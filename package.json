@@ -1,0 +1,25 @@
+{
+  "name": "galapagos",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "echo \"Implemented in Chunk 1 (typecheck + node --test)\" && exit 1"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest",
+    "better-sqlite3": "latest",
+    "next": "latest",
+    "picomatch": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "latest",
+    "@types/node": "latest",
+    "@types/picomatch": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "concurrently": "latest",
+    "typescript": "latest"
+  }
+}
