@@ -106,7 +106,7 @@ export async function createNewProject(
   const rootPath = path.join(path.resolve(input.devRoot), name);
   if (existsSync(rootPath)) {
     throw new Error(
-      `A folder named "${name}" already exists in ${input.devRoot} — register it from Browse instead.`,
+      `A folder named "${name}" already exists in ${input.devRoot} — register it with "Choose folder…" instead.`,
     );
   }
 
