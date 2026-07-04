@@ -24,7 +24,25 @@ verification passes; the user reviews and commits between chunks. Consult the
 Claude Agent SDK docs (docs.claude.com, Agent SDK section) — never guess SDK
 APIs.
 
-## Development (after Chunk 1)
+## Development
 
-- `npm run dev` — daemon (:4517) + Next.js UI
-- `npm test` — typecheck + node --test suites
+- `npm run dev` — daemon (:4517) + Next.js UI (http://localhost:3002)
+- `npm test` — typecheck + node --test suites (no network)
+- `npm run spike:resume` — proves session resume across process boundaries
+  (makes two small real manager turns on your subscription)
+
+**Run `npm run dev` from your own terminal.** Darwin's sessions spawn your
+installed Claude Code binary (`~/.claude/local/claude`, override with
+`GALAPAGOS_CLAUDE_BIN`) so they authenticate with your subscription login via
+the macOS keychain — sandboxed or headless shells cannot reach it, and turns
+fail with "Not logged in".
+
+Environment (all optional):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GALAPAGOS_STATE_DIR` | `~/.galapagos` | Central SQLite operational state |
+| `GALAPAGOS_VAULT_PATH` | `/Users/taan/Documents/Obsidian Vault` | Obsidian vault for agreed specifics |
+| `GALAPAGOS_MANAGER_MODEL` | `claude-fable-5` | Darwin's model |
+| `GALAPAGOS_DAEMON_PORT` | `4517` | Daemon port |
+| `GALAPAGOS_CLAUDE_BIN` | `~/.claude/local/claude` | Logged-in Claude Code binary |
