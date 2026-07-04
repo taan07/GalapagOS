@@ -176,10 +176,14 @@ stage user files.
 
 ## 6. Workers
 
-One streaming-input `query()` per worker, `cwd` = its own git worktree. The
-daemon consumes the async iterator and persists **every** message to
-`worker_events` — that stream IS progress reporting (no transcript polling).
-`steer_worker` injects messages mid-run via streaming input.
+One streaming-input `query()` per worker, `cwd` = its own git worktree.
+Worktrees are created under `<GALAPAGOS_STATE_DIR>/worktrees/<project-slug>/<lane-slug>/`
+— never inside the target repo, which stays clean of orchestration artifacts.
+Worker sessions spawn through the same helper as the manager (user's installed
+Claude binary, cwd-pinned). The daemon consumes the async iterator and
+persists **every** message to `worker_events` — that stream IS progress
+reporting (no transcript polling). `steer_worker` injects messages mid-run via
+streaming input.
 
 **Completion report contract.** Worker system prompts require the final result
 message to end with a fenced block:
@@ -252,8 +256,9 @@ On `write_record(type=decision)`:
 4. Write the record with `git_checkpoint_ref` + `parent_decision_ref` = current
    tip decision on that line; commit the record file.
 
-Resume from a node: `git worktree add .galapagos/worktrees/resume-<shortid>
--b resume/<slug> galapagos/decision/<shortid>`, create lane (+ worker if asked),
+Resume from a node: `git worktree add
+<GALAPAGOS_STATE_DIR>/worktrees/<project-slug>/resume-<shortid> -b
+resume/<slug> galapagos/decision/<shortid>`, create lane (+ worker if asked),
 and write a child decision record pointing at the resumed node so the bloodline
 visibly forks. Forbidden always: force-push, tag deletion, history rewriting.
 
