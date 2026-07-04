@@ -22,7 +22,10 @@ Three processes, one machine, no cloud:
   multi-project from Chunk 1: a `projects` table is the registry, every other
   table is scoped by `project_id`, and the UI carries a project picker plus an
   Add-project flow (which offers one-click `git init` for non-git projects —
-  Galapagos never manages a project without history). Every streamed message,
+  Galapagos never manages a project without history). Registration uses the
+  native system folder chooser pre-opened at `GALAPAGOS_DEV_ROOT` (default
+  `~/Dev`), plus create-from-name: a new folder in the dev root with a seeded
+  README, initial commit, and registration in one step. Every streamed message,
   job, heartbeat, and attention item is persisted as it lands. Nothing
   state-bearing lives in module-level memory; the daemon can be killed at any
   moment and lose nothing durable.
@@ -132,6 +135,16 @@ One logical manager session per project. Each user turn:
 mcpServers: { galapagos: { type: "sdk", serverInstance } }, systemPrompt:
 managerDoctrine, allowedTools, model } })`. The manager model is pinned via
 `GALAPAGOS_MANAGER_MODEL` (default `claude-fable-5`).
+
+**Auth is keychain-bound (learned in Chunk 1, applies to every session —
+manager, distill, triage, workers):** the SDK's bundled runtime cannot read
+Claude Code's subscription credentials (macOS keychain items are bound to the
+binary that created them). Every `query()` goes through a shared spawn helper
+that sets `pathToClaudeCodeExecutable` to the user's installed binary
+(`GALAPAGOS_CLAUDE_BIN`, default `~/.claude/local/claude`), and live sessions
+only authenticate when the daemon is launched from the user's own terminal —
+sandboxed or headless shells get "Not logged in". Auth-errored turns must
+never persist as conversation or trigger fresh-session retries.
 
 Verified SDK facts (code.claude.com/docs/en/agent-sdk — do not re-derive):
 the session id is surfaced on the init message (`type === "system" &&
