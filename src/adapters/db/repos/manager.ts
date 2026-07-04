@@ -125,3 +125,52 @@ export function markSessionResumed(db: GalapagosDb, sessionId: string): void {
     sessionId,
   );
 }
+
+/**
+ * Compact-by-re-brief: retire the unresumable session and open a fresh one
+ * whose context will be seeded from records. One transaction — there is never
+ * a moment with two active sessions for a project.
+ */
+export function compactSession(
+  db: GalapagosDb,
+  projectId: string,
+  oldSessionId: string,
+): ManagerSessionRow {
+  const swap = db.transaction((): ManagerSessionRow => {
+    db.prepare("UPDATE manager_sessions SET status = 'compacted' WHERE id = ?").run(oldSessionId);
+    const row: ManagerSessionRow = {
+      id: randomUUID(),
+      project_id: projectId,
+      sdk_session_id: null,
+      status: "active",
+      seeded_from_records_at: nowIso(),
+      created_at: nowIso(),
+      last_resumed_at: null,
+    };
+    db.prepare(
+      `INSERT INTO manager_sessions (id, project_id, sdk_session_id, status, seeded_from_records_at, created_at, last_resumed_at)
+       VALUES (@id, @project_id, @sdk_session_id, @status, @seeded_from_records_at, @created_at, @last_resumed_at)`,
+    ).run(row);
+    return row;
+  });
+  return swap();
+}
+
+/** Chat history for a project spans compacted sessions — memory survives. */
+export function listProjectTurns(db: GalapagosDb, projectId: string): ManagerTurnRow[] {
+  return db
+    .prepare(
+      `SELECT manager_turns.* FROM manager_turns
+       JOIN manager_sessions ON manager_sessions.id = manager_turns.session_id
+       WHERE manager_sessions.project_id = ?
+       ORDER BY manager_turns.created_at, manager_turns.turn_index`,
+    )
+    .all(projectId) as ManagerTurnRow[];
+}
+
+/** Stamp every not-yet-distilled turn of a session as covered. */
+export function markTurnsDistilled(db: GalapagosDb, sessionId: string): void {
+  db.prepare(
+    "UPDATE manager_turns SET distilled_at = ? WHERE session_id = ? AND distilled_at IS NULL",
+  ).run(nowIso(), sessionId);
+}

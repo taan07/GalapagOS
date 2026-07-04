@@ -168,6 +168,28 @@ export function App() {
               }
             } else if (event.type === "rebrief") {
               setItems((current) => [...current, { kind: "note", text: event.reason }]);
+            } else if (event.type === "distilled") {
+              // Silent when nothing durable happened; visible when memory
+              // changed or when a records commit had to be skipped.
+              const notes: string[] = [];
+              if (event.recordsWritten > 0) {
+                notes.push(
+                  `Distilled ${event.recordsWritten} record${event.recordsWritten === 1 ? "" : "s"} into durable memory${event.committed ? " (committed)" : ""}.`,
+                );
+              }
+              if (event.commitSkippedReason) {
+                notes.push(`Records commit skipped: ${event.commitSkippedReason}`);
+              }
+              if (event.error) {
+                notes.push(`Distillation failed: ${event.error}`);
+              }
+              if (notes.length > 0) {
+                setItems((current) => [
+                  ...current,
+                  ...notes.map((text) => ({ kind: "note" as const, text })),
+                ]);
+              }
+              void refreshSpecifics(projectId);
             } else if (event.type === "turn_error") {
               setItems((current) => [
                 ...current,
@@ -230,6 +252,11 @@ export function App() {
         <div className="app-title">
           GALAPAGOS <span>/ Darwin</span>
         </div>
+        {selected ? (
+          <a className="nav-link" href={`/records?projectId=${encodeURIComponent(selected.id)}`}>
+            Records
+          </a>
+        ) : null}
         {projects.length > 0 ? (
           <ProjectPicker
             projects={projects}

@@ -42,4 +42,29 @@ export type ManagerStreamEvent =
   | { type: "tool_use"; tool: string; summary: string; detail: string }
   | { type: "rebrief"; reason: string }
   | { type: "turn_complete"; resultText: string; sdkSessionId: string | null }
+  | {
+      type: "distilled";
+      recordsWritten: number;
+      committed: boolean;
+      commitSkippedReason?: string;
+      error?: string;
+    }
   | { type: "turn_error"; message: string };
+
+/** One durable record as served by /api/records — every field attributed. */
+export type RecordView = {
+  id: string;
+  type: string;
+  title: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  writtenBy: string;
+  body: string;
+  /** Where this record physically lives, relative to the project root. */
+  sourceFile: string;
+  /** Per-field origin, e.g. title → "frontmatter:title", body → "markdown body". */
+  fieldSources: Record<string, string>;
+  /** Type-specific frontmatter (question, answer, decision fields, links). */
+  extra: Record<string, unknown>;
+};

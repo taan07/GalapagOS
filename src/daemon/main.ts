@@ -6,8 +6,13 @@ import {
   getProject,
   listProjects,
   registerProject,
+  type ProjectRow,
 } from "../adapters/db/repos/projects";
+import { runDistillJob } from "../adapters/agent/distill";
 import { runManagerTurn, type ManagerTurnEvent } from "../adapters/agent/manager-session";
+import { commitRecords } from "../adapters/git/mutating-runner";
+import { ingestVaultSpecifics } from "../adapters/records/ingest";
+import { createRecordsStore } from "../adapters/records/store";
 import { chooseFolder, revealFolder } from "../adapters/system/dialogs";
 
 const db = openDb(config.stateDir);
@@ -59,6 +64,37 @@ function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 
+/**
+ * Import Chunk-1-era vault specifics into the project's records store.
+ * Idempotent (migrated files are stamped), so it runs on every daemon start
+ * and after every registration — Darwin's memory must not reset or fork when
+ * the store arrives, and a second start must not re-import.
+ */
+async function ingestProjectVault(project: ProjectRow): Promise<void> {
+  try {
+    const store = createRecordsStore(project.root_path, project.slug);
+    const result = ingestVaultSpecifics({
+      store,
+      vaultPath: config.vaultPath,
+      projectSlug: project.slug,
+    });
+    if (result.ingested.length === 0) {
+      return;
+    }
+    const commit = await commitRecords(
+      project.root_path,
+      `galapagos(records): ingest ${result.ingested.length} vault specific${result.ingested.length === 1 ? "" : "s"}`,
+    );
+    console.log(
+      `[records] ${project.slug}: ingested ${result.ingested.length} vault specifics (commit: ${commit.status})`,
+    );
+  } catch (error) {
+    console.error(
+      `[records] vault ingestion failed for ${project.slug}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 async function handleManagerMessage(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -90,7 +126,29 @@ async function handleManagerMessage(
   };
 
   try {
-    await runManagerTurn({ db, config, project, userText: text, emit });
+    const outcome = await runManagerTurn({ db, config, project, userText: text, emit });
+
+    // Post-turn distillation runs while the stream (and the busy flag) is
+    // still held: the manager session must never be forked concurrently with
+    // a new user turn. The fork's records land before the input unlocks.
+    if (outcome.completed) {
+      const distill = await runDistillJob({
+        db,
+        config,
+        project,
+        sessionId: outcome.sessionId,
+        sdkSessionId: outcome.sdkSessionId,
+      });
+      sseWrite(res, {
+        type: "distilled",
+        recordsWritten: distill.recordsWritten,
+        committed: distill.commit.status === "committed",
+        ...(distill.commit.status === "skipped"
+          ? { commitSkippedReason: distill.commit.reason }
+          : {}),
+        ...(distill.error ? { error: distill.error } : {}),
+      });
+    }
   } catch (error) {
     sseWrite(res, {
       type: "turn_error",
@@ -118,6 +176,7 @@ async function handleRegisterProject(
       name: asString(body.name),
       initGit: body.initGit === true,
     });
+    await ingestProjectVault(project);
     sendJson(res, 201, { project });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -138,6 +197,7 @@ async function handleCreateProject(
   }
   try {
     const project = await createNewProject(db, { name, devRoot: config.devRoot });
+    await ingestProjectVault(project);
     sendJson(res, 201, { project });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -217,4 +277,10 @@ server.listen(config.daemonPort, "127.0.0.1", () => {
   console.log(
     `galapagos daemon listening on http://127.0.0.1:${config.daemonPort} (state: ${config.stateDir}, model: ${config.managerModel})`,
   );
+  // Idempotent per-project vault ingestion on every start (chunk 2 brief).
+  void (async () => {
+    for (const project of listProjects(db)) {
+      await ingestProjectVault(project);
+    }
+  })();
 });

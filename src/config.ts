@@ -6,6 +6,11 @@ export type GalapagosConfig = {
   stateDir: string;
   vaultPath: string;
   managerModel: string;
+  /**
+   * Model for post-turn distillation forks. Distillation is extraction, not
+   * judgment — it must not double the subscription cost of every chat turn.
+   */
+  distillModel: string;
   daemonPort: number;
   /** Where new projects are created and where folder browsing starts. */
   devRoot: string;
@@ -49,6 +54,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GalapagosConfi
     stateDir,
     vaultPath,
     managerModel: env.GALAPAGOS_MANAGER_MODEL ?? "claude-fable-5",
+    distillModel: env.GALAPAGOS_DISTILL_MODEL ?? "claude-haiku-4-5",
     daemonPort,
     devRoot: path.resolve(expandHome(env.GALAPAGOS_DEV_ROOT ?? "~/Dev")),
     claudeBinPath,

@@ -12,11 +12,15 @@ import {
 } from "../src/adapters/db/repos/projects";
 import {
   appendTurn,
+  compactSession,
   getOrCreateActiveSession,
   latestSdkSessionId,
+  listProjectTurns,
   listTurns,
+  markTurnsDistilled,
   updateTurnSdkSessionId,
 } from "../src/adapters/db/repos/manager";
+import { createJob, failJob, finishJob, startJob } from "../src/adapters/db/repos/jobs";
 
 const TEST_GIT_IDENTITY = { name: "Galapagos Tests", email: "tests@galapagos.local" };
 
@@ -111,6 +115,78 @@ test("manager turns round-trip with ordering and session-id pointer updates", as
       [2, "tool"],
     ],
   );
+});
+
+test("compaction swaps the active session and history spans both", async () => {
+  const stateDir = tmpDir("glp-state-");
+  const projectDir = tmpDir("glp-proj-");
+  mkdirSync(path.join(projectDir, ".git"));
+  const db = openDb(stateDir);
+  const project = await registerProject(db, { rootPath: projectDir });
+
+  const first = getOrCreateActiveSession(db, project.id);
+  appendTurn(db, { sessionId: first.id, role: "user", content: "before compaction" });
+
+  const second = compactSession(db, project.id, first.id);
+  assert.notEqual(second.id, first.id);
+  assert.ok(second.seeded_from_records_at, "fresh session records its records-seeding");
+  assert.equal(getOrCreateActiveSession(db, project.id).id, second.id, "new session is active");
+
+  appendTurn(db, { sessionId: second.id, role: "user", content: "after compaction" });
+  assert.deepEqual(
+    listProjectTurns(db, project.id).map((turn) => turn.content),
+    ["before compaction", "after compaction"],
+    "project history survives compaction",
+  );
+});
+
+test("markTurnsDistilled stamps only the session's uncovered turns", async () => {
+  const stateDir = tmpDir("glp-state-");
+  const projectDir = tmpDir("glp-proj-");
+  mkdirSync(path.join(projectDir, ".git"));
+  const db = openDb(stateDir);
+  const project = await registerProject(db, { rootPath: projectDir });
+  const session = getOrCreateActiveSession(db, project.id);
+
+  appendTurn(db, { sessionId: session.id, role: "user", content: "q" });
+  appendTurn(db, { sessionId: session.id, role: "assistant", content: "a" });
+  markTurnsDistilled(db, session.id);
+  const stamped = listTurns(db, session.id);
+  assert.ok(stamped.every((turn) => turn.distilled_at !== null));
+
+  const firstStamp = stamped[0]?.distilled_at;
+  appendTurn(db, { sessionId: session.id, role: "user", content: "later" });
+  markTurnsDistilled(db, session.id);
+  const after = listTurns(db, session.id);
+  assert.equal(after[0]?.distilled_at, firstStamp, "already-covered turns keep their stamp");
+  assert.ok(after[2]?.distilled_at, "the new turn is covered");
+});
+
+test("jobs move queued → running → done/failed with payload and result", () => {
+  const stateDir = tmpDir("glp-state-");
+  const db = openDb(stateDir);
+
+  const job = createJob(db, "distill", { projectId: "p1" });
+  assert.equal(job.status, "queued");
+  startJob(db, job.id);
+  finishJob(db, job.id, { recordsWritten: 2 });
+  const done = db.prepare("SELECT * FROM jobs WHERE id = ?").get(job.id) as {
+    status: string;
+    result: string;
+    started_at: string | null;
+  };
+  assert.equal(done.status, "done");
+  assert.ok(done.started_at);
+  assert.deepEqual(JSON.parse(done.result), { recordsWritten: 2 });
+
+  const bad = createJob(db, "distill", null);
+  startJob(db, bad.id);
+  failJob(db, bad.id, "fork exploded");
+  const failed = db.prepare("SELECT status, error FROM jobs WHERE id = ?").get(bad.id) as {
+    status: string;
+    error: string;
+  };
+  assert.deepEqual(failed, { status: "failed", error: "fork exploded" });
 });
 
 test("sessions and turns stay isolated between projects", async () => {
