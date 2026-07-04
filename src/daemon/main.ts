@@ -1,7 +1,12 @@
 import http from "node:http";
 import { config } from "../config";
 import { openDb } from "../adapters/db/db";
-import { getProject, listProjects, registerProject } from "../adapters/db/repos/projects";
+import {
+  createNewProject,
+  getProject,
+  listProjects,
+  registerProject,
+} from "../adapters/db/repos/projects";
 import { runManagerTurn, type ManagerTurnEvent } from "../adapters/agent/manager-session";
 
 const db = openDb(config.stateDir);
@@ -120,6 +125,25 @@ async function handleRegisterProject(
   }
 }
 
+async function handleCreateProject(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const body = await readBody(req);
+  const name = asString(body.name);
+  if (!name) {
+    sendJson(res, 400, { error: "name is required." });
+    return;
+  }
+  try {
+    const project = await createNewProject(db, { name, devRoot: config.devRoot });
+    sendJson(res, 201, { project });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    sendJson(res, /already exists/.test(message) ? 409 : 400, { error: message });
+  }
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url ?? "/", "http://localhost");
   const route = `${req.method} ${url.pathname}`;
@@ -134,6 +158,12 @@ const server = http.createServer((req, res) => {
   }
   if (route === "POST /projects") {
     void handleRegisterProject(req, res).catch((error) => {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    });
+    return;
+  }
+  if (route === "POST /projects/create") {
+    void handleCreateProject(req, res).catch((error) => {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     });
     return;

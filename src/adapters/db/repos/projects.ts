@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { GalapagosDb } from "../db";
 import { nowIso } from "../db";
@@ -81,4 +81,37 @@ export async function registerProject(
     "INSERT INTO projects (id, name, slug, root_path, created_at) VALUES (@id, @name, @slug, @root_path, @created_at)",
   ).run(row);
   return row;
+}
+
+/**
+ * Create a brand-new project from a name: folder under devRoot, seeded
+ * README, git history, and registration in one step.
+ */
+export async function createNewProject(
+  db: GalapagosDb,
+  input: {
+    name: string;
+    devRoot: string;
+    gitIdentity?: { name: string; email: string };
+  },
+): Promise<ProjectRow> {
+  const name = input.name.trim();
+  if (!name) {
+    throw new Error("A project name is required.");
+  }
+  if (name.startsWith(".") || /[/\\:\0]/.test(name)) {
+    throw new Error("Project names cannot start with a dot or contain / \\ : characters.");
+  }
+
+  const rootPath = path.join(path.resolve(input.devRoot), name);
+  if (existsSync(rootPath)) {
+    throw new Error(
+      `A folder named "${name}" already exists in ${input.devRoot} — register it from Browse instead.`,
+    );
+  }
+
+  mkdirSync(rootPath, { recursive: true });
+  writeFileSync(path.join(rootPath, "README.md"), `# ${name}\n`, { flag: "wx" });
+  await initGitRepo(rootPath, { identity: input.gitIdentity });
+  return registerProject(db, { rootPath, name });
 }

@@ -46,3 +46,4 @@ Environment (all optional):
 | `GALAPAGOS_MANAGER_MODEL` | `claude-fable-5` | Darwin's model |
 | `GALAPAGOS_DAEMON_PORT` | `4517` | Daemon port |
 | `GALAPAGOS_CLAUDE_BIN` | `~/.claude/local/claude` | Logged-in Claude Code binary |
+| `GALAPAGOS_DEV_ROOT` | `~/Dev` | Folder browsing start + where new projects are created |

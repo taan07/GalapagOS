@@ -7,6 +7,8 @@ export type GalapagosConfig = {
   vaultPath: string;
   managerModel: string;
   daemonPort: number;
+  /** Where new projects are created and where folder browsing starts. */
+  devRoot: string;
   /**
    * Path to the user's logged-in Claude Code binary. The SDK's bundled
    * runtime cannot read Claude Code's keychain credentials (they are bound
@@ -48,6 +50,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GalapagosConfi
     vaultPath,
     managerModel: env.GALAPAGOS_MANAGER_MODEL ?? "claude-fable-5",
     daemonPort,
+    devRoot: path.resolve(expandHome(env.GALAPAGOS_DEV_ROOT ?? "~/Dev")),
     claudeBinPath,
   };
 }
