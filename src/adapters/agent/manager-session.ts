@@ -24,9 +24,24 @@ export type ManagerTurnEvent =
   | { type: "turn_started"; sessionId: string }
   | { type: "assistant_text"; text: string }
   | { type: "tool_use"; tool: string; summary: string; detail: string }
-  | { type: "rebrief"; reason: string }
+  | {
+      type: "rebrief";
+      reason: string;
+      /** The full seed text; null when the store had nothing to seed from. */
+      preamble: string | null;
+      /** Persisted turn id — the clear-re-brief action targets this. */
+      turnId: string | null;
+    }
   | { type: "turn_complete"; resultText: string; sdkSessionId: string | null }
   | { type: "turn_error"; message: string };
+
+/** Persisted payload of a system re-brief turn (manager_turns.content). */
+export type RebriefTurnPayload = {
+  kind: "rebrief";
+  reason: string;
+  preamble: string | null;
+  clearedAt: string | null;
+};
 
 export type EmitManagerTurnEvent = (event: ManagerTurnEvent) => void;
 
@@ -98,7 +113,10 @@ export async function runManagerTurn(input: {
 
   let session = getOrCreateActiveSession(db, project.id);
   let resumeId = latestSdkSessionId(db, session.id);
-  const hasHistory = listTurns(db, session.id).length > 0;
+  // Only conversation counts as lost context. System turns (re-brief markers,
+  // the "re-brief cleared" note) carry no SDK state — a deliberately blanked
+  // session must start blank, not trigger another records-seeded re-brief.
+  const hasHistory = listTurns(db, session.id).some((turn) => turn.role !== "system");
   emit({ type: "turn_started", sessionId: session.id });
 
   let userTurn: ManagerTurnRow = appendTurn(db, {
@@ -139,15 +157,22 @@ export async function runManagerTurn(input: {
     deleteTurns(db, [userTurn.id, ...attemptTurnIds]);
     attemptTurnIds = [];
     session = compactSession(db, project.id, session.id);
-    userTurn = appendTurn(db, { sessionId: session.id, role: "user", content: userText });
 
     const preamble = rebriefPreamble(store, project.name);
-    emit({
-      type: "rebrief",
-      reason: preamble
-        ? `${cause} Darwin re-briefed himself from the committed records (goals, open questions, agreed answers are intact); recent conversational nuance may be lost.`
-        : `${cause} No durable records exist yet to re-brief from — Darwin restarted with a blank slate.`,
+    const reason = preamble
+      ? `${cause} Darwin re-briefed himself from the committed records (goals, open questions, agreed answers are intact); recent conversational nuance may be lost.`
+      : `${cause} No durable records exist yet to re-brief from — Darwin restarted with a blank slate.`;
+    // The re-brief is part of history: persisted before the user turn so the
+    // UI can re-render (and clear) it after any reload.
+    const payload: RebriefTurnPayload = { kind: "rebrief", reason, preamble, clearedAt: null };
+    const rebriefTurn = appendTurn(db, {
+      sessionId: session.id,
+      role: "system",
+      content: JSON.stringify(payload),
     });
+    userTurn = appendTurn(db, { sessionId: session.id, role: "user", content: userText });
+
+    emit({ type: "rebrief", reason, preamble, turnId: rebriefTurn.id });
     return preamble
       ? `${preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${userText}`
       : userText;

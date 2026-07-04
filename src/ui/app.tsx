@@ -5,6 +5,7 @@ import type {
   ChatItem,
   ManagerStreamEvent,
   ProjectView,
+  RebriefView,
   SpecificView,
   ToolChip,
   TurnView,
@@ -30,6 +31,31 @@ function turnsToChatItems(turns: TurnView[]): ChatItem[] {
       } catch {
         return [];
       }
+    }
+    // System turns carry structured payloads (re-briefs, notes) since Chunk 2;
+    // plain text stays a note for backward compatibility.
+    try {
+      const payload = JSON.parse(turn.content) as
+        | { kind: "rebrief"; reason: string; preamble: string | null; clearedAt: string | null }
+        | { kind: "note"; text: string };
+      if (payload.kind === "rebrief") {
+        return [
+          {
+            kind: "rebrief",
+            rebrief: {
+              turnId: turn.id,
+              reason: payload.reason,
+              preamble: payload.preamble,
+              cleared: payload.clearedAt !== null,
+            },
+          },
+        ];
+      }
+      if (payload.kind === "note") {
+        return [{ kind: "note", text: payload.text }];
+      }
+    } catch {
+      // fall through to plain text
     }
     return [{ kind: "note", text: turn.content }];
   });
@@ -167,7 +193,18 @@ export function App() {
                 void refreshSpecifics(projectId);
               }
             } else if (event.type === "rebrief") {
-              setItems((current) => [...current, { kind: "note", text: event.reason }]);
+              setItems((current) => [
+                ...current,
+                {
+                  kind: "rebrief",
+                  rebrief: {
+                    turnId: event.turnId,
+                    reason: event.reason,
+                    preamble: event.preamble,
+                    cleared: false,
+                  },
+                },
+              ]);
             } else if (event.type === "distilled") {
               // Silent when nothing durable happened; visible when memory
               // changed or when a records commit had to be skipped.
@@ -240,6 +277,39 @@ export function App() {
     [selectedId, working, sendNow],
   );
 
+  const handleClearRebrief = useCallback(
+    async (rebrief: RebriefView) => {
+      if (!selectedId || !rebrief.turnId) {
+        return;
+      }
+      const response = await fetch("/api/manager/rebrief/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: selectedId, turnId: rebrief.turnId }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      if (!response.ok) {
+        setItems((current) => [
+          ...current,
+          { kind: "note", text: payload.error ?? `Clearing the re-brief failed (${response.status}).` },
+        ]);
+        return;
+      }
+      setItems((current) => [
+        ...current.map((item) =>
+          item.kind === "rebrief" && item.rebrief.turnId === rebrief.turnId
+            ? { ...item, rebrief: { ...item.rebrief, cleared: true } }
+            : item,
+        ),
+        {
+          kind: "note",
+          text: "Re-brief cleared — Darwin starts the next turn from a blank context. The committed records remain on disk; he will only know them again if he reads them with his tools.",
+        },
+      ]);
+    },
+    [selectedId],
+  );
+
   if (projects === null) {
     return <div className="app-shell" />;
   }
@@ -292,6 +362,7 @@ export function App() {
             disabled={daemonDown || !selected}
             projectName={selected?.name ?? ""}
             onSend={handleSend}
+            onClearRebrief={handleClearRebrief}
           />
           <SpecificsPanel specifics={specifics} />
         </main>

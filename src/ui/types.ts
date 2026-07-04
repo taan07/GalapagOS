@@ -30,17 +30,27 @@ export type ToolChip = {
   detail: string;
 };
 
+export type RebriefView = {
+  /** Turn id the clear action targets; null for pre-persistence events. */
+  turnId: string | null;
+  reason: string;
+  /** Full seed text; null when there were no records to seed from. */
+  preamble: string | null;
+  cleared: boolean;
+};
+
 export type ChatItem =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string }
   | { kind: "chip"; chip: ToolChip }
+  | { kind: "rebrief"; rebrief: RebriefView }
   | { kind: "note"; text: string };
 
 export type ManagerStreamEvent =
   | { type: "turn_started"; sessionId: string }
   | { type: "assistant_text"; text: string }
   | { type: "tool_use"; tool: string; summary: string; detail: string }
-  | { type: "rebrief"; reason: string }
+  | { type: "rebrief"; reason: string; preamble: string | null; turnId: string | null }
   | { type: "turn_complete"; resultText: string; sdkSessionId: string | null }
   | {
       type: "distilled";

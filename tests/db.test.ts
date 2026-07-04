@@ -14,10 +14,12 @@ import {
   appendTurn,
   compactSession,
   getOrCreateActiveSession,
+  getTurn,
   latestSdkSessionId,
   listProjectTurns,
   listTurns,
   markTurnsDistilled,
+  updateTurnContent,
   updateTurnSdkSessionId,
 } from "../src/adapters/db/repos/manager";
 import { createJob, failJob, finishJob, startJob } from "../src/adapters/db/repos/jobs";
@@ -137,6 +139,41 @@ test("compaction swaps the active session and history spans both", async () => {
     listProjectTurns(db, project.id).map((turn) => turn.content),
     ["before compaction", "after compaction"],
     "project history survives compaction",
+  );
+});
+
+test("clearing a re-brief compacts to a truly blank session", async () => {
+  const stateDir = tmpDir("glp-state-");
+  const projectDir = tmpDir("glp-proj-");
+  mkdirSync(path.join(projectDir, ".git"));
+  const db = openDb(stateDir);
+  const project = await registerProject(db, { rootPath: projectDir });
+
+  const seeded = compactSession(db, project.id, getOrCreateActiveSession(db, project.id).id);
+  const rebriefTurn = appendTurn(db, {
+    sessionId: seeded.id,
+    role: "system",
+    content: JSON.stringify({ kind: "rebrief", reason: "r", preamble: "p", clearedAt: null }),
+  });
+
+  // The clear flow: stamp the re-brief turn, then blank-compact.
+  updateTurnContent(
+    db,
+    rebriefTurn.id,
+    JSON.stringify({ kind: "rebrief", reason: "r", preamble: "p", clearedAt: "2026-07-04T15:00:00Z" }),
+  );
+  const stamped = getTurn(db, rebriefTurn.id);
+  assert.ok(stamped);
+  assert.match(stamped.content, /clearedAt":"2026-07-04T15:00:00Z"/);
+
+  const blank = compactSession(db, project.id, seeded.id, { seededFromRecords: false });
+  assert.equal(blank.seeded_from_records_at, null, "a cleared session is NOT records-seeded");
+  assert.equal(getOrCreateActiveSession(db, project.id).id, blank.id);
+  assert.equal(listTurns(db, blank.id).length, 0, "the blank session starts with zero turns");
+  assert.equal(
+    latestSdkSessionId(db, blank.id),
+    null,
+    "no resume pointer — the next turn starts a fresh SDK session with no context",
   );
 });
 

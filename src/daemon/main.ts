@@ -9,7 +9,18 @@ import {
   type ProjectRow,
 } from "../adapters/db/repos/projects";
 import { runDistillJob } from "../adapters/agent/distill";
-import { runManagerTurn, type ManagerTurnEvent } from "../adapters/agent/manager-session";
+import {
+  runManagerTurn,
+  type ManagerTurnEvent,
+  type RebriefTurnPayload,
+} from "../adapters/agent/manager-session";
+import {
+  appendTurn,
+  compactSession,
+  getOrCreateActiveSession,
+  getTurn,
+  updateTurnContent,
+} from "../adapters/db/repos/manager";
 import { commitRecords } from "../adapters/git/mutating-runner";
 import { ingestVaultSpecifics } from "../adapters/records/ingest";
 import { createRecordsStore } from "../adapters/records/store";
@@ -160,6 +171,76 @@ async function handleManagerMessage(
   }
 }
 
+/**
+ * Deliberately clear a re-brief: the user chose to drop even the
+ * record-seeded context, so the active session is retired and the next turn
+ * starts from a truly blank session (records stay on disk; Darwin only knows
+ * them again if he reads them with his tools).
+ */
+async function handleClearRebrief(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const body = await readBody(req);
+  const projectId = asString(body.projectId);
+  const turnId = asString(body.turnId);
+  if (!projectId || !turnId) {
+    sendJson(res, 400, { error: "projectId and turnId are required." });
+    return;
+  }
+  const project = getProject(db, projectId);
+  if (!project) {
+    sendJson(res, 404, { error: `Unknown project: ${projectId}` });
+    return;
+  }
+  if (busyProjects.has(projectId)) {
+    sendJson(res, 409, { error: "Darwin is mid-turn — wait for it to finish before clearing." });
+    return;
+  }
+
+  const turn = getTurn(db, turnId);
+  let payload: RebriefTurnPayload | null = null;
+  if (turn && turn.role === "system") {
+    try {
+      const parsed = JSON.parse(turn.content) as RebriefTurnPayload;
+      payload = parsed.kind === "rebrief" ? parsed : null;
+    } catch {
+      payload = null;
+    }
+  }
+  if (!turn || !payload) {
+    sendJson(res, 404, { error: "That turn is not a re-brief." });
+    return;
+  }
+  if (payload.clearedAt) {
+    sendJson(res, 409, { error: "This re-brief was already cleared." });
+    return;
+  }
+  const activeSession = getOrCreateActiveSession(db, projectId);
+  if (turn.session_id !== activeSession.id) {
+    sendJson(res, 409, {
+      error: "Only the current session's re-brief can be cleared — this one was already superseded.",
+    });
+    return;
+  }
+
+  updateTurnContent(
+    db,
+    turn.id,
+    JSON.stringify({ ...payload, clearedAt: new Date().toISOString() }),
+  );
+  const fresh = compactSession(db, projectId, activeSession.id, { seededFromRecords: false });
+  const note = appendTurn(db, {
+    sessionId: fresh.id,
+    role: "system",
+    content: JSON.stringify({
+      kind: "note",
+      text: "Re-brief cleared — Darwin starts the next turn from a blank context. The committed records remain on disk; he will only know them again if he reads them with his tools.",
+    }),
+  });
+  sendJson(res, 200, { ok: true, sessionId: fresh.id, noteTurnId: note.id });
+}
+
 async function handleRegisterProject(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -251,6 +332,12 @@ const server = http.createServer((req, res) => {
   }
   if (route === "POST /projects/create") {
     void handleCreateProject(req, res).catch((error) => {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    });
+    return;
+  }
+  if (route === "POST /manager/rebrief/clear") {
+    void handleClearRebrief(req, res).catch((error) => {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     });
     return;

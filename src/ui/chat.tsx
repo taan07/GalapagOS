@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { ChatItem } from "./types";
+import type { ChatItem, RebriefView } from "./types";
 
 export function Chat({
   items,
@@ -10,6 +10,7 @@ export function Chat({
   disabled,
   projectName,
   onSend,
+  onClearRebrief,
 }: {
   items: ChatItem[];
   working: boolean;
@@ -17,6 +18,7 @@ export function Chat({
   disabled: boolean;
   projectName: string;
   onSend: (text: string) => void;
+  onClearRebrief: (rebrief: RebriefView) => void;
 }) {
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -64,6 +66,41 @@ export function Chat({
               <details className="chip" key={index}>
                 <summary>{item.chip.summary}</summary>
                 {item.chip.detail ? <pre>{item.chip.detail}</pre> : null}
+              </details>
+            );
+          }
+          if (item.kind === "rebrief") {
+            // Quiet by default: a collapsed chip, full seed text on demand.
+            // No preamble means nothing was seeded — a plain note is honest.
+            if (!item.rebrief.preamble) {
+              return (
+                <div className="msg system-note" key={index}>
+                  {item.rebrief.reason}
+                </div>
+              );
+            }
+            return (
+              <details className="chip rebrief" key={index}>
+                <summary>
+                  Darwin re-briefed from records{item.rebrief.cleared ? " (cleared)" : ""}
+                </summary>
+                <div className="rebrief-detail">
+                  <p className="rebrief-reason">{item.rebrief.reason}</p>
+                  <pre>{item.rebrief.preamble}</pre>
+                  {item.rebrief.cleared ? (
+                    <p className="rebrief-reason">
+                      This re-brief was cleared — it is no longer in Darwin's context.
+                    </p>
+                  ) : (
+                    <button
+                      onClick={() => onClearRebrief(item.rebrief)}
+                      disabled={disabled || working || !item.rebrief.turnId}
+                      title="Retire this context entirely: Darwin's next turn starts blank. Records stay on disk."
+                    >
+                      Clear this re-brief — start Darwin blank
+                    </button>
+                  )}
+                </div>
               </details>
             );
           }

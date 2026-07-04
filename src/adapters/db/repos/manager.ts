@@ -127,14 +127,17 @@ export function markSessionResumed(db: GalapagosDb, sessionId: string): void {
 }
 
 /**
- * Compact-by-re-brief: retire the unresumable session and open a fresh one
- * whose context will be seeded from records. One transaction — there is never
- * a moment with two active sessions for a project.
+ * Compact-by-re-brief: retire the unresumable session and open a fresh one.
+ * By default the fresh session is seeded from records; pass
+ * `seededFromRecords: false` for a deliberate blank restart (the user cleared
+ * a re-brief). One transaction — there is never a moment with two active
+ * sessions for a project.
  */
 export function compactSession(
   db: GalapagosDb,
   projectId: string,
   oldSessionId: string,
+  options: { seededFromRecords?: boolean } = {},
 ): ManagerSessionRow {
   const swap = db.transaction((): ManagerSessionRow => {
     db.prepare("UPDATE manager_sessions SET status = 'compacted' WHERE id = ?").run(oldSessionId);
@@ -143,7 +146,7 @@ export function compactSession(
       project_id: projectId,
       sdk_session_id: null,
       status: "active",
-      seeded_from_records_at: nowIso(),
+      seeded_from_records_at: options.seededFromRecords === false ? null : nowIso(),
       created_at: nowIso(),
       last_resumed_at: null,
     };
@@ -158,14 +161,27 @@ export function compactSession(
 
 /** Chat history for a project spans compacted sessions — memory survives. */
 export function listProjectTurns(db: GalapagosDb, projectId: string): ManagerTurnRow[] {
+  // rowid = insertion order: same-millisecond turns across a compaction
+  // boundary would tie on created_at.
   return db
     .prepare(
       `SELECT manager_turns.* FROM manager_turns
        JOIN manager_sessions ON manager_sessions.id = manager_turns.session_id
        WHERE manager_sessions.project_id = ?
-       ORDER BY manager_turns.created_at, manager_turns.turn_index`,
+       ORDER BY manager_turns.rowid`,
     )
     .all(projectId) as ManagerTurnRow[];
+}
+
+export function getTurn(db: GalapagosDb, turnId: string): ManagerTurnRow | undefined {
+  return db.prepare("SELECT * FROM manager_turns WHERE id = ?").get(turnId) as
+    | ManagerTurnRow
+    | undefined;
+}
+
+/** Replace a turn's content payload (used to stamp a re-brief as cleared). */
+export function updateTurnContent(db: GalapagosDb, turnId: string, content: string): void {
+  db.prepare("UPDATE manager_turns SET content = ? WHERE id = ?").run(content, turnId);
 }
 
 /** Stamp every not-yet-distilled turn of a session as covered. */
