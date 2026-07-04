@@ -7,3 +7,4 @@ dist-node/
 .env
 .env.*
 .DS_Store
+tsconfig.tsbuildinfo
