@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "concurrently -n daemon,web -c blue,green \"npm:daemon\" \"npm:web\"",
     "daemon": "tsx watch src/daemon/main.ts",
-    "web": "next dev --port 3002",
+    "web": "next dev --port 3005",
     "build": "next build",
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck && npm run test:unit",

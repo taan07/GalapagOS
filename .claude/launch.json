@@ -12,7 +12,7 @@
       "name": "web",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "web"],
-      "port": 3002,
+      "port": 3005,
       "autoPort": false
     }
   ]

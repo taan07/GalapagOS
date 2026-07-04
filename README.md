@@ -26,7 +26,7 @@ APIs.
 
 ## Development
 
-- `npm run dev` — daemon (:4517) + Next.js UI (http://localhost:3002)
+- `npm run dev` — daemon (:4517) + Next.js UI (http://localhost:3005)
 - `npm test` — typecheck + node --test suites (no network)
 - `npm run spike:resume` — proves session resume across process boundaries
   (makes two small real manager turns on your subscription)
