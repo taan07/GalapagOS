@@ -9,14 +9,20 @@ implement `docs/chunks/3.md`. Consult the Claude Agent SDK docs
 
 ## Branch state — read this before writing code
 
-- **Base your work on `claude/chunk-2-durable-memory-w3g1cs`**, not `main`.
-  Chunk 2 lives there and is NOT yet merged. If it has merged into `main` by
-  the time you start, base on `main` instead — check first.
+- **Work on a separate stacked branch** (user-confirmed 2026-07-04):
+  create `claude/chunk-3-workers-lanes` FROM
+  `claude/chunk-2-durable-memory-w3g1cs` and push all Chunk 3 work there.
+  Never commit Chunk 3 code onto the chunk-2 branch — the two chunks are
+  verified independently, and chunk-2 fixes must stay cherry-pickable/
+  mergeable on their own. If chunk 2 has already merged into `main` when
+  you start, stack on `main` instead — check first.
 - Chunk 2's stamp is **BUILT, awaiting the user's live verification** (see
   the stamp in `docs/chunks/2.md` and the drill list in
-  `docs/chunks/2-verification.md`). The user may report Chunk 2 issues while
-  you work; fixes to Chunk 2 surfaces take priority over new Chunk 3 code —
-  the product is a spine, not a pile of features.
+  `docs/chunks/2-verification.md`); Chunk 3 will end in the same state —
+  built and tested here, live drills run by the user. The user may report
+  Chunk 2 issues while you work; fixes to Chunk 2 surfaces take priority
+  over new Chunk 3 code and land on the CHUNK 2 branch (then rebase your
+  stacked branch onto it) — the product is a spine, not a pile of features.
 - All 66 tests green at handoff (`npm test` = typecheck + `node --test` on
   compiled `dist-node/tests`). Keep them green before every commit.
 
