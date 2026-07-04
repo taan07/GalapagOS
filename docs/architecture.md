@@ -157,10 +157,22 @@ Manager tools (in-process `createSdkMcpServer` + `tool()`):
 `write_record(type=decision)` triggers the checkpoint mechanism (section 8).
 
 **Distillation:** after each manager turn, enqueue a `distill` job — one cheap
-follow-up prompt on the same session: "record any durable outcomes of this
-exchange using write_record; write nothing if nothing durable happened." Mark
-covered turns `distilled_at`; auto-commit `docs/galapagos/` when files were
-written.
+follow-up prompt: "record any durable outcomes of this exchange using
+write_record; write nothing if nothing durable happened." Run it on a **fork**
+of the manager session (`resume` + `forkSession: true`) so Darwin's main
+context never accumulates distillation chatter — persist nothing from the fork
+except the records it writes. Use a small model via `GALAPAGOS_DISTILL_MODEL`
+(default `claude-haiku-4-5`) — distillation is extraction, not judgment, and
+must not double the subscription cost of every chat turn. Mark covered turns
+`distilled_at`; auto-commit `docs/galapagos/` when files were written.
+
+**Records are per-project and live in the TARGET repo.** All record paths are
+`<project.root_path>/docs/galapagos/…`, and distill commits go to the target
+project's own git history. The mutating-git surface for this stays as narrow
+as project-init: stage only paths under `docs/galapagos/`, never anything
+else; if the target repo is mid-merge/rebase or the commit fails, skip the
+commit and surface a visible attention note — never block the turn, never
+stage user files.
 
 ## 6. Workers
 
