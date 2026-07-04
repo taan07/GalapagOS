@@ -278,34 +278,46 @@ visibly forks. Forbidden always: force-push, tag deletion, history rewriting.
 ## 9. Confidence
 
 One gauge per worker and per project: 0–100 with states
-strong/steady/draining/blocked. Semantics (non-negotiable, encoded in the
-ported regression suite): confidence = intervention need, not progress; records
-alone cap below strong (real evidence required); required check failures block;
-stale evidence drains; unsupported claims lower; contradictions cap at
-40/blocked; one risky worker lowers project confidence. Detailed caps/signals
-live in a debug drilldown, never as default sub-bars.
+strong/steady/draining/blocked. Semantics (non-negotiable): confidence =
+intervention need, not progress; records alone cap below strong (real evidence
+required); required check failures block; stale evidence drains; unsupported
+claims lower; contradictions cap hard; one risky worker lowers project
+confidence. Detailed caps/signals live in a debug drilldown, never as default
+sub-bars.
+
+The engine is pure (inputs in, explainable report out) and is proven by a
+**regression suite of gold scenarios**, written with the engine, that must
+encode at least:
+
+- complete manager clarity + fresh required evidence can reach strong
+- complete manager clarity with no real evidence stays below strong
+- a missing or failed required check blocks; a failed optional check lowers
+  without blocking
+- evidence that predates a head/dirty-state change is stale and drains
+- a claim marked supported without linked evidence lowers (honesty is
+  observable support, not confident wording)
+- a contradicted claim caps hard (≈40/blocked)
+- one risky worker lowers project confidence even when others are healthy
+- every score's caps and signals identify their reason (no opaque numbers)
 
 Every UI field everywhere carries source attribution (source, sourceLabel,
 sourceRecords) — missing data renders as explicitly missing, never fabricated.
 
-## 10. Ported sources (from the prior prototype)
+## 10. Lineage
 
-Port these near-verbatim, with their tests, from `/Users/taan/Dev/karz98rk`
-(read-only reference; never modify that repo):
+Galapagos descends from a failed but hopeful rough idea that grew into a messy
+codebase (karz98rk). We keep its **intent** — evidence over claims, a manager
+that absorbs cognitive load, calm clarity, honest confidence — and none of its
+code. **Do not read, reference, or copy from that repository.** Every module
+here is written fresh against this contract; the contract itself carries
+everything worth keeping (the confidence semantics in §9, the record
+discipline in §4, the trust rules throughout). The lesson of the lineage is
+the one to honor: contamination starts with "let me just see how the old one
+did it."
 
-| Into Galapagos | Source | Notes |
-|---|---|---|
-| `core/confidence/engine.ts` | `src/manager-clarity/confidence-engine.ts` | rename thread_brief→worker_brief; drop lifecycle/manager_run blocks; keep every cap/evidence semantic. Tests: `tests/manager-confidence-engine.test.ts`, `tests/confidence-engine.test.ts` |
-| `core/git/parsers.ts` | `src/git-truth/parsers.ts` | verbatim. Tests: `tests/parsers.test.ts` |
-| `adapters/git/runner.ts` | `src/git-truth/adapter.ts` | verbatim (read-only runner). Tests: `tests/adapter.test.ts` |
-| `core/records/frontmatter.ts` | `src/obsidian/frontmatter.ts` | verbatim. Tests: frontmatter cases in `tests/obsidian.test.ts` |
-| `adapters/records/store.ts` | `src/server/manager-docs.ts` | port mechanics (wx creates, type dirs, status lifecycle, decision validation); replace the 14 pcc_types with the 8 glp_types |
-| `adapters/checks/run-checks.ts` | `src/local-session-reporter/checks.ts` | verbatim mechanics |
-| clarity view-model pattern | `src/manager-clarity/view-model.ts` | rewrite trimmed; keep the source-attribution pattern. Test patterns: `tests/manager-clarity-view-model.test.ts` |
-
-Not ported (rewritten or dropped): Convex/app-data layer, codex-connector,
-openwebui, recap pipeline, handoff-parser, evidence adapter (rewrite thin over
-SQLite rows).
+(Historical note: Chunk 1 predates this rule and ported the pure git parsers
+and read-only runner with their tests; that code is now simply Galapagos code
+— tested, committed, and maintained here. The no-copy rule is prospective.)
 
 ## 11. Known risks (designed-for)
 
