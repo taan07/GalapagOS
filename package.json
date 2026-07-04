@@ -3,7 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "test": "echo \"Implemented in Chunk 1 (typecheck + node --test)\" && exit 1"
+    "dev": "concurrently -n daemon,web -c blue,green \"npm:daemon\" \"npm:web\"",
+    "daemon": "tsx watch src/daemon/main.ts",
+    "web": "next dev",
+    "build": "next build",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && npm run test:unit",
+    "test:unit": "tsc --project tsconfig.node.json && node --test \"dist-node/tests/*.test.js\"",
+    "spike:resume": "tsx scripts/spike-resume.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "latest",
@@ -11,7 +18,8 @@
     "next": "latest",
     "picomatch": "latest",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "zod": "latest"
   },
   "devDependencies": {
     "@types/better-sqlite3": "latest",
@@ -20,6 +28,7 @@
     "@types/react": "latest",
     "@types/react-dom": "latest",
     "concurrently": "latest",
+    "tsx": "latest",
     "typescript": "latest"
   }
 }

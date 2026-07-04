@@ -17,16 +17,32 @@ Three processes, one machine, no cloud:
   **:4517**. Owns ALL Agent SDK subprocesses (manager and workers). Small API:
   `POST /manager/message` (SSE reply), `POST /workers`, `POST /workers/:id/steer`,
   `POST /workers/:id/stop`, `GET /events` (SSE), `GET /health`.
-- **SQLite** — the single operational store, at `.galapagos/state.db` inside the
-  target project repo. Every streamed message, job, heartbeat, and attention
-  item is persisted as it lands. Nothing state-bearing lives in module-level
-  memory; the daemon can be killed at any moment and lose nothing durable.
+- **SQLite** — the single operational store, at **`~/.galapagos/state.db`**
+  (user-level, central; override dir with `GALAPAGOS_STATE_DIR`). Galapagos is
+  multi-project from Chunk 1: a `projects` table is the registry, every other
+  table is scoped by `project_id`, and the UI carries a project picker plus an
+  Add-project flow (which offers one-click `git init` for non-git projects —
+  Galapagos never manages a project without history). Every streamed message,
+  job, heartbeat, and attention item is persisted as it lands. Nothing
+  state-bearing lives in module-level memory; the daemon can be killed at any
+  moment and lose nothing durable.
 
 Reads go straight to SQLite (Next route handlers open the db read-only);
 commands and live streams go through the daemon.
 
 **Durable memory** is separate from operational state: git-committed markdown
 records at `docs/galapagos/` in the target repo (section 4).
+
+**Interim memory (Chunk 1 → 2 bridge): agreed specifics in Obsidian.** Until
+the records store lands, every answer the user gives Darwin is written as one
+markdown file to `<GALAPAGOS_VAULT_PATH>/Galapagos/<project-slug>/specifics/`
+(vault default: `/Users/taan/Documents/Obsidian Vault`). Filenames are
+date-prefixed kebab-case; frontmatter carries `glp_type: agreed_specific`,
+`question`, `answer` (summary — full answer in the body), `project`, `status`
+(`agreed | superseded | deferred`), `created_at`. Chunk 2's records store MUST
+ingest these files (mapping them onto `user_answer`/`routed_clarification`
+records) rather than starting memory from zero. Writes use the wx flag and a
+resolve-inside-vault guard.
 
 ## 2. Module boundaries
 
@@ -113,10 +129,20 @@ noise (runs, recaps, attention, liveness) belongs in SQLite, never in records.
 
 One logical manager session per project. Each user turn:
 `query({ prompt, options: { resume: lastSdkSessionId, cwd: projectRoot,
-mcpServers: { galapagos: managerToolServer }, systemPrompt: managerDoctrine,
-allowedTools, model } })`. The SDK may return a new session id per run —
-persist it to `manager_turns.sdk_session_id_after` after **every** turn; resume
-always uses the latest.
+mcpServers: { galapagos: { type: "sdk", serverInstance } }, systemPrompt:
+managerDoctrine, allowedTools, model } })`. The manager model is pinned via
+`GALAPAGOS_MANAGER_MODEL` (default `claude-fable-5`).
+
+Verified SDK facts (code.claude.com/docs/en/agent-sdk — do not re-derive):
+the session id is surfaced on the init message (`type === "system" &&
+subtype === "init"` → `session_id`) and on every `result` message; persist it
+to `manager_turns.sdk_session_id_after` after **every** turn — resume always
+uses the latest. **Resume is cwd-keyed**: transcripts live at
+`~/.claude/projects/<encoded-cwd>/*.jsonl`, and resuming from a different cwd
+silently starts a blank session — the daemon must pass the project root as
+`cwd` on every query, always. In-process tools are `tool(name, description,
+zodShape, handler)` (zod is a required dependency) grouped by
+`createSdkMcpServer({ name, version, tools })`.
 
 **Resume is an optimization, never a dependency.** On resume failure or context
 bloat, compact by **re-brief**: open a fresh session whose first message is

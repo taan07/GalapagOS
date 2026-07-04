@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "rootDir": ".",
+    "outDir": "dist-node"
+  },
+  "include": [
+    "src/config.ts",
+    "src/core/**/*.ts",
+    "src/adapters/**/*.ts",
+    "src/daemon/**/*.ts",
+    "tests/**/*.ts"
+  ]
+}
