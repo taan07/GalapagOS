@@ -341,94 +341,20 @@ select:focus {
   font-size: 13px;
 }
 
-.tabs {
+.action-row,
+.create-row {
   display: flex;
-  gap: 6px;
-}
-
-.tab {
-  background: transparent;
-  border: 1px solid transparent;
-  color: var(--muted);
-}
-
-.tab.active {
-  background: var(--surface-raised);
-  border-color: var(--line);
-  color: var(--ink);
-}
-
-.crumb-row {
-  display: flex;
-  align-items: center;
   gap: 8px;
 }
 
-.crumb {
+.create-row input {
   flex: 1;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
-.browser {
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  max-height: 320px;
-  overflow-y: auto;
-  background: var(--bg);
-}
-
-.browser-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--line);
-}
-
-.browser-row:last-child {
-  border-bottom: none;
-}
-
-.dir-name {
-  flex: 1;
-  text-align: left;
-  background: transparent;
+.divider {
   border: none;
-  padding: 4px 2px;
-  font-family: var(--mono);
-  font-size: 13px;
-}
-
-.dir-name:hover {
-  color: var(--accent);
-}
-
-.badges {
-  display: flex;
-  gap: 4px;
-}
-
-.badge {
-  font-size: 10.5px;
-  padding: 1px 7px;
-  border-radius: 999px;
-  border: 1px solid var(--line);
-  color: var(--muted);
-}
-
-.badge.git {
-  color: var(--ok);
-  border-color: color-mix(in srgb, var(--ok) 40%, var(--line));
-}
-
-.badge.registered {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+  border-top: 1px solid var(--line);
+  margin: 4px 0;
 }
 
 .git-offer {

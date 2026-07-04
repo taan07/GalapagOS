@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import type { ProjectView } from "./types";
 
 export function ProjectPicker({
@@ -32,51 +32,30 @@ export function ProjectPicker({
   );
 }
 
-type BrowseEntry = {
-  name: string;
-  path: string;
-  isGitRepo: boolean;
-  isRegistered: boolean;
-};
-
-type BrowseResult = {
-  path: string;
-  parent: string | null;
-  devRoot: string;
-  entries: BrowseEntry[];
-};
-
 export function AddProjectForm({
   onRegistered,
 }: {
   onRegistered: (project: ProjectView) => void | Promise<void>;
 }) {
-  const [mode, setMode] = useState<"browse" | "create">("browse");
-  const [browse, setBrowse] = useState<BrowseResult | null>(null);
+  const [devRoot, setDevRoot] = useState<string>("~/Dev");
   const [newName, setNewName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [gitInitPath, setGitInitPath] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-
-  const loadDir = useCallback(async (dirPath?: string) => {
-    setError(null);
-    setGitInitPath(null);
-    const search = dirPath ? `?path=${encodeURIComponent(dirPath)}` : "";
-    const response = await fetch(`/api/fs/browse${search}`, { cache: "no-store" });
-    const payload = (await response.json()) as BrowseResult & { error?: string };
-    if (!response.ok) {
-      setError(payload.error ?? `Browse failed (${response.status}).`);
-      return;
-    }
-    setBrowse(payload);
-  }, []);
+  const [busy, setBusy] = useState<"choose" | "create" | "register" | null>(null);
 
   useEffect(() => {
-    void loadDir();
-  }, [loadDir]);
+    void fetch("/api/daemon-health", { cache: "no-store" })
+      .then((response) => response.json())
+      .then((payload: { devRoot?: string }) => {
+        if (payload.devRoot) {
+          setDevRoot(payload.devRoot);
+        }
+      })
+      .catch(() => undefined);
+  }, []);
 
   const register = async (rootPath: string, initGit: boolean) => {
-    setSubmitting(true);
+    setBusy("register");
     setError(null);
     try {
       const response = await fetch("/api/projects", {
@@ -101,13 +80,40 @@ export function AddProjectForm({
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
-      setSubmitting(false);
+      setBusy(null);
+    }
+  };
+
+  const chooseFolder = async () => {
+    setBusy("choose");
+    setError(null);
+    setGitInitPath(null);
+    try {
+      const response = await fetch("/api/system/choose-folder", { method: "POST" });
+      const payload = (await response.json()) as {
+        path?: string;
+        cancelled?: boolean;
+        error?: string;
+      };
+      if (!response.ok) {
+        setError(payload.error ?? `Folder chooser failed (${response.status}).`);
+        return;
+      }
+      if (payload.cancelled || !payload.path) {
+        return;
+      }
+      await register(payload.path, false);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(null);
     }
   };
 
   const createProject = async () => {
-    setSubmitting(true);
+    setBusy("create");
     setError(null);
+    setGitInitPath(null);
     try {
       const response = await fetch("/api/projects/create", {
         method: "POST",
@@ -123,109 +129,51 @@ export function AddProjectForm({
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
-      setSubmitting(false);
+      setBusy(null);
     }
   };
 
   return (
     <div className="add-project">
       <h1>Add a project</h1>
-      <div className="tabs" role="tablist">
-        <button
-          className={mode === "browse" ? "tab active" : "tab"}
-          onClick={() => setMode("browse")}
-        >
-          Browse existing
+      <p>
+        Register an existing folder for Darwin to manage — the system folder chooser opens in
+        your dev folder — or create a brand-new project from a name.
+      </p>
+      <div className="action-row">
+        <button disabled={busy !== null} onClick={() => void chooseFolder()}>
+          {busy === "choose" ? "Chooser open…" : "Choose folder…"}
         </button>
         <button
-          className={mode === "create" ? "tab active" : "tab"}
-          onClick={() => setMode("create")}
+          disabled={busy !== null}
+          onClick={() => void fetch("/api/system/reveal", { method: "POST" })}
         >
-          Create new
+          Open dev folder in Finder
         </button>
       </div>
-
-      {mode === "browse" ? (
-        <>
-          <p>
-            Pick a folder for Darwin to manage. Folders without git history get a one-click init
-            — Galapagos never manages a project without history.
-          </p>
-          {browse ? (
-            <>
-              <div className="crumb-row">
-                <button
-                  disabled={!browse.parent}
-                  onClick={() => browse.parent && void loadDir(browse.parent)}
-                  aria-label="Up one folder"
-                >
-                  ↑ Up
-                </button>
-                <code className="crumb">{browse.path}</code>
-                {browse.path !== browse.devRoot ? (
-                  <button onClick={() => void loadDir(browse.devRoot)}>Dev folder</button>
-                ) : null}
-              </div>
-              <div className="browser">
-                {browse.entries.length === 0 ? (
-                  <p className="empty-note">No subfolders here.</p>
-                ) : (
-                  browse.entries.map((entry) => (
-                    <div className="browser-row" key={entry.path}>
-                      <button className="dir-name" onClick={() => void loadDir(entry.path)}>
-                        {entry.name}/
-                      </button>
-                      <span className="badges">
-                        {entry.isGitRepo ? <span className="badge git">git</span> : null}
-                        {entry.isRegistered ? (
-                          <span className="badge registered">registered</span>
-                        ) : null}
-                      </span>
-                      <button
-                        disabled={submitting || entry.isRegistered}
-                        onClick={() => void register(entry.path, false)}
-                      >
-                        {entry.isRegistered ? "Added" : "Register"}
-                      </button>
-                    </div>
-                  ))
-                )}
-              </div>
-            </>
-          ) : (
-            <p className="empty-note">Loading folders…</p>
-          )}
-        </>
-      ) : (
-        <>
-          <p>
-            Name a brand-new project. Galapagos creates the folder in your dev folder, seeds a
-            README, starts git history, and registers it — ready for Darwin immediately.
-          </p>
-          <input
-            value={newName}
-            placeholder="Project name"
-            onChange={(event) => setNewName(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && newName.trim()) {
-                void createProject();
-              }
-            }}
-          />
-          {browse ? (
-            <span className="hint">
-              Will create: <code>{browse.devRoot}/{newName.trim() || "…"}</code>
-            </span>
-          ) : null}
-          <button
-            disabled={submitting || newName.trim().length === 0}
-            onClick={() => void createProject()}
-          >
-            Create and register
-          </button>
-        </>
-      )}
-
+      <hr className="divider" />
+      <div className="create-row">
+        <input
+          value={newName}
+          placeholder="New project name"
+          onChange={(event) => setNewName(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && newName.trim()) {
+              void createProject();
+            }
+          }}
+        />
+        <button
+          disabled={busy !== null || newName.trim().length === 0}
+          onClick={() => void createProject()}
+        >
+          {busy === "create" ? "Creating…" : "Create new project"}
+        </button>
+      </div>
+      <span className="hint">
+        Creates <code>{devRoot}/{newName.trim() || "…"}</code> with a README and git history,
+        registered and Darwin-ready.
+      </span>
       {error ? <div className="field-error">{error}</div> : null}
       {gitInitPath ? (
         <div className="git-offer">
@@ -233,7 +181,7 @@ export function AddProjectForm({
             <code>{gitInitPath}</code> has no git history. Initialize it now? (Creates an initial
             commit of the current contents, respecting any .gitignore.)
           </span>
-          <button disabled={submitting} onClick={() => void register(gitInitPath, true)}>
+          <button disabled={busy !== null} onClick={() => void register(gitInitPath, true)}>
             Initialize git and register
           </button>
         </div>

@@ -8,6 +8,7 @@ import {
   registerProject,
 } from "../adapters/db/repos/projects";
 import { runManagerTurn, type ManagerTurnEvent } from "../adapters/agent/manager-session";
+import { chooseFolder, revealFolder } from "../adapters/system/dialogs";
 
 const db = openDb(config.stateDir);
 // The only module-level state: live SSE clients and per-project busy flags.
@@ -144,12 +145,26 @@ async function handleCreateProject(
   }
 }
 
+async function handleChooseFolder(res: http.ServerResponse): Promise<void> {
+  try {
+    const result = await chooseFolder(config.devRoot);
+    sendJson(res, 200, result);
+  } catch (error) {
+    sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url ?? "/", "http://localhost");
   const route = `${req.method} ${url.pathname}`;
 
   if (route === "GET /health") {
-    sendJson(res, 200, { ok: true, service: "galapagos-daemon", model: config.managerModel });
+    sendJson(res, 200, {
+      ok: true,
+      service: "galapagos-daemon",
+      model: config.managerModel,
+      devRoot: config.devRoot,
+    });
     return;
   }
   if (route === "GET /projects") {
@@ -160,6 +175,18 @@ const server = http.createServer((req, res) => {
     void handleRegisterProject(req, res).catch((error) => {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     });
+    return;
+  }
+  if (route === "POST /system/choose-folder") {
+    void handleChooseFolder(res);
+    return;
+  }
+  if (route === "POST /system/reveal-dev-root") {
+    void revealFolder(config.devRoot)
+      .then(() => sendJson(res, 200, { ok: true }))
+      .catch((error) =>
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) }),
+      );
     return;
   }
   if (route === "POST /projects/create") {
