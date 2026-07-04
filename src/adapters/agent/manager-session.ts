@@ -3,6 +3,7 @@ import type { GalapagosConfig } from "../../config";
 import type { GalapagosDb } from "../db/db";
 import {
   appendTurn,
+  deleteTurns,
   getOrCreateActiveSession,
   latestSdkSessionId,
   markSessionResumed,
@@ -48,6 +49,8 @@ export async function runManagerTurn(input: {
 
   let sdkSessionId: string | null = null;
   let lastPersistedTurnId: string | null = null;
+  let attemptTurnIds: string[] = [];
+  let resultWasError = false;
 
   const toolServer = createManagerToolServer({
     projectRoot: project.root_path,
@@ -61,6 +64,7 @@ export async function runManagerTurn(input: {
         sdkSessionIdAfter: sdkSessionId,
       });
       lastPersistedTurnId = turn.id;
+      attemptTurnIds.push(turn.id);
       emit({ type: "tool_use", ...event });
     },
   });
@@ -70,6 +74,7 @@ export async function runManagerTurn(input: {
       prompt: userText,
       options: {
         ...(resume ? { resume } : {}),
+        ...(config.claudeBinPath ? { pathToClaudeCodeExecutable: config.claudeBinPath } : {}),
         cwd: project.root_path,
         model: config.managerModel,
         systemPrompt: buildManagerDoctrine({
@@ -109,6 +114,7 @@ export async function runManagerTurn(input: {
               sdkSessionIdAfter: sdkSessionId ?? message.session_id,
             });
             lastPersistedTurnId = turn.id;
+            attemptTurnIds.push(turn.id);
             emit({ type: "assistant_text", text: block.text });
           }
         }
@@ -117,12 +123,19 @@ export async function runManagerTurn(input: {
 
       if (message.type === "result") {
         sdkSessionId = message.session_id;
+        if (message.subtype !== "success" || message.is_error) {
+          // The CLI ran but the turn failed (auth, model, etc.). The thrown
+          // error after the stream ends carries the message; don't record the
+          // failure text as if Darwin said it.
+          resultWasError = true;
+          deleteTurns(db, attemptTurnIds);
+          attemptTurnIds = [];
+          continue;
+        }
         if (lastPersistedTurnId) {
           updateTurnSdkSessionId(db, lastPersistedTurnId, message.session_id);
         }
-        const resultText =
-          message.subtype === "success" ? message.result : `Turn ended with ${message.subtype}.`;
-        emit({ type: "turn_complete", resultText, sdkSessionId: message.session_id });
+        emit({ type: "turn_complete", resultText: message.result, sdkSessionId: message.session_id });
       }
     }
   };
@@ -131,6 +144,16 @@ export async function runManagerTurn(input: {
     await runQuery(resumeId);
   } catch (error) {
     const messageText = error instanceof Error ? error.message : String(error);
+
+    if (resultWasError) {
+      // The session itself ran — retrying with a fresh session cannot help.
+      const guidance = /not logged in/i.test(messageText)
+        ? " The daemon cannot reach Claude Code's credentials. Start Galapagos from your own terminal (npm run dev) so the spawned Claude binary can use your keychain login, and check `claude /login` status."
+        : "";
+      emit({ type: "turn_error", message: `${messageText}${guidance}` });
+      return;
+    }
+
     if (resumeId) {
       emit({
         type: "rebrief",

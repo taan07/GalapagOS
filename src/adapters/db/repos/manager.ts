@@ -109,6 +109,16 @@ export function listTurns(db: GalapagosDb, sessionId: string): ManagerTurnRow[] 
     .all(sessionId) as ManagerTurnRow[];
 }
 
+export function deleteTurns(db: GalapagosDb, turnIds: string[]): void {
+  const remove = db.prepare("DELETE FROM manager_turns WHERE id = ?");
+  const removeAll = db.transaction((ids: string[]) => {
+    for (const id of ids) {
+      remove.run(id);
+    }
+  });
+  removeAll(turnIds);
+}
+
 export function markSessionResumed(db: GalapagosDb, sessionId: string): void {
   db.prepare("UPDATE manager_sessions SET last_resumed_at = ? WHERE id = ?").run(
     nowIso(),

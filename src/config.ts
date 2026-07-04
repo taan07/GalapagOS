@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -6,6 +7,13 @@ export type GalapagosConfig = {
   vaultPath: string;
   managerModel: string;
   daemonPort: number;
+  /**
+   * Path to the user's logged-in Claude Code binary. The SDK's bundled
+   * runtime cannot read Claude Code's keychain credentials (they are bound
+   * to the binary that created them), so agent sessions must spawn the real
+   * installed binary to run on the subscription.
+   */
+  claudeBinPath: string | undefined;
 };
 
 function expandHome(value: string): string {
@@ -28,11 +36,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GalapagosConfi
     throw new Error(`Invalid GALAPAGOS_DAEMON_PORT: ${env.GALAPAGOS_DAEMON_PORT}`);
   }
 
+  const defaultClaudeBin = path.join(os.homedir(), ".claude", "local", "claude");
+  const claudeBinPath = env.GALAPAGOS_CLAUDE_BIN
+    ? path.resolve(expandHome(env.GALAPAGOS_CLAUDE_BIN))
+    : existsSync(defaultClaudeBin)
+      ? defaultClaudeBin
+      : undefined;
+
   return {
     stateDir,
     vaultPath,
     managerModel: env.GALAPAGOS_MANAGER_MODEL ?? "claude-fable-5",
     daemonPort,
+    claudeBinPath,
   };
 }
 
