@@ -13,6 +13,8 @@ import { Chat } from "./chat";
 import { AddProjectForm, ProjectPicker } from "./project-picker";
 import { SpecificsPanel } from "./specifics-panel";
 
+const LAST_PROJECT_KEY = "galapagos.lastProjectId";
+
 function turnsToChatItems(turns: TurnView[]): ChatItem[] {
   return turns.flatMap((turn): ChatItem[] => {
     if (turn.role === "user") {
@@ -50,8 +52,26 @@ export function App() {
     const response = await fetch("/api/projects", { cache: "no-store" });
     const payload = (await response.json()) as { projects: ProjectView[] };
     setProjects(payload.projects);
-    setSelectedId((current) => current ?? payload.projects[0]?.id ?? null);
+    setSelectedId((current) => {
+      const exists = (id: string | null) =>
+        id !== null && payload.projects.some((project) => project.id === id);
+      if (exists(current)) {
+        return current;
+      }
+      const remembered = localStorage.getItem(LAST_PROJECT_KEY);
+      if (exists(remembered)) {
+        return remembered;
+      }
+      return payload.projects[0]?.id ?? null;
+    });
   }, []);
+
+  // Remember the focused project so reopening the app lands where you left off.
+  useEffect(() => {
+    if (selectedId) {
+      localStorage.setItem(LAST_PROJECT_KEY, selectedId);
+    }
+  }, [selectedId]);
 
   const refreshSpecifics = useCallback(async (projectId: string) => {
     const response = await fetch(`/api/specifics?projectId=${encodeURIComponent(projectId)}`, {
