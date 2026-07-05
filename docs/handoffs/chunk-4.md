@@ -103,6 +103,23 @@ override everything, including this handoff. Then implement
 - 116 tests green at handoff (`npm test` = typecheck + `node --test` on
   `dist-node/tests`). Keep them green before every commit.
 
+## Scope triage/monitor around closing Darwin's sensory loop
+
+A flow review (docs/reviews/manager-worker-flow-2026-07-05.md,
+user-requested) verified that NO path exists today by which worker events
+reach Darwin — he is blind between his own turns, and the user carries
+worker questions from the /workers page into chat by hand. Treat the
+review's Tier 1 as acceptance criteria for this chunk's triage/monitor/
+evidence work, not new scope: (1) a worker turn ending without a
+completion block raises a question-shaped attention item that triage
+consumes — answering from records when covered, steering the worker,
+escalating only direction calls; (2) every manager turn starts with a
+deterministic LLM-free fleet snapshot from SQLite; (3) Darwin can see
+evidence before he speaks — run_checks (already in your brief) plus a
+bounded worker_diff, and a doctrine line that he may read worker worktrees
+read-only. The review's Tier 2/3 items are ruling-gated — build none of
+them without a user-confirmed stamp.
+
 ## What Chunk 3 added (concrete map)
 
 - `src/core/lanes/lane-check.ts` — pure: `checkLane(files, contract)` →
