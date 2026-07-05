@@ -110,7 +110,7 @@ export function Chat({
             </div>
           );
         })}
-        {working ? <div className="working">Darwin is working</div> : null}
+        {working ? <div className="working">Darwin is working — Esc ×3 to stop</div> : null}
       </div>
       <div className="chat-compose">
         <textarea

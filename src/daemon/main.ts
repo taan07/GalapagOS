@@ -1,4 +1,6 @@
+import { execFile } from "node:child_process";
 import http from "node:http";
+import { promisify } from "node:util";
 import { config } from "../config";
 import { openDb } from "../adapters/db/db";
 import {
@@ -27,10 +29,28 @@ import { createRecordsStore } from "../adapters/records/store";
 import { chooseFolder, revealFolder } from "../adapters/system/dialogs";
 
 const db = openDb(config.stateDir);
-// The only module-level state: live SSE clients and per-project busy flags.
-// Everything durable lives in SQLite.
+// The only module-level state: live SSE clients, per-project busy flags, and
+// the in-flight turn kill switches. Everything durable lives in SQLite.
 const busyProjects = new Set<string>();
 const eventClients = new Set<http.ServerResponse>();
+const activeTurnControllers = new Map<string, AbortController>();
+
+const execFileAsync = promisify(execFile);
+
+// Which code is this process actually running? Learned the hard way: a stale
+// daemon once masqueraded as current through a whole verification session.
+const codeIdentity = { revision: "unknown", branch: "unknown" };
+async function resolveCodeIdentity(): Promise<void> {
+  try {
+    // npm scripts run from the package root, which is the galapagos checkout.
+    const git = (args: string[]) =>
+      execFileAsync("git", args, { cwd: process.cwd(), encoding: "utf8" });
+    codeIdentity.revision = (await git(["rev-parse", "--short", "HEAD"])).stdout.trim();
+    codeIdentity.branch = (await git(["branch", "--show-current"])).stdout.trim() || "(detached)";
+  } catch {
+    // Not a git checkout (packaged install) — "unknown" is the honest answer.
+  }
+}
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -90,6 +110,13 @@ async function ingestProjectVault(project: ProjectRow): Promise<void> {
       projectSlug: project.slug,
     });
     if (result.ingested.length === 0) {
+      // Pure silence here once cost an hour of "did ingestion even run?" —
+      // say so when there were specifics and they're all already migrated.
+      if (result.skipped > 0) {
+        console.log(
+          `[records] ${project.slug}: ${result.skipped} vault specific${result.skipped === 1 ? "" : "s"} already migrated`,
+        );
+      }
       return;
     }
     const commit = await commitRecords(
@@ -137,18 +164,35 @@ async function handleManagerMessage(
   };
 
   try {
-    const outcome = await runManagerTurn({ db, config, project, userText: text, emit });
+    // One kill switch per phase: interrupting the turn must not also kill the
+    // distill pass that follows (the user chose to keep it), but a second
+    // triple-Esc during distillation aborts the fork too.
+    const turnController = new AbortController();
+    activeTurnControllers.set(projectId, turnController);
+    const outcome = await runManagerTurn({
+      db,
+      config,
+      project,
+      userText: text,
+      emit,
+      abortController: turnController,
+    });
 
     // Post-turn distillation runs while the stream (and the busy flag) is
     // still held: the manager session must never be forked concurrently with
     // a new user turn. The fork's records land before the input unlocks.
-    if (outcome.completed) {
+    // Interrupted turns still distill — partial exchanges can hold durable
+    // agreements, and the records commit must happen regardless.
+    if (outcome.completed || outcome.interrupted) {
+      const distillController = new AbortController();
+      activeTurnControllers.set(projectId, distillController);
       const distill = await runDistillJob({
         db,
         config,
         project,
         sessionId: outcome.sessionId,
         sdkSessionId: outcome.sdkSessionId,
+        abortController: distillController,
       });
       sseWrite(res, {
         type: "distilled",
@@ -166,9 +210,30 @@ async function handleManagerMessage(
       message: error instanceof Error ? error.message : String(error),
     });
   } finally {
+    activeTurnControllers.delete(projectId);
     busyProjects.delete(projectId);
     res.end();
   }
+}
+
+/** Triple-Esc in the UI lands here: kill whatever phase is in flight. */
+async function handleInterrupt(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const body = await readBody(req);
+  const projectId = asString(body.projectId);
+  if (!projectId) {
+    sendJson(res, 400, { error: "projectId is required." });
+    return;
+  }
+  const controller = activeTurnControllers.get(projectId);
+  if (!controller) {
+    sendJson(res, 409, { error: "No turn in flight for this project." });
+    return;
+  }
+  controller.abort();
+  sendJson(res, 200, { ok: true });
 }
 
 /**
@@ -305,6 +370,8 @@ const server = http.createServer((req, res) => {
       service: "galapagos-daemon",
       model: config.managerModel,
       devRoot: config.devRoot,
+      revision: codeIdentity.revision,
+      branch: codeIdentity.branch,
     });
     return;
   }
@@ -336,6 +403,12 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
+  if (route === "POST /manager/interrupt") {
+    void handleInterrupt(req, res).catch((error) => {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    });
+    return;
+  }
   if (route === "POST /manager/rebrief/clear") {
     void handleClearRebrief(req, res).catch((error) => {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
@@ -361,11 +434,12 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(config.daemonPort, "127.0.0.1", () => {
-  console.log(
-    `galapagos daemon listening on http://127.0.0.1:${config.daemonPort} (state: ${config.stateDir}, model: ${config.managerModel})`,
-  );
-  // Idempotent per-project vault ingestion on every start (chunk 2 brief).
   void (async () => {
+    await resolveCodeIdentity();
+    console.log(
+      `galapagos daemon listening on http://127.0.0.1:${config.daemonPort} (rev: ${codeIdentity.revision} on ${codeIdentity.branch}, state: ${config.stateDir}, model: ${config.managerModel})`,
+    );
+    // Idempotent per-project vault ingestion on every start (chunk 2 brief).
     for (const project of listProjects(db)) {
       await ingestProjectVault(project);
     }

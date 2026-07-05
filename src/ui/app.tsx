@@ -205,6 +205,8 @@ export function App() {
                   },
                 },
               ]);
+            } else if (event.type === "interrupted") {
+              setItems((current) => [...current, { kind: "note", text: event.message }]);
             } else if (event.type === "distilled") {
               // Silent when nothing durable happened; visible when memory
               // changed or when a records commit had to be skipped.
@@ -249,6 +251,33 @@ export function App() {
     },
     [refreshSpecifics],
   );
+
+  // Triple-Esc within ~a second force-interrupts the in-flight turn, so a
+  // queued message gets through without waiting Darwin out.
+  const escPressesRef = useRef<number[]>([]);
+  useEffect(() => {
+    if (!working || !selectedId) {
+      escPressesRef.current = [];
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+      const now = Date.now();
+      escPressesRef.current = [...escPressesRef.current.filter((t) => now - t < 900), now];
+      if (escPressesRef.current.length >= 3) {
+        escPressesRef.current = [];
+        void fetch("/api/manager/interrupt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectId: selectedId }),
+        });
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [working, selectedId]);
 
   // Drain the queue whenever Darwin finishes a turn.
   useEffect(() => {

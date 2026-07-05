@@ -33,6 +33,7 @@ export type ManagerTurnEvent =
       turnId: string | null;
     }
   | { type: "turn_complete"; resultText: string; sdkSessionId: string | null }
+  | { type: "interrupted"; message: string }
   | { type: "turn_error"; message: string };
 
 /** Persisted payload of a system re-brief turn (manager_turns.content). */
@@ -51,6 +52,8 @@ export type ManagerTurnOutcome = {
   /** Resume pointer after the turn; null when the turn never completed. */
   sdkSessionId: string | null;
   completed: boolean;
+  /** True when the user force-stopped the turn (triple-Esc). */
+  interrupted: boolean;
 };
 
 const MANAGER_ALLOWED_TOOLS = [
@@ -107,6 +110,8 @@ export async function runManagerTurn(input: {
   project: ProjectRow;
   userText: string;
   emit: EmitManagerTurnEvent;
+  /** Aborting this kills the in-flight SDK turn (triple-Esc interrupt). */
+  abortController?: AbortController;
 }): Promise<ManagerTurnOutcome> {
   const { db, config, project, userText, emit } = input;
   const store = createRecordsStore(project.root_path, project.slug);
@@ -183,6 +188,7 @@ export async function runManagerTurn(input: {
       prompt: promptText,
       options: {
         ...baseQueryOptions({ config, cwd: project.root_path, resume }),
+        ...(input.abortController ? { abortController: input.abortController } : {}),
         model: config.managerModel,
         systemPrompt: buildManagerDoctrine({
           projectName: project.name,
@@ -260,12 +266,27 @@ export async function runManagerTurn(input: {
     sessionId: session.id,
     sdkSessionId,
     completed,
+    interrupted: input.abortController?.signal.aborted ?? false,
   });
 
   try {
     await runQuery(resumeId, prompt);
   } catch (error) {
     const messageText = error instanceof Error ? error.message : String(error);
+
+    if (input.abortController?.signal.aborted) {
+      // Deliberate stop, not a failure: keep whatever streamed (it happened),
+      // never retry or re-brief, and leave the session resumable from the
+      // init pointer so the next turn continues with full context.
+      const note = "Turn interrupted — Darwin stopped mid-turn at your request.";
+      appendTurn(db, {
+        sessionId: session.id,
+        role: "system",
+        content: JSON.stringify({ kind: "note", text: note }),
+      });
+      emit({ type: "interrupted", message: note });
+      return outcome();
+    }
 
     if (resultWasError) {
       // The session itself ran — retrying with a fresh session cannot help.

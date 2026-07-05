@@ -52,6 +52,7 @@ export type ManagerStreamEvent =
   | { type: "tool_use"; tool: string; summary: string; detail: string }
   | { type: "rebrief"; reason: string; preamble: string | null; turnId: string | null }
   | { type: "turn_complete"; resultText: string; sdkSessionId: string | null }
+  | { type: "interrupted"; message: string }
   | {
       type: "distilled";
       recordsWritten: number;

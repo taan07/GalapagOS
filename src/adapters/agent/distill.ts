@@ -23,7 +23,12 @@ const DISTILL_ALLOWED_TOOLS = [
 const DISTILL_PROMPT = `Post-turn distillation pass. Record any durable outcomes of this exchange
 using write_record (or update_record to resolve/supersede an existing record —
 check read_records before writing to avoid duplicates). Durable means: an
-agreed answer, a goal, a plan, an open or deferred question, a real decision.
+agreed answer, a goal, a plan the user accepted, an open or deferred
+question, a real decision the user made.
+A proposal the user has NOT yet accepted is none of those — record it as an
+open_question ("user has not yet decided: <the call to make>") so it keeps
+being re-raised, or write nothing; never write implementation_plan or
+decision records for directions the user has not approved.
 If the exchange reversed or revised a previously recorded answer, mark the
 old record superseded via update_record with a note naming the replacement —
 a stale record left standing as agreed is memory corruption, worse than a
@@ -51,6 +56,8 @@ export async function runDistillJob(input: {
   sessionId: string;
   /** Resume pointer of the manager session to fork; null = nothing to fork. */
   sdkSessionId: string | null;
+  /** Shared with the main turn: a triple-Esc during distill aborts the fork. */
+  abortController?: AbortController;
 }): Promise<DistillOutcome> {
   const { db, config, project } = input;
   const job = createJob(db, "distill", {
@@ -89,6 +96,7 @@ export async function runDistillJob(input: {
             resume: input.sdkSessionId,
             forkSession: true,
           }),
+          ...(input.abortController ? { abortController: input.abortController } : {}),
           model: config.distillModel,
           systemPrompt: DISTILL_SYSTEM_PROMPT,
           mcpServers: { galapagos: toolServer },
@@ -111,7 +119,11 @@ export async function runDistillJob(input: {
     } catch (error) {
       // Auth or spawn failure: never retry on a fresh session (a fork without
       // the parent's context has nothing to distill) — surface and move on.
-      distillError = error instanceof Error ? error.message : String(error);
+      distillError = input.abortController?.signal.aborted
+        ? "distillation interrupted by user"
+        : error instanceof Error
+          ? error.message
+          : String(error);
     }
   }
 

@@ -58,6 +58,11 @@ your memory across sessions. It survives compaction; conversation does not.
   supersede stale records, append dated notes. Closed statuses only exist
   via update, and a decision cannot close without its chosen_path.
 
+A proposal YOU made that the user has not yet accepted is not durable:
+record it as an open_question ("user has not yet decided: …") so it gets
+re-raised until answered — never as an implementation_plan or decision.
+Those two types exist only for calls the user has actually made.
+
 When the user reverses or revises something already recorded, handle it in
 that same turn, in this order: find the affected record with read_records,
 mark it superseded with update_record (note which answer replaces it), then

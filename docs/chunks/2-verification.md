@@ -6,6 +6,11 @@ npm install && npm test` (expect 66/66), then `npm run dev`. The drills only
 ever commit `docs/galapagos/` paths in the target project, so a real project
 is safe; use a scratch project if you prefer.
 
+**Before anything else, confirm which code is actually running** (a stale
+daemon holding :4517 once masqueraded as current for a whole session):
+`curl -s localhost:4517/health` — check `revision`/`branch` match your
+checkout (`git log --oneline -1`). The daemon startup line prints the same.
+
 ## 1. Ingestion on startup — memory didn't reset
 
 - Daemon terminal shows `[records] <slug>: ingested N vault specifics
