@@ -130,7 +130,8 @@ override everything, including this handoff. Then implement
 - `/workers` page: list + drilldown, live stream, digest card, attention
   rows, and a user-confirmed Stop escape hatch (spawn/steer stay
   chat-only). Your gauges and attention queue extend these surfaces.
-- Config: `GALAPAGOS_WORKER_MODEL` (default claude-fable-5).
+- Config: `GALAPAGOS_WORKER_MODEL` (default claude-opus-4-8) and
+  `GALAPAGOS_WORKER_EFFORT` (default high) — user-confirmed 2026-07-05.
 
 ## Conventions established in Chunk 3 — follow them
 

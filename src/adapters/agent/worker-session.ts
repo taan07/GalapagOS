@@ -218,6 +218,9 @@ export function spawnWorkerSession(input: SpawnWorkerSessionInput): WorkerSessio
         permissionMode: "default",
       }),
       model: input.model,
+      // Reasoning depth for implementation work (user-confirmed: high).
+      // Pinned explicitly so an upstream default change never moves it.
+      effort: input.config.workerEffort,
       systemPrompt: input.systemPrompt,
       allowedTools: WORKER_ALLOWED_TOOLS,
       canUseTool: workerCanUseTool(input.lane, input.worktreePath),

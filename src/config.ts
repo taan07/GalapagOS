@@ -2,6 +2,11 @@ import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+/** Mirrors the Agent SDK's EffortLevel — validated here so a typo in the
+ * env var fails the daemon at boot, not silently mid-spawn. */
+export const WORKER_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type WorkerEffort = (typeof WORKER_EFFORT_LEVELS)[number];
+
 export type GalapagosConfig = {
   stateDir: string;
   vaultPath: string;
@@ -13,6 +18,8 @@ export type GalapagosConfig = {
   distillModel: string;
   /** Model worker sessions run on — workers do real implementation work. */
   workerModel: string;
+  /** Reasoning effort for worker sessions (user-confirmed: high). */
+  workerEffort: WorkerEffort;
   daemonPort: number;
   /** Where new projects are created and where folder browsing starts. */
   devRoot: string;
@@ -33,6 +40,18 @@ function expandHome(value: string): string {
     return path.join(os.homedir(), value.slice(2));
   }
   return value;
+}
+
+function parseWorkerEffort(value: string | undefined): WorkerEffort {
+  if (value === undefined) {
+    return "high";
+  }
+  if ((WORKER_EFFORT_LEVELS as readonly string[]).includes(value)) {
+    return value as WorkerEffort;
+  }
+  throw new Error(
+    `Invalid GALAPAGOS_WORKER_EFFORT: ${value} — expected one of ${WORKER_EFFORT_LEVELS.join(", ")}.`,
+  );
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): GalapagosConfig {
@@ -57,7 +76,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GalapagosConfi
     vaultPath,
     managerModel: env.GALAPAGOS_MANAGER_MODEL ?? "claude-fable-5",
     distillModel: env.GALAPAGOS_DISTILL_MODEL ?? "claude-haiku-4-5",
-    workerModel: env.GALAPAGOS_WORKER_MODEL ?? "claude-fable-5",
+    // Workers: Opus 4.8 at high effort (user-confirmed 2026-07-05).
+    workerModel: env.GALAPAGOS_WORKER_MODEL ?? "claude-opus-4-8",
+    workerEffort: parseWorkerEffort(env.GALAPAGOS_WORKER_EFFORT),
     daemonPort,
     devRoot: path.resolve(expandHome(env.GALAPAGOS_DEV_ROOT ?? "~/Dev")),
     claudeBinPath,
