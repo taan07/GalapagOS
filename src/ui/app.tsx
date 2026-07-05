@@ -5,6 +5,7 @@ import type {
   ChatItem,
   ManagerStreamEvent,
   ProjectView,
+  RebriefView,
   SpecificView,
   ToolChip,
   TurnView,
@@ -30,6 +31,31 @@ function turnsToChatItems(turns: TurnView[]): ChatItem[] {
       } catch {
         return [];
       }
+    }
+    // System turns carry structured payloads (re-briefs, notes) since Chunk 2;
+    // plain text stays a note for backward compatibility.
+    try {
+      const payload = JSON.parse(turn.content) as
+        | { kind: "rebrief"; reason: string; preamble: string | null; clearedAt: string | null }
+        | { kind: "note"; text: string };
+      if (payload.kind === "rebrief") {
+        return [
+          {
+            kind: "rebrief",
+            rebrief: {
+              turnId: turn.id,
+              reason: payload.reason,
+              preamble: payload.preamble,
+              cleared: payload.clearedAt !== null,
+            },
+          },
+        ];
+      }
+      if (payload.kind === "note") {
+        return [{ kind: "note", text: payload.text }];
+      }
+    } catch {
+      // fall through to plain text
     }
     return [{ kind: "note", text: turn.content }];
   });
@@ -167,7 +193,42 @@ export function App() {
                 void refreshSpecifics(projectId);
               }
             } else if (event.type === "rebrief") {
-              setItems((current) => [...current, { kind: "note", text: event.reason }]);
+              setItems((current) => [
+                ...current,
+                {
+                  kind: "rebrief",
+                  rebrief: {
+                    turnId: event.turnId,
+                    reason: event.reason,
+                    preamble: event.preamble,
+                    cleared: false,
+                  },
+                },
+              ]);
+            } else if (event.type === "interrupted") {
+              setItems((current) => [...current, { kind: "note", text: event.message }]);
+            } else if (event.type === "distilled") {
+              // Silent when nothing durable happened; visible when memory
+              // changed or when a records commit had to be skipped.
+              const notes: string[] = [];
+              if (event.recordsWritten > 0) {
+                notes.push(
+                  `Distilled ${event.recordsWritten} record${event.recordsWritten === 1 ? "" : "s"} into durable memory${event.committed ? " (committed)" : ""}.`,
+                );
+              }
+              if (event.commitSkippedReason) {
+                notes.push(`Records commit skipped: ${event.commitSkippedReason}`);
+              }
+              if (event.error) {
+                notes.push(`Distillation failed: ${event.error}`);
+              }
+              if (notes.length > 0) {
+                setItems((current) => [
+                  ...current,
+                  ...notes.map((text) => ({ kind: "note" as const, text })),
+                ]);
+              }
+              void refreshSpecifics(projectId);
             } else if (event.type === "turn_error") {
               setItems((current) => [
                 ...current,
@@ -190,6 +251,33 @@ export function App() {
     },
     [refreshSpecifics],
   );
+
+  // Triple-Esc within ~a second force-interrupts the in-flight turn, so a
+  // queued message gets through without waiting Darwin out.
+  const escPressesRef = useRef<number[]>([]);
+  useEffect(() => {
+    if (!working || !selectedId) {
+      escPressesRef.current = [];
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+      const now = Date.now();
+      escPressesRef.current = [...escPressesRef.current.filter((t) => now - t < 900), now];
+      if (escPressesRef.current.length >= 3) {
+        escPressesRef.current = [];
+        void fetch("/api/manager/interrupt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectId: selectedId }),
+        });
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [working, selectedId]);
 
   // Drain the queue whenever Darwin finishes a turn.
   useEffect(() => {
@@ -218,6 +306,39 @@ export function App() {
     [selectedId, working, sendNow],
   );
 
+  const handleClearRebrief = useCallback(
+    async (rebrief: RebriefView) => {
+      if (!selectedId || !rebrief.turnId) {
+        return;
+      }
+      const response = await fetch("/api/manager/rebrief/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: selectedId, turnId: rebrief.turnId }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      if (!response.ok) {
+        setItems((current) => [
+          ...current,
+          { kind: "note", text: payload.error ?? `Clearing the re-brief failed (${response.status}).` },
+        ]);
+        return;
+      }
+      setItems((current) => [
+        ...current.map((item) =>
+          item.kind === "rebrief" && item.rebrief.turnId === rebrief.turnId
+            ? { ...item, rebrief: { ...item.rebrief, cleared: true } }
+            : item,
+        ),
+        {
+          kind: "note",
+          text: "Re-brief cleared — Darwin starts the next turn from a blank context. The committed records remain on disk; he will only know them again if he reads them with his tools.",
+        },
+      ]);
+    },
+    [selectedId],
+  );
+
   if (projects === null) {
     return <div className="app-shell" />;
   }
@@ -230,6 +351,11 @@ export function App() {
         <div className="app-title">
           GALAPAGOS <span>/ Darwin</span>
         </div>
+        {selected ? (
+          <a className="nav-link" href={`/records?projectId=${encodeURIComponent(selected.id)}`}>
+            Records
+          </a>
+        ) : null}
         {projects.length > 0 ? (
           <ProjectPicker
             projects={projects}
@@ -265,6 +391,7 @@ export function App() {
             disabled={daemonDown || !selected}
             projectName={selected?.name ?? ""}
             onSend={handleSend}
+            onClearRebrief={handleClearRebrief}
           />
           <SpecificsPanel specifics={specifics} />
         </main>

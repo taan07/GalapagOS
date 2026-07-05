@@ -1,7 +1,9 @@
-// Interim memory (Chunk 1 → 2 bridge): agreed specifics as markdown files in
-// the user's Obsidian vault. See architecture §1 "Interim memory" — Chunk 2's
-// records store ingests these files; they are Darwin's durable memory until
-// then, so writes are wx (never overwrite) and stay inside the vault.
+// The Obsidian vault view of agreed specifics. Since Chunk 2 the records
+// store (docs/galapagos/ in the target repo) is the memory and these files
+// are its human-readable mirror: new specifics are written through with a
+// migrated_to pointer, and pre-records-store files are ingested exactly once
+// (ingest.ts) and stamped migrated_to so restarts never duplicate them.
+// Writes are wx (never overwrite) and stay inside the vault.
 import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
 
@@ -12,6 +14,8 @@ export type AgreedSpecific = {
   project: string;
   status: "agreed" | "superseded" | "deferred";
   createdAt: string;
+  /** Record id this file was migrated to / mirrors; undefined = not ingested. */
+  migratedTo?: string;
   body: string;
 };
 
@@ -20,6 +24,8 @@ export type WriteSpecificInput = {
   projectSlug: string;
   question: string;
   answer: string;
+  /** Record id this file mirrors (write-through from the records store). */
+  migratedTo?: string;
   now?: Date;
 };
 
@@ -86,6 +92,7 @@ export function writeAgreedSpecific(input: WriteSpecificInput): AgreedSpecific {
     `project: "${escapeYaml(input.projectSlug)}"`,
     'status: "agreed"',
     `created_at: "${createdAt}"`,
+    ...(input.migratedTo ? [`migrated_to: "${escapeYaml(input.migratedTo)}"`] : []),
     "---",
     "",
     `# ${summarize(question, 100)}`,
@@ -145,7 +152,35 @@ export function listAgreedSpecifics(vaultPath: string, projectSlug: string): Agr
         project: parseFrontmatterValue(lines, "project") ?? projectSlug,
         status: status === "superseded" || status === "deferred" ? status : "agreed",
         createdAt: parseFrontmatterValue(lines, "created_at") ?? "",
+        migratedTo: parseFrontmatterValue(lines, "migrated_to"),
         body,
       };
     });
+}
+
+/**
+ * Stamp a vault specific as migrated to a record so ingestion re-runs skip
+ * it. Inserts migrated_to into the existing frontmatter block; no-op when the
+ * stamp is already present.
+ */
+export function markSpecificMigrated(
+  vaultPath: string,
+  projectSlug: string,
+  fileName: string,
+  recordId: string,
+): void {
+  const filePath = path.join(specificsDir(vaultPath, projectSlug), fileName);
+  const content = readFileSync(filePath, "utf8");
+  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) {
+    throw new Error(`Vault specific ${fileName} has no frontmatter to stamp.`);
+  }
+  if (/^migrated_to: /m.test(match[1] ?? "")) {
+    return;
+  }
+  const stamped = content.replace(
+    /^---\n([\s\S]*?)\n---/,
+    `---\n$1\nmigrated_to: "${escapeYaml(recordId)}"\n---`,
+  );
+  writeFileSync(filePath, stamped, "utf8");
 }

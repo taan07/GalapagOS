@@ -1,10 +1,11 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import { GLP_TYPES, type GlpType } from "../../core/records/schema";
+import type { Frontmatter } from "../../core/records/frontmatter";
 import { observeGitRepository, recentLog } from "../git/runner";
-import {
-  listAgreedSpecifics,
-  writeAgreedSpecific,
-} from "../vault/specifics";
+import { createRecordsStore, type RecordDoc } from "../records/store";
+import { recordAgreedSpecific } from "../records/write-through";
+import { listAgreedSpecifics } from "../vault/specifics";
 
 export type ManagerToolContext = {
   projectRoot: string;
@@ -57,10 +58,28 @@ export async function runGitTruth(
   );
 }
 
+function describeRecord(doc: RecordDoc): string {
+  return `[${doc.type}/${doc.status}] ${doc.title} (id ${doc.id}, ${doc.createdAt.slice(0, 10)}) — ${doc.filePath}`;
+}
+
+function renderFullRecord(doc: RecordDoc): string {
+  const lines = [
+    describeRecord(doc),
+    `updated: ${doc.updatedAt}`,
+    ...Object.entries(doc.frontmatter)
+      .filter(([key]) => !["id", "glp_type", "title", "status", "created_at", "updated_at"].includes(key))
+      .map(([key, value]) => `${key}: ${JSON.stringify(value)}`),
+    "",
+    doc.body.trim(),
+  ];
+  return lines.join("\n");
+}
+
 export function createManagerToolServer(context: ManagerToolContext) {
   const emit = (toolName: string, summary: string, detail: string) => {
     context.onToolEvent?.({ tool: toolName, summary, detail });
   };
+  const store = createRecordsStore(context.projectRoot, context.projectSlug);
 
   return createSdkMcpServer({
     name: "galapagos",
@@ -78,17 +97,25 @@ export function createManagerToolServer(context: ManagerToolContext) {
       ),
       tool(
         "record_specific",
-        "Record ONE agreed specific the user just confirmed (a pinned-down decision). Writes durable memory to the user's Obsidian vault. Use one call per distinct decision; never record vague statements.",
+        "Record ONE agreed specific the user just confirmed (a pinned-down decision). Writes a durable user_answer record in the project's records store, mirrored to the user's Obsidian vault. Use one call per distinct decision; never record vague statements.",
         { question: z.string(), answer: z.string() },
         async ({ question, answer }) => {
-          const specific = writeAgreedSpecific({
+          const result = recordAgreedSpecific({
+            store,
             vaultPath: context.vaultPath,
             projectSlug: context.projectSlug,
             question,
             answer,
           });
-          emit("record_specific", `recorded: ${specific.question}`, specific.body);
-          return text(`Recorded agreed specific in the vault: ${specific.fileName}`);
+          const mirrorNote = result.mirrorError
+            ? `Vault mirror failed (${result.mirrorError}) — the record itself is safe.`
+            : `Vault mirror: ${result.mirrorFileName}`;
+          emit(
+            "record_specific",
+            `recorded: ${result.record.title}`,
+            `${describeRecord(result.record)}\n${mirrorNote}`,
+          );
+          return text(`Recorded user_answer ${result.record.id} at ${result.record.filePath}. ${mirrorNote}`);
         },
       ),
       tool(
@@ -117,13 +144,102 @@ export function createManagerToolServer(context: ManagerToolContext) {
       ),
       tool(
         "read_records",
-        "Read durable project records (manager synthesis, goals, plans, briefs, decisions).",
-        {},
-        async () => {
-          emit("read_records", "records store not built yet", "");
-          return text(
-            "The records store is not built yet — it arrives in Chunk 2 of Galapagos. Agreed specifics (list_specifics) are the only durable memory available right now. Do not invent records.",
+        "Read durable project records (docs/galapagos/ in the project repo). Without arguments lists everything; filter by type/status, or pass id for one full record. Consult this before proposing anything.",
+        {
+          type: z.enum(GLP_TYPES).optional(),
+          status: z.string().optional(),
+          id: z.string().optional(),
+        },
+        async ({ type, status, id }) => {
+          if (id) {
+            const doc = store.get(id);
+            if (!doc) {
+              emit("read_records", `no record ${id}`, "");
+              return text(`No record with id ${id}. Use read_records without id to list what exists.`);
+            }
+            emit("read_records", `read ${doc.type} ${doc.id}`, describeRecord(doc));
+            return text(renderFullRecord(doc));
+          }
+          const docs = store.list({ ...(type ? { type } : {}), ...(status ? { status } : {}) });
+          emit(
+            "read_records",
+            `consulted ${docs.length} record${docs.length === 1 ? "" : "s"}`,
+            docs.map(describeRecord).join("\n") || "(none)",
           );
+          if (docs.length === 0) {
+            return text(
+              "No records match — the store has nothing durable recorded here yet. Do not invent records.",
+            );
+          }
+          return text(docs.map(describeRecord).join("\n"));
+        },
+      ),
+      tool(
+        "write_record",
+        "Write ONE durable record to the project's records store (git-committed markdown). Records are doctrine, not transcripts: short, durable, linkable — never conversation dumps. Types: manager_synthesis (your evolving understanding), active_goal, implementation_plan, open_question (unanswered/deferred — track and re-raise), user_answer (a pinned-down answer; prefer record_specific for these), routed_clarification, worker_brief, decision (requires decision_options, rollback_note, confidence_impact).",
+        {
+          type: z.enum(GLP_TYPES),
+          title: z.string(),
+          body: z.string(),
+          status: z.string().optional(),
+          question: z.string().optional(),
+          answer: z.string().optional(),
+          decision_options: z.array(z.string()).optional(),
+          chosen_path: z.string().optional(),
+          rollback_note: z.string().optional(),
+          confidence_impact: z.string().optional(),
+          parent_decision_ref: z.string().optional(),
+        },
+        async (input) => {
+          const extra: Frontmatter = {};
+          if (input.question) extra.question = input.question;
+          if (input.answer) extra.answer = input.answer;
+          if (input.decision_options) extra.decision_options = input.decision_options;
+          if (input.chosen_path) extra.chosen_path = input.chosen_path;
+          if (input.rollback_note) extra.rollback_note = input.rollback_note;
+          if (input.confidence_impact) extra.confidence_impact = input.confidence_impact;
+          if (input.parent_decision_ref) extra.parent_decision_ref = input.parent_decision_ref;
+          try {
+            const doc = store.create({
+              type: input.type as GlpType,
+              title: input.title,
+              body: input.body,
+              ...(input.status ? { status: input.status } : {}),
+              extra,
+            });
+            emit("write_record", `wrote ${doc.type}: ${doc.title}`, renderFullRecord(doc));
+            return text(`Wrote ${doc.type} ${doc.id} at ${doc.filePath}.`);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            emit("write_record", `rejected ${input.type}`, message);
+            return text(`Record rejected: ${message}`);
+          }
+        },
+      ),
+      tool(
+        "update_record",
+        "Update an existing record: change status (closed statuses — resolved/done/approved/superseded/archived — are only reachable here), append a dated note, or set chosen_path on a decision. Never rewrites history.",
+        {
+          id: z.string(),
+          status: z.string().optional(),
+          note: z.string().optional(),
+          chosen_path: z.string().optional(),
+        },
+        async ({ id, status, note, chosen_path }) => {
+          try {
+            const doc = store.update({
+              id,
+              ...(status !== undefined ? { status } : {}),
+              ...(note !== undefined ? { note } : {}),
+              ...(chosen_path !== undefined ? { chosenPath: chosen_path } : {}),
+            });
+            emit("update_record", `updated ${doc.type} ${doc.id} → ${doc.status}`, renderFullRecord(doc));
+            return text(`Updated ${doc.type} ${doc.id}: status ${doc.status}.`);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            emit("update_record", `update rejected for ${id}`, message);
+            return text(`Update rejected: ${message}`);
+          }
         },
       ),
     ],

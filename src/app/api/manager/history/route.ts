@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getOrCreateActiveSession, listTurns } from "../../../../adapters/db/repos/manager";
+import { listProjectTurns } from "../../../../adapters/db/repos/manager";
 import { getProject } from "../../../../adapters/db/repos/projects";
 import { readDb } from "../../../../server/read-db";
 
@@ -15,9 +15,10 @@ export async function GET(request: Request) {
   if (!project) {
     return NextResponse.json({ error: `Unknown project: ${projectId}` }, { status: 404 });
   }
-  const session = getOrCreateActiveSession(db, projectId);
+  // History spans compacted sessions: a re-brief must not wipe the visible
+  // conversation, only the SDK context behind it.
   return NextResponse.json(
-    { sessionId: session.id, turns: listTurns(db, session.id) },
+    { turns: listProjectTurns(db, projectId) },
     { headers: { "Cache-Control": "no-store" } },
   );
 }
