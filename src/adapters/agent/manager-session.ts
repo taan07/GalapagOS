@@ -65,6 +65,7 @@ const MANAGER_ALLOWED_TOOLS = [
   "mcp__galapagos__write_record",
   "mcp__galapagos__update_record",
   "mcp__galapagos__spawn_worker",
+  "mcp__galapagos__resume_worker",
   "mcp__galapagos__steer_worker",
   "mcp__galapagos__stop_worker",
   "mcp__galapagos__list_workers",

@@ -63,6 +63,15 @@ export function retireLane(db: GalapagosDb, id: string): void {
   db.prepare("UPDATE lanes SET status = 'retired' WHERE id = ?").run(id);
 }
 
+/**
+ * Re-activate a retired lane for a resumed worker (user-confirmed
+ * continuation ruling). The caller MUST re-check glob overlap against
+ * currently active lanes first — exclusivity holds across resume too.
+ */
+export function reactivateLane(db: GalapagosDb, id: string): void {
+  db.prepare("UPDATE lanes SET status = 'active' WHERE id = ?").run(id);
+}
+
 export function laneGlobs(lane: LaneRow): { allowedGlobs: string[]; forbiddenGlobs: string[] } {
   return {
     allowedGlobs: JSON.parse(lane.allowed_globs) as string[],

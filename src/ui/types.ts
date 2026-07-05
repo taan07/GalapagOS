@@ -77,6 +77,8 @@ export type WorkerView = {
   createdAt: string;
   hasDigest: boolean;
   openAttentionCount: number;
+  /** Predecessor worker id when this session continues stopped work. */
+  resumedFrom: string | null;
 };
 
 export type WorkerEventView = {

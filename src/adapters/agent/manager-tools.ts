@@ -353,6 +353,41 @@ export function createManagerToolServer(context: ManagerToolContext) {
         },
       ),
       tool(
+        "resume_worker",
+        "Continue a STOPPED (or failed) worker's task: a fresh session in the SAME worktree and branch, lane re-activated, briefed from the original worker_brief record plus the worktree's current git state and your continuation note. This is the ONLY way to continue stopped work — never reuse its lane name for a new spawn.",
+        {
+          id: z.string().describe("The stopped worker's id"),
+          note: z
+            .string()
+            .optional()
+            .describe("Continuation instruction — what to focus on or change"),
+        },
+        async ({ id, note }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const outcome = await bridge.workers.resume({
+            project: bridge.project,
+            workerId: id,
+            ...(note ? { note } : {}),
+          });
+          if (!outcome.ok) {
+            emit("resume_worker", `resume rejected for ${id.slice(0, 8)}`, outcome.reason);
+            return text(`Resume rejected: ${outcome.reason}`);
+          }
+          const detail = [
+            `new worker ${outcome.workerId} (continues ${id})`,
+            `same worktree ${outcome.worktreePath} on ${outcome.branch}`,
+            `lane "${outcome.laneSlug}" re-activated`,
+          ].join("\n");
+          emit("resume_worker", `resumed work as worker ${outcome.workerId.slice(0, 8)}`, detail);
+          return text(
+            `Resumed. ${detail}\nThe new session was briefed with the original brief plus the worktree's real state${note ? " and your note" : ""}. Check on it with worker_status.`,
+          );
+        },
+      ),
+      tool(
         "steer_worker",
         "Inject a message into a running worker mid-task: course corrections, answers to its questions, added context. The worker treats it as part of the same task.",
         { id: z.string(), message: z.string() },
@@ -379,7 +414,7 @@ export function createManagerToolServer(context: ManagerToolContext) {
           if (!bridge) {
             return text("Worker control is not available in this context.");
           }
-          const outcome = await bridge.workers.stop(id);
+          const outcome = await bridge.workers.stop(id, "Darwin");
           if (!outcome.ok) {
             emit("stop_worker", `stop failed for ${id}`, outcome.reason);
             return text(`Stop failed: ${outcome.reason}`);

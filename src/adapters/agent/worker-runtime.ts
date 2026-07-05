@@ -3,6 +3,7 @@
 // SQLite as it happens): spawn = lane row + worktree + brief record + session,
 // steer = streaming-input injection, stop = end session + detective lane
 // audit + completion check. The harness itself is behind worker-session.ts.
+import { existsSync } from "node:fs";
 import type { GalapagosConfig } from "../../config";
 import { checkLane, findLaneOverlap, type LaneContract } from "../../core/lanes/lane-check";
 import { parseCompletionReport } from "../../core/digests/completion";
@@ -14,6 +15,7 @@ import {
   getLane,
   laneGlobs,
   listActiveLanes,
+  reactivateLane,
   retireLane,
   type LaneRow,
 } from "../db/repos/lanes";
@@ -295,13 +297,14 @@ export function createWorkerRuntime(deps: {
           });
           break;
         case "result":
+          if (event.payload.isError && live.get(workerId)?.stopRequested) {
+            // Interrupting an in-flight turn surfaces as an error RESULT from
+            // the SDK. A requested stop is not a failure: persist nothing here
+            // — finalizeStop writes the honest "stopped by …" marker.
+            break;
+          }
           persistEvent(worker, "result", event.payload);
           if (event.payload.isError) {
-            if (live.get(workerId)?.stopRequested) {
-              // Interrupting an in-flight turn can surface as an error
-              // RESULT: the user stopped this worker; it did not fail.
-              break;
-            }
             // Auth/model/max-turn failure: the session cannot continue. Never
             // retried on a fresh session (chunk 2 rule, same for workers).
             failed = true;
@@ -347,9 +350,16 @@ export function createWorkerRuntime(deps: {
    * The at-stop safety pass: detective lane audit over the worktree, the
    * has-a-digest check, lane retirement. Runs for live stops and for boot
    * reconciliation alike. Never silently skipped — an audit that cannot run
-   * becomes an attention item.
+   * becomes an attention item. `stoppedBy` names who ended this worker so
+   * the stream records a deliberate stop as a stop, never as a failure.
    */
-  const finalizeStop = async (worker: WorkerRow): Promise<StopWorkerOutcome> => {
+  const finalizeStop = async (worker: WorkerRow, stoppedBy: string): Promise<StopWorkerOutcome> => {
+    persistEvent(worker, "result", {
+      subtype: "stopped",
+      isError: false,
+      resultText: null,
+      stoppedBy,
+    });
     const lane = getLane(db, worker.lane_id);
     const violations: { path: string; reason: string }[] = [];
     let auditError: string | null = null;
@@ -455,6 +465,28 @@ export function createWorkerRuntime(deps: {
         }
       }
 
+      // Leftovers from a retired lane of the same name are a CLEAN rejection
+      // — Darwin reads the reason and picks a new name (or resumes the old
+      // worker). They must never become a failed worker row (drill finding).
+      const worktreePath = workerWorktreePath(config.stateDir, project.slug, laneSlug);
+      const branch = `galapagos/worker/${laneSlug}`;
+      if (existsSync(worktreePath)) {
+        return {
+          ok: false,
+          reason: `A previous lane named "${laneName}" left its worktree at ${worktreePath} — that work is preserved there. Pick a NEW lane name for new work, or use resume_worker on the stopped worker to continue the old task.`,
+        };
+      }
+      try {
+        const runner = new LocalGitCommandRunner();
+        await runner.runGit(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], project.root_path);
+        return {
+          ok: false,
+          reason: `The branch ${branch} already exists from a previous lane named "${laneName}". Pick a NEW lane name — worker branches are never reused.`,
+        };
+      } catch {
+        // branch does not exist — the name is free
+      }
+
       const lane = createLane(db, {
         projectId: project.id,
         name: laneName,
@@ -463,8 +495,6 @@ export function createWorkerRuntime(deps: {
         forbiddenGlobs,
         baseSha,
       });
-      const worktreePath = workerWorktreePath(config.stateDir, project.slug, laneSlug);
-      const branch = `galapagos/worker/${laneSlug}`;
       const worker = createWorker(db, {
         projectId: project.id,
         laneId: lane.id,
@@ -575,6 +605,171 @@ export function createWorkerRuntime(deps: {
       };
     },
 
+    /**
+     * Continue a stopped worker's task (user-confirmed ruling, 2026-07-05):
+     * a FRESH session in the SAME worktree and branch, lane re-activated
+     * after re-checking exclusivity, briefed from the original worker_brief
+     * record plus the worktree's actual git state. The old session is gone —
+     * this is continuation of the WORK, not resurrection of the transcript.
+     */
+    async resume(input: {
+      project: ProjectRow;
+      workerId: string;
+      note?: string;
+    }): Promise<SpawnWorkerOutcome> {
+      const { project } = input;
+      const predecessor = getWorker(db, input.workerId);
+      if (!predecessor) {
+        return { ok: false, reason: `No worker with id ${input.workerId}.` };
+      }
+      if (live.has(predecessor.id) || stopping.has(predecessor.id)) {
+        return {
+          ok: false,
+          reason: `Worker ${predecessor.id} is still live — steer it instead of resuming.`,
+        };
+      }
+      if (predecessor.status !== "stopped" && predecessor.status !== "failed") {
+        return {
+          ok: false,
+          reason: `Worker ${predecessor.id} is ${predecessor.status} — only stopped or failed workers can be resumed.`,
+        };
+      }
+      const lane = getLane(db, predecessor.lane_id);
+      if (!lane) {
+        return { ok: false, reason: `Worker ${predecessor.id} has no lane row — cannot resume.` };
+      }
+      if (!existsSync(predecessor.worktree_path)) {
+        return {
+          ok: false,
+          reason: `The worktree at ${predecessor.worktree_path} no longer exists — the work is gone; spawn a fresh worker instead.`,
+        };
+      }
+
+      // Exclusivity holds across resume: the lane's globs must not overlap
+      // any lane that became active while this one was retired.
+      const contract = laneGlobs(lane);
+      for (const active of listActiveLanes(db, project.id)) {
+        if (active.id === lane.id) {
+          continue;
+        }
+        const overlap = findLaneOverlap(contract.allowedGlobs, laneGlobs(active).allowedGlobs);
+        if (overlap) {
+          return {
+            ok: false,
+            reason: `Resume rejected: this lane's glob "${overlap.candidateGlob}" overlaps "${overlap.existingGlob}" of the now-active lane "${active.name}". Stop that worker first or wait for it.`,
+          };
+        }
+      }
+
+      // The continuation brief: the original doctrine-judged brief plus the
+      // honest state of the worktree the new session inherits.
+      let originalBrief = "(the original worker_brief record is unavailable — inspect the worktree and its commits to reconstruct the task)";
+      if (predecessor.brief_record_id) {
+        const store = createRecordsStore(project.root_path, project.slug);
+        const record = store.get(predecessor.brief_record_id);
+        if (record) {
+          originalBrief = `${record.title}\n\n${record.body.trim()}`;
+        }
+      }
+      let commits = "(could not read)";
+      let dirty = "(could not read)";
+      try {
+        const runner = new LocalGitCommandRunner();
+        commits =
+          (
+            await runner.runGit(
+              ["log", "--oneline", `${lane.base_sha}..HEAD`],
+              predecessor.worktree_path,
+            )
+          ).trim() || "(none yet)";
+        dirty =
+          (
+            await runner.runGit(["status", "--porcelain", "-uall"], predecessor.worktree_path)
+          ).trim() || "(clean)";
+      } catch (error) {
+        return {
+          ok: false,
+          reason: `Could not read the worktree's git state: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+
+      const briefText = `CONTINUATION: you are resuming a task a previous worker session started
+and did not finish. You work in the SAME worktree — its state below is
+real; inspect it with git before acting, and do not redo finished work.
+
+## Original brief
+
+${originalBrief}
+
+## Worktree state at resume
+
+Commits since the lane base:
+${commits}
+
+Uncommitted changes:
+${dirty}
+
+## Continuation instruction from the manager
+
+${input.note?.trim() || "Continue toward the original brief's done-criteria."}
+
+Review the state first, then continue. End with your completion report as
+required.`;
+
+      reactivateLane(db, lane.id);
+      const worker = createWorker(db, {
+        projectId: project.id,
+        laneId: lane.id,
+        worktreePath: predecessor.worktree_path,
+        branch: predecessor.branch,
+        briefRecordId: predecessor.brief_record_id,
+        resumedFrom: predecessor.id,
+      });
+
+      let session: WorkerSession;
+      try {
+        session = sessionFactory({
+          config,
+          worktreePath: predecessor.worktree_path,
+          systemPrompt: buildWorkerDoctrine({
+            projectName: project.name,
+            laneName: lane.name,
+            allowedGlobs: contract.allowedGlobs,
+            forbiddenGlobs: contract.forbiddenGlobs,
+            baseSha: lane.base_sha,
+            branch: predecessor.branch,
+            worktreePath: predecessor.worktree_path,
+          }),
+          briefText,
+          model: config.workerModel,
+          lane: contract,
+        });
+      } catch (error) {
+        persistEvent(worker, "error", {
+          message: `Resuming the worker session failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        retireLane(db, lane.id);
+        setStatus(worker, "failed");
+        return {
+          ok: false,
+          reason: `Resuming the worker session failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      const loopDone = consumeSession(worker.id, session);
+      live.set(worker.id, { session, loopDone, stopRequested: false });
+
+      return {
+        ok: true,
+        workerId: worker.id,
+        laneSlug: lane.slug,
+        branch: predecessor.branch,
+        worktreePath: predecessor.worktree_path,
+        baseSha: lane.base_sha,
+        briefRecordId: predecessor.brief_record_id ?? "(none)",
+        briefCommitNote: null,
+      };
+    },
+
     steer(workerId: string, message: string): { ok: true } | { ok: false; reason: string } {
       const worker = getWorker(db, workerId);
       if (!worker) {
@@ -608,7 +803,10 @@ export function createWorkerRuntime(deps: {
       return { ok: true };
     },
 
-    async stop(workerId: string): Promise<StopWorkerOutcome> {
+    async stop(
+      workerId: string,
+      stoppedBy = "an unspecified caller",
+    ): Promise<StopWorkerOutcome> {
       const worker = getWorker(db, workerId);
       if (!worker) {
         return { ok: false, reason: `No worker with id ${workerId}.` };
@@ -637,7 +835,7 @@ export function createWorkerRuntime(deps: {
           await entry.session.stop();
           await entry.loopDone;
         }
-        return await finalizeStop(worker);
+        return await finalizeStop(worker, stoppedBy);
       } finally {
         stopping.delete(workerId);
       }
@@ -678,7 +876,7 @@ export function createWorkerRuntime(deps: {
           message:
             "Daemon restarted — the live worker session was lost. Work up to this point remains in the worktree.",
         });
-        await finalizeStop(worker);
+        await finalizeStop(worker, "the daemon (restart reconciliation)");
       }
       return orphans.length;
     },

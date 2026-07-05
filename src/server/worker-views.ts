@@ -37,5 +37,6 @@ export function toWorkerView(
     createdAt: worker.created_at,
     hasDigest: digest !== null,
     openAttentionCount: attention.filter((item) => item.status === "open").length,
+    resumedFrom: worker.resumed_from,
   };
 }

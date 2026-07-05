@@ -430,7 +430,7 @@ async function handleSteerWorker(
 }
 
 async function handleStopWorker(res: http.ServerResponse, workerId: string): Promise<void> {
-  const outcome = await workers.stop(workerId);
+  const outcome = await workers.stop(workerId, "the user, via the workers page");
   if (!outcome.ok) {
     sendJson(res, 409, { error: outcome.reason });
     return;

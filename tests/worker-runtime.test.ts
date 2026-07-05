@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -241,22 +241,31 @@ test("a worker without a lane contract is refused", async () => {
   }
 });
 
-test("a failed worktree add marks the worker failed and retires the lane", async () => {
+test("leftover worktree dirs and branches reject cleanly — no rows, no failed workers", async () => {
   const { db, config, project, runtime } = await fixture();
-  // Pre-create the worktree directory so the add fails operationally.
-  const doomed = path.join(config.stateDir, "worktrees", project.slug, "auth-ui");
-  mkdirSync(doomed, { recursive: true });
-
-  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
-  assert.equal(outcome.ok, false);
-  if (!outcome.ok) {
-    assert.match(outcome.reason, /already exists/);
+  // A directory left behind by a previous lane of the same name…
+  const leftover = path.join(config.stateDir, "worktrees", project.slug, "auth-ui");
+  mkdirSync(leftover, { recursive: true });
+  const dirCase = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.equal(dirCase.ok, false);
+  if (!dirCase.ok) {
+    assert.match(dirCase.reason, /left its worktree/);
+    assert.match(dirCase.reason, /Pick a NEW lane name/);
   }
-  assert.equal(listActiveLanes(db, project.id).length, 0, "lane retired");
-  const workers = runtime.list(project.id);
-  assert.equal(workers[0]?.worker.status, "failed");
-  const events = listWorkerEvents(db, workers[0]?.worker.id ?? "");
-  assert.equal(events[0]?.kind, "error");
+
+  // …and a leftover branch without a directory are both clean rejections.
+  rmSync(leftover, { recursive: true });
+  execFileSync("git", ["branch", "galapagos/worker/auth-ui", "HEAD"], {
+    cwd: project.root_path,
+  });
+  const branchCase = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.equal(branchCase.ok, false);
+  if (!branchCase.ok) {
+    assert.match(branchCase.reason, /branch galapagos\/worker\/auth-ui already exists/);
+  }
+
+  assert.equal(listActiveLanes(db, project.id).length, 0, "no lane row leaked");
+  assert.equal(runtime.list(project.id).length, 0, "no worker row leaked");
 });
 
 test("streamed events persist; a valid completion result becomes a digest and idle", async () => {
@@ -527,10 +536,19 @@ test("reconcileOrphans finalizes live-status workers after a daemon restart", as
   const worker = getWorker(db, outcome.workerId);
   assert.equal(worker?.status, "stopped");
   assert.equal(listActiveLanes(db, project.id).length, 0, "lane freed for new spawns");
-  const events = listWorkerEvents(db, outcome.workerId);
-  assert.match(
-    JSON.parse(events.at(-1)?.payload ?? "{}").message ?? "",
-    /Daemon restarted/,
+  const payloads = listWorkerEvents(db, outcome.workerId).map(
+    (event) => JSON.parse(event.payload) as Record<string, unknown>,
+  );
+  assert.ok(
+    payloads.some((payload) => /Daemon restarted/.test(String(payload.message ?? ""))),
+    "the restart is recorded honestly",
+  );
+  assert.ok(
+    payloads.some(
+      (payload) =>
+        payload.subtype === "stopped" && /restart reconciliation/.test(String(payload.stoppedBy)),
+    ),
+    "the stop marker names the daemon as the stopper",
   );
   assert.ok(
     listWorkerAttentionItems(db, outcome.workerId).some(
@@ -538,6 +556,147 @@ test("reconcileOrphans finalizes live-status workers after a daemon restart", as
     ),
     "an orphan without a digest is not rendered done",
   );
+});
+
+test("a stop persists an honest stopped-by marker, not an execution error", async () => {
+  const { db, project, runtime, sessions } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  const fake = sessions[0];
+  assert.ok(fake);
+  fake.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "running", "running");
+
+  // Interrupts can surface as an error RESULT mid-stop — it must not be
+  // persisted as one.
+  const originalStop = fake.session.stop.bind(fake.session);
+  fake.session.stop = async () => {
+    fake.emit({
+      kind: "result",
+      payload: { subtype: "error_during_execution", isError: true, resultText: null },
+    });
+    await originalStop();
+  };
+  const stopped = await runtime.stop(outcome.workerId, "the user, via the workers page");
+  assert.ok(stopped.ok);
+
+  const events = listWorkerEvents(db, outcome.workerId).map(
+    (event) => JSON.parse(event.payload) as Record<string, unknown>,
+  );
+  assert.ok(
+    !events.some((payload) => payload.subtype === "error_during_execution"),
+    "the interrupt-induced error result is not persisted on a requested stop",
+  );
+  const marker = events.find((payload) => payload.subtype === "stopped");
+  assert.ok(marker, "a stopped marker event exists");
+  assert.equal(marker?.stoppedBy, "the user, via the workers page");
+  assert.equal(marker?.isError, false);
+});
+
+test("reusing a retired lane's name is a clean rejection, never a failed worker row", async () => {
+  const { db, project, runtime, sessions } = await fixture();
+  const first = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(first.ok);
+  if (!first.ok) {
+    return;
+  }
+  sessions[0]?.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await runtime.stop(first.workerId, "Darwin");
+
+  const again = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.equal(again.ok, false);
+  if (!again.ok) {
+    assert.match(again.reason, /Pick a NEW lane name/);
+    assert.match(again.reason, /resume_worker/);
+  }
+  assert.equal(runtime.list(project.id).length, 1, "no failed worker row was created");
+});
+
+test("resume_worker continues stopped work: same worktree, lane re-activated, honest brief", async () => {
+  const { db, project, runtime, sessions, spawnInputs } = await fixture();
+  const first = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(first.ok);
+  if (!first.ok) {
+    return;
+  }
+  sessions[0]?.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await waitFor(() => getWorker(db, first.workerId)?.status === "running", "running");
+
+  // Live workers cannot be resumed.
+  const whileLive = await runtime.resume({ project, workerId: first.workerId });
+  assert.equal(whileLive.ok, false);
+
+  // The predecessor did some work, then was stopped.
+  writeFileSync(path.join(first.worktreePath, "src", "auth", "login.ts"), "// progress\n");
+  execFileSync(
+    "git",
+    ["-c", "user.name=T", "-c", "user.email=t@t", "commit", "-am", "half done"],
+    { cwd: first.worktreePath },
+  );
+  await runtime.stop(first.workerId, "the user, via the workers page");
+  assert.equal(listActiveLanes(db, project.id).length, 0);
+
+  const resumed = await runtime.resume({
+    project,
+    workerId: first.workerId,
+    note: "Also validate the email field.",
+  });
+  assert.ok(resumed.ok, JSON.stringify(resumed));
+  if (!resumed.ok) {
+    return;
+  }
+  assert.notEqual(resumed.workerId, first.workerId, "a fresh worker row");
+  assert.equal(resumed.worktreePath, first.worktreePath, "the SAME worktree");
+  assert.equal(resumed.branch, first.branch);
+  assert.equal(listActiveLanes(db, project.id).length, 1, "lane re-activated");
+  assert.equal(getWorker(db, resumed.workerId)?.resumed_from, first.workerId);
+
+  const resumeBrief = spawnInputs.at(-1)?.briefText ?? "";
+  assert.match(resumeBrief, /CONTINUATION/);
+  assert.match(resumeBrief, /Harden the login form/, "original brief title included");
+  assert.match(resumeBrief, /half done/, "the worktree's real commits included");
+  assert.match(resumeBrief, /Also validate the email field/, "the manager's note included");
+
+  // The resumed worker is live and steerable; exclusivity still holds.
+  const overlapping = await runtime.spawn({
+    project,
+    laneName: "auth rewrite",
+    allowedGlobs: ["src/auth/**"],
+    briefTitle: "t",
+    brief: "b",
+  });
+  assert.equal(overlapping.ok, false);
+});
+
+test("resume is refused when a now-active lane overlaps the retired one", async () => {
+  const { db, project, runtime, sessions } = await fixture();
+  const first = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(first.ok);
+  if (!first.ok) {
+    return;
+  }
+  sessions[0]?.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await runtime.stop(first.workerId, "Darwin");
+
+  const successor = await runtime.spawn({
+    project,
+    laneName: "auth take two",
+    allowedGlobs: ["src/auth/**"],
+    briefTitle: "t",
+    brief: "b",
+  });
+  assert.ok(successor.ok, "same globs are legal once the old lane retired");
+
+  const resumed = await runtime.resume({ project, workerId: first.workerId });
+  assert.equal(resumed.ok, false);
+  if (!resumed.ok) {
+    assert.match(resumed.reason, /overlaps/);
+    assert.match(resumed.reason, /auth take two/);
+  }
+  assert.equal(getWorker(db, first.workerId)?.status, "stopped", "predecessor untouched");
 });
 
 test("collectAuditFiles unions committed diff with porcelain, handling renames", async () => {
