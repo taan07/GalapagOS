@@ -11,6 +11,8 @@ export type GalapagosConfig = {
    * judgment — it must not double the subscription cost of every chat turn.
    */
   distillModel: string;
+  /** Model worker sessions run on — workers do real implementation work. */
+  workerModel: string;
   daemonPort: number;
   /** Where new projects are created and where folder browsing starts. */
   devRoot: string;
@@ -55,6 +57,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GalapagosConfi
     vaultPath,
     managerModel: env.GALAPAGOS_MANAGER_MODEL ?? "claude-fable-5",
     distillModel: env.GALAPAGOS_DISTILL_MODEL ?? "claude-haiku-4-5",
+    workerModel: env.GALAPAGOS_WORKER_MODEL ?? "claude-fable-5",
     daemonPort,
     devRoot: path.resolve(expandHome(env.GALAPAGOS_DEV_ROOT ?? "~/Dev")),
     claudeBinPath,
