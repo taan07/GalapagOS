@@ -153,6 +153,27 @@ unverified detail.
    co-evolve; calibrate the judge against the user's own overrides over
    time; expect and instrument for gaming, don't assume its absence.
 
+## The pending direction call (asked 2026-07-05, unanswered — re-raise)
+
+Three questions for the user before §9 changes; recommendations attached:
+
+1. **Direction** — adopt the combined target for §9? Deterministic facts
+   floor (chunk 4, kept) + three new legs feeding the same capped engine:
+   (a) a **blinded critic** — separate session, reads brief + diff +
+   execution results, never the worker's prose, judges against a rubric
+   built from the brief and the recorded specifics, emits evidence-anchored
+   findings that cap the score; (b) **test-integrity signals** —
+   deterministic tripwires ("worker edited the tests that judge its own
+   code", test-machinery tampering patterns, later mutation probes);
+   (c) a cheap **transcript watchdog** over worker_events.
+   *Recommended: adopt all three.*
+2. **Build order** — *Recommended: watchdog + integrity tripwires first*
+   (highest measured payoff per token, no design risk), critic second once
+   its design is settled with the user.
+3. **Critic budget** — every completion, triaged-only, or tiered by stakes.
+   *Recommended: every completion* (a clean-LOOKING gamed completion is the
+   exact threat; haiku-class critique costs cents).
+
 ## Open problems the field has NOT solved
 
 - Judge validity doesn't transfer across task distributions — any critic we
