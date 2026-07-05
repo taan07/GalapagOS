@@ -192,11 +192,76 @@ sqlite3 ~/.galapagos/state.db "SELECT status, COUNT(*) FROM workers GROUP BY sta
 
 ---
 
-**All ten pass →** flip the stamp in `docs/chunks/3.md` to COMPLETE, and
-rule on the remaining implementer decisions in that stamp (especially #1,
-the hybrid completion-report timing — drill 2 showed you its behavior).
-Then delete `~/Dev/chunk3-drill` and its state rows if you want, or keep
-it as a scratch project.
+# Round 2 — after the post-drill fixes (2026-07-05)
+
+Round 1 passed drills 1–4, 6–9 and the sweep; its four findings are fixed
+on this branch. Pull, `npm install && npm test` (expect 120/120), restart
+`npm run dev`, confirm `/health` reports your checkout's revision. Then:
+
+## R2-1. Timestamps spot-check (finding 0)
+
+With any worker streaming, compare an event's time in the drilldown and a
+record's created date on /records against your system clock.
+
+- [ ] Times match your local clock and timezone, not UTC.
+
+## R2-2. Drill 5 re-run, sharpened (finding 1)
+
+Re-run drill 5 (WebFetch probe, NEW lane name — e.g. "docs fetch two").
+
+- [ ] EVERY fetch appears in the stream: a `WebFetch` chip, a
+      `server_tool_use`-style chip, or a Bash `curl` chip — whichever way
+      your CLI executes it, the trail is visible.
+- [ ] Open the digest card and check each claim's evidence badge: a claim
+      about fetched content backed by a real fetch may say `diff`/`manual`;
+      if the worker could NOT fetch, its narrative must SAY so — content
+      presented as fetched with no fetch chip anywhere is a FAIL (report
+      it; that's a worker-honesty defect, not a pipeline one).
+
+## R2-3. Stop, then continue (findings 2 + 3, the ruled path)
+
+Spawn a worker on a real multi-step task (new lane name). Mid-task, stop
+it with the /workers Stop button.
+
+- [ ] The stream shows "Stopped by the user, via the workers page" — NOT
+      `error_during_execution`. Status pill: `stopped`, not `failed`.
+- [ ] Ask Darwin to CONTINUE that work (phrase it lazily: "pick that back
+      up, and also …"). He uses `resume_worker` — not a new spawn — the
+      drilldown's new worker shows "continues <predecessor>", the SAME
+      worktree path, and the lane is active again.
+- [ ] Ask Darwin to spawn a fresh worker reusing the OLD lane name: he
+      relays a clean rejection (no failed row in `sqlite3 … "SELECT status
+      FROM workers"`).
+
+## R2-4. The lazy request (item 4 — Darwin's brief-writing IS the gate)
+
+Say to Darwin, verbatim or in your own lazy words:
+
+> make a little page that lists the notes files, nothing fancy
+
+Zero lane/glob/brief detail. Judge what he does:
+
+- [ ] He consults records (read_records chip), asks AT MOST a couple of
+      sharp questions if genuinely warranted — none is also acceptable —
+      and never asks you for lane names or globs.
+- [ ] Before spawning he states, in one line, the lane name, globs, and
+      brief title he's about to use.
+- [ ] The lane name is fresh (non-colliding); the globs are the narrowest
+      sensible scope; open the worker_brief record on /records — it reads
+      as a real hand-off: goal, concrete deliverables, constraints, out of
+      scope, done-criteria with self-verification.
+- [ ] The worker completes WITHOUT needing a steer to understand the task.
+
+Your judgment of that brief's quality is the acceptance test — if you
+wouldn't hand that brief to a contractor, the item fails; report what was
+missing.
+
+---
+
+**All of round 2 passes →** flip the stamp in `docs/chunks/3.md` to
+COMPLETE. Every decision in the stamp is now user-ruled. Then delete
+`~/Dev/chunk3-drill` and its state rows if you want, and the branch merges
+to main (chunk 4 rebases on it).
 
 **Likely failure points:** drill 1 needs your keychain auth (`claude
 /login` state) — a "Not logged in" turn error means the daemon wasn't

@@ -30,7 +30,8 @@ lanes, workers, worker_events, completion_digests, attention_items (you ADD
 evidence_runs per architecture §3); per-project records in each target
 repo's docs/galapagos/; Darwin's tools: git_truth, record_specific,
 list_specifics, read_records, write_record, update_record, spawn_worker,
-steer_worker, stop_worker, list_workers, worker_status; workers run in
+resume_worker (continue stopped work in the same worktree — user-confirmed
+ruling), steer_worker, stop_worker, list_workers, worker_status; workers run in
 worktrees under <GALAPAGOS_STATE_DIR>/worktrees/<project-slug>/<lane-slug>/
 on branches galapagos/worker/<lane-slug>, streaming-input query() with
 canUseTool lane guard (preventive; Bash bypass documented), every message
@@ -125,7 +126,7 @@ override everything, including this handoff. Then implement
   (pure, tested), normalized `WorkerStreamEvent`s.
 - `src/adapters/agent/worker-runtime.ts` — daemon-side orchestration:
   `createWorkerRuntime({db, config, sessionFactory?, broadcast?})` →
-  spawn/steer/stop/list/status/reconcileOrphans. `collectAuditFiles`
+  spawn/resume/steer/stop/list/status/reconcileOrphans. `collectAuditFiles`
   (diff base...HEAD ∪ porcelain -uall) lives here — your monitor tick
   wants it. Tests inject a fake sessionFactory; yours can too.
 - `src/adapters/agent/worker-doctrine.ts` — the worker system prompt (lane
