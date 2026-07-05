@@ -1178,3 +1178,16 @@ select:focus {
   color: var(--danger);
   border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
 }
+
+/* Leg grouping inside the confidence drilldown — the four brains, visibly apart. */
+.breakdown-leg {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0 2px;
+  border-top: 1px dashed var(--line);
+}
+
+.breakdown-leg:first-of-type {
+  border-top: none;
+}

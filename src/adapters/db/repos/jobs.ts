@@ -55,6 +55,30 @@ export function listRecentJobsByKind(db: GalapagosDb, kind: string, limit = 100)
     .all(kind, limit) as JobRow[];
 }
 
+/**
+ * The newest job of a kind whose payload carries the given key/value —
+ * how leg verdicts (watchdog/critic reviews) are found for a worker without
+ * a dedicated table (jobs IS the §3 job log).
+ */
+export function latestJobByPayload(
+  db: GalapagosDb,
+  kind: string,
+  key: string,
+  value: string,
+): JobRow | undefined {
+  for (const job of listRecentJobsByKind(db, kind, 300)) {
+    try {
+      const payload = JSON.parse(job.payload ?? "{}") as Record<string, unknown>;
+      if (payload[key] === value) {
+        return job;
+      }
+    } catch {
+      // Unparseable payload — not a match.
+    }
+  }
+  return undefined;
+}
+
 export function failJob(db: GalapagosDb, jobId: string, error: string): void {
   db.prepare("UPDATE jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?").run(
     error,

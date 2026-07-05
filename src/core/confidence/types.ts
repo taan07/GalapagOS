@@ -10,9 +10,21 @@
  */
 export type ConfidenceState = "strong" | "steady" | "draining" | "blocked";
 
+/**
+ * The engine's independent evidence legs (user-confirmed 2026-07-05): four
+ * "brains" that cannot all be fooled the same way, each its own module,
+ * each visible in the report. facts = deterministic evidence bookkeeping
+ * (checks, freshness, lanes, liveness); tripwires = deterministic
+ * test-integrity patterns; watchdog = a cheap model reading the worker's
+ * transcript; critic = blinded independent critique of diff-vs-brief.
+ */
+export type ConfidenceLeg = "facts" | "tripwires" | "watchdog" | "critic";
+
 /** One accumulating contribution to the score, positive or negative. */
 export type ConfidenceSignal = {
   id: string;
+  /** Which leg produced this signal. */
+  leg: ConfidenceLeg;
   /** The human reason — every number explains itself (§9, non-negotiable). */
   label: string;
   delta: number;
@@ -24,6 +36,7 @@ export type ConfidenceSignal = {
  */
 export type ConfidenceCap = {
   id: string;
+  leg: ConfidenceLeg;
   label: string;
   capTo: number;
   blocking: boolean;
@@ -97,6 +110,56 @@ export type LaneAuditEvidence =
   | { ran: true; violations: string[] }
   | { ran: false; reason: string };
 
+/**
+ * One deterministic test-integrity finding (the tripwires leg). "alert" =
+ * the check machinery itself was touched in a way that can fake a pass —
+ * blocks; "warn" = legitimate-looking but review-worthy (e.g. the worker
+ * edited tests that judge its own code) — lowers and flags for the critic.
+ */
+export type TripwireFinding = {
+  id: string;
+  severity: "alert" | "warn";
+  label: string;
+  paths: string[];
+};
+
+export type IntegrityInput =
+  | { available: true; tripwires: TripwireFinding[] }
+  | { available: false; reason: string };
+
+/**
+ * The watchdog leg's verdict over the worker's transcript. Applicable only
+ * once completion is claimed (null before that). `fresh` compares the
+ * verdict's evidence key to the workspace — a verdict predating new work
+ * proves nothing about it.
+ */
+export type WatchdogInput =
+  | { status: "pending" }
+  | { status: "unavailable"; reason: string }
+  | {
+      status: "reviewed";
+      verdict: "clean" | "suspicious" | "gaming";
+      fresh: boolean;
+      summary: string;
+    };
+
+export type CriticFindingInput = {
+  severity: "blocker" | "major" | "minor";
+  label: string;
+};
+
+/** The blinded-critic leg's verdict. Applicable only once completion is claimed. */
+export type CriticInput =
+  | { status: "pending" }
+  | { status: "unavailable"; reason: string }
+  | {
+      status: "reviewed";
+      verdict: "approve" | "needs_work" | "reject";
+      fresh: boolean;
+      findings: CriticFindingInput[];
+      summary: string;
+    };
+
 export type WorkerConfidenceInput = {
   /** How the report names this worker, e.g. its lane name. */
   label: string;
@@ -106,6 +169,12 @@ export type WorkerConfidenceInput = {
   /** Claims from the latest digest; [] when there is no digest. */
   claims: ClaimEvidence[];
   checks: CheckEvidence;
+  /** The tripwires leg — deterministic, computed whenever the audit can run. */
+  integrity: IntegrityInput;
+  /** The watchdog leg; null = not applicable (no completion claimed yet). */
+  watchdog: WatchdogInput | null;
+  /** The critic leg; null = not applicable (no completion claimed yet). */
+  critic: CriticInput | null;
 };
 
 export type ProjectClarity = {

@@ -25,6 +25,8 @@ import {
 } from "../adapters/db/repos/manager";
 import { createWorkerRuntime } from "../adapters/agent/worker-runtime";
 import { runTriageJob } from "../adapters/agent/triage";
+import { runWatchdogReview } from "../adapters/legs/watchdog";
+import { runCriticReview } from "../adapters/legs/critic";
 import { getAttentionItem, resolveAttentionItem } from "../adapters/db/repos/attention";
 import { commitRecords } from "../adapters/git/mutating-runner";
 import { ingestVaultSpecifics } from "../adapters/records/ingest";
@@ -50,6 +52,18 @@ const monitor = createMonitor({
   db,
   config,
   broadcast: (event) => broadcast(event),
+  // The judgment legs (user-confirmed 2026-07-05): watchdog reads the
+  // transcript, the critic judges the diff against the brief — both on
+  // fresh single-shot sessions, both persisted as jobs rows.
+  runWatchdog: ({ worker, lane, digestId }) =>
+    runWatchdogReview({ db, config, worker, lane, digestId }),
+  runCritic: ({ worker, lane, digestId }) => {
+    const project = getProject(db, worker.project_id);
+    if (!project) {
+      return Promise.resolve({ ran: false, error: `unknown project ${worker.project_id}` });
+    }
+    return runCriticReview({ db, config, project, worker, lane, digestId });
+  },
   runTriage: async (project) => {
     const outcome = await runTriageJob({
       db,

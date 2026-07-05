@@ -26,6 +26,10 @@ export type GalapagosConfig = {
    * user can raise it.
    */
   triageModel: string;
+  /** Model for the transcript watchdog leg — reading, not implementing. */
+  watchdogModel: string;
+  /** Model for the blinded critic leg — the user can raise it for harder projects. */
+  criticModel: string;
   /** Monitor loop cadence. The tick makes zero LLM calls at any interval. */
   monitorIntervalMs: number;
   /** A running worker silent beyond this raises stale_worker attention. */
@@ -103,6 +107,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GalapagosConfi
     workerModel: env.GALAPAGOS_WORKER_MODEL ?? "claude-opus-4-8",
     workerEffort: parseWorkerEffort(env.GALAPAGOS_WORKER_EFFORT),
     triageModel: env.GALAPAGOS_TRIAGE_MODEL ?? "claude-haiku-4-5",
+    watchdogModel: env.GALAPAGOS_WATCHDOG_MODEL ?? "claude-haiku-4-5",
+    criticModel: env.GALAPAGOS_CRITIC_MODEL ?? "claude-haiku-4-5",
     monitorIntervalMs: parsePositiveInt(
       "GALAPAGOS_MONITOR_INTERVAL_MS",
       env.GALAPAGOS_MONITOR_INTERVAL_MS,

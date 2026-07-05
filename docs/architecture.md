@@ -97,7 +97,8 @@ completion_digests(id PK, worker_id FK, narrative, before_after JSON,
                    created_at)
 attention_items(id PK, project_id FK, worker_id NULL, kind,
                 -- lane_violation|stale_worker|question_for_user|unsupported_claim|
-                -- check_failed|decision_needed|unstructured_completion|worker_failed
+                -- check_failed|decision_needed|unstructured_completion|worker_failed|
+                -- integrity_alert
                 title, detail, priority, status,                    -- open|resolved|dismissed
                 record_id NULL, created_at, resolved_at)
 evidence_runs(id PK, project_id FK, worker_id NULL, check_key,      -- typecheck|lint|test|build|diff-check
@@ -285,6 +286,38 @@ claims lower; contradictions cap hard; one risky worker lowers project
 confidence. Detailed caps/signals live in a debug drilldown, never as default
 sub-bars.
 
+**The engine aggregates four independent legs** (amended 2026-07-05 after the
+user challenged the original single-leg design; evidence in
+docs/research/confidence-engine-evidence.md — verification, not generation,
+is the binding constraint, and no single verifier class is sufficient). Each
+leg is its own module with its own tests and doc (docs/legs/), each signal
+and cap names its leg, and the legs cannot all be fooled the same way:
+
+1. **facts** — deterministic evidence bookkeeping: check runs keyed to the
+   exact workspace state, staleness, lane audits, claim-to-run links,
+   liveness. The anchor everything else grounds to.
+2. **tripwires** (`core/legs/tripwires`) — deterministic test-integrity
+   patterns over what actually changed: rewritten check scripts, patched
+   test machinery, hard exits in tests, always-true equality, mass skips,
+   assertion deletion, self-authored judging tests. Alerts block; warns
+   lower and direct the critic's attention.
+3. **watchdog** (`core/legs/watchdog`) — a cheap model reads the worker's
+   FULL persisted transcript for gaming, deception, thrashing, scope creep.
+   Observes only; never a training/optimization signal. Verdicts require
+   verbatim quotes — no quote, no finding.
+4. **critic** (`core/legs/critic`) — blinded independent critique of the
+   diff against the brief, the lane contract, the agreed specifics, and the
+   execution evidence. NEVER sees the worker's narrative, claims, or
+   transcript (judge the work, not the story). Findings must anchor to
+   evidence; unanchored findings are dropped.
+
+Judgment-leg verdicts persist as jobs rows keyed to the workspace evidence
+key: any commit or edit stales them, and a stale or pending verdict caps
+below strong — **a completion nobody independent has reviewed is never
+strong, and is never auto-reviewed**. A leg that cannot run drains (missing
+judgment is not quiet health). Legs run event-driven at completion (and
+re-run when the workspace moves), never per monitor tick.
+
 The engine is pure (inputs in, explainable report out) and is proven by a
 **regression suite of gold scenarios**, written with the engine, that must
 encode at least:
@@ -297,8 +330,17 @@ encode at least:
 - a claim marked supported without linked evidence lowers (honesty is
   observable support, not confident wording)
 - a contradicted claim caps hard (≈40/blocked)
+- a fired tripwire alert blocks (corrupting the judge is a contradiction);
+  a tripwire warning lowers without blocking
+- an unreviewed (pending or stale-verdict) completion stays below strong
+  without being treated as a failure
+- a watchdog gaming verdict caps hard; suspicion drains without blocking
+- a critic rejection blocks, naming an evidence-anchored blocker;
+  needs_work caps below strong without blocking
+- a judgment leg that could not run drains
 - one risky worker lowers project confidence even when others are healthy
-- every score's caps and signals identify their reason (no opaque numbers)
+- every score's caps and signals identify their reason AND their leg
+  (no opaque numbers)
 
 Every UI field everywhere carries source attribution (source, sourceLabel,
 sourceRecords) — missing data renders as explicitly missing, never fabricated.

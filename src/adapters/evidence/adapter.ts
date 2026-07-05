@@ -6,17 +6,24 @@ import { checkLane } from "../../core/lanes/lane-check";
 import type {
   CheckEvidence,
   ClaimVerification,
+  CriticInput,
+  IntegrityInput,
+  WatchdogInput,
   WorkerConfidenceInput,
   WorkerLiveness,
 } from "../../core/confidence/types";
 import type { CompletionClaim } from "../../core/digests/completion";
 import type { GalapagosDb } from "../db/db";
+import { latestJobByPayload } from "../db/repos/jobs";
 import { laneGlobs, type LaneRow } from "../db/repos/lanes";
 import type { WorkerRow } from "../db/repos/workers";
 import { latestDigestForWorker } from "../db/repos/digests";
 import { latestRunsByKey, type CheckKey, type EvidenceRunRow } from "../db/repos/evidence";
 import { collectAuditFiles } from "../agent/worker-runtime";
 import { configuredCheckKeys } from "../checks/run-checks";
+import { runTripwires } from "../legs/tripwires";
+import type { WatchdogJobResult } from "../legs/watchdog";
+import type { CriticJobResult } from "../legs/critic";
 import { observeWorkspaceEvidence } from "./workspace";
 
 /**
@@ -178,6 +185,41 @@ export type WorkerEvidence = {
 };
 
 /**
+ * Resolve a judgment leg's jobs row into an engine input. The verdict must
+ * belong to THIS digest (a new completion needs a new review) and freshness
+ * compares its evidence key against the workspace now.
+ */
+function legInputFromJob<TResult extends { digestId: string; evidenceKey: string }>(
+  db: GalapagosDb,
+  kind: "watchdog" | "critic",
+  workerId: string,
+  digestId: string,
+  workspaceKey: string | null,
+  toInput: (result: TResult, fresh: boolean) => WatchdogInput | CriticInput,
+): WatchdogInput | CriticInput {
+  const job = latestJobByPayload(db, kind, "workerId", workerId);
+  if (!job) {
+    return { status: "pending" };
+  }
+  if (job.status === "failed") {
+    return { status: "unavailable", reason: job.error ?? "the review run failed" };
+  }
+  if (job.status !== "done" || !job.result) {
+    return { status: "pending" }; // queued or mid-run
+  }
+  try {
+    const result = JSON.parse(job.result) as TResult;
+    if (result.digestId !== digestId) {
+      return { status: "pending" }; // verdict belongs to a superseded completion
+    }
+    const fresh = workspaceKey !== null && result.evidenceKey === workspaceKey;
+    return toInput(result, fresh);
+  } catch {
+    return { status: "unavailable", reason: "the stored verdict could not be parsed" };
+  }
+}
+
+/**
  * Assemble one worker's confidence input from what is actually observable:
  * its row, its lane, its worktree, its digest, its evidence runs. Every
  * unobservable piece degrades to an explicit "could not run/observe" —
@@ -258,6 +300,50 @@ export async function buildWorkerEvidence(
     ? REQUIRED_ON_COMPLETION.filter((key) => configured.includes(key))
     : [];
 
+  // The tripwires leg is deterministic and always due once a lane exists.
+  let integrity: IntegrityInput;
+  if (!lane) {
+    integrity = { available: false, reason: "the lane record is missing" };
+  } else {
+    integrity = await runTripwires(worker.worktree_path, lane.base_sha);
+  }
+
+  // The judgment legs apply only once completion is claimed.
+  const watchdog: WatchdogInput | null = digest
+    ? (legInputFromJob<WatchdogJobResult>(
+        db,
+        "watchdog",
+        worker.id,
+        digest.id,
+        workspaceKey,
+        (result, fresh) => ({
+          status: "reviewed",
+          verdict: result.verdict,
+          fresh,
+          summary: result.summary,
+        }),
+      ) as WatchdogInput)
+    : null;
+  const critic: CriticInput | null = digest
+    ? (legInputFromJob<CriticJobResult>(
+        db,
+        "critic",
+        worker.id,
+        digest.id,
+        workspaceKey,
+        (result, fresh) => ({
+          status: "reviewed",
+          verdict: result.verdict,
+          fresh,
+          findings: result.findings.map((finding) => ({
+            severity: finding.severity,
+            label: `${finding.title} — ${finding.evidence}`,
+          })),
+          summary: result.summary,
+        }),
+      ) as CriticInput)
+    : null;
+
   return {
     input: {
       label: lane?.name ?? worker.id.slice(0, 8),
@@ -270,6 +356,9 @@ export async function buildWorkerEvidence(
         verification: claim.verification,
       })),
       checks: toCheckEvidence(latestRuns, workspaceKey, requiredKeys),
+      integrity,
+      watchdog,
+      critic,
     },
     linkedClaims,
     auditFiles,

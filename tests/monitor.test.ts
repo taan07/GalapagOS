@@ -6,7 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { openDb, type GalapagosDb } from "../src/adapters/db/db";
@@ -19,7 +19,7 @@ import {
 } from "../src/adapters/db/repos/attention";
 import { createCompletionDigest, latestDigestForWorker } from "../src/adapters/db/repos/digests";
 import { createEvidenceRun } from "../src/adapters/db/repos/evidence";
-import { createJob } from "../src/adapters/db/repos/jobs";
+import { createJob, finishJob, startJob } from "../src/adapters/db/repos/jobs";
 import { getWorker } from "../src/adapters/db/repos/workers";
 import { createWorkerRuntime } from "../src/adapters/agent/worker-runtime";
 import type { WorkerSession } from "../src/adapters/agent/worker-session";
@@ -58,6 +58,16 @@ function inertSession(): WorkerSession {
   };
 }
 
+/** What the fake judgment legs answer — mutable per test. */
+type LegBehavior = {
+  watchdog: { verdict: "clean" | "suspicious" | "gaming"; summary: string };
+  critic: {
+    verdict: "approve" | "needs_work" | "reject";
+    summary: string;
+    findings: { severity: "blocker" | "major" | "minor"; title: string; evidence: string }[];
+  };
+};
+
 type Fixture = {
   db: GalapagosDb;
   config: GalapagosConfig;
@@ -68,6 +78,8 @@ type Fixture = {
   events: MonitorBroadcast[];
   monitor: ReturnType<typeof createMonitor>;
   clock: { now: Date };
+  legs: LegBehavior;
+  legRuns: string[];
 };
 
 async function fixture(): Promise<Fixture> {
@@ -90,11 +102,38 @@ async function fixture(): Promise<Fixture> {
   const triaged: ProjectRow[] = [];
   const events: MonitorBroadcast[] = [];
   const clock = { now: new Date() };
+  const legs: LegBehavior = {
+    watchdog: { verdict: "clean", summary: "honest run" },
+    critic: { verdict: "approve", summary: "satisfies the brief", findings: [] },
+  };
+  const legRuns: string[] = [];
+  // Fake judgment legs: persist a verdict job exactly like the real ones,
+  // keyed to the live workspace state.
+  const fakeLeg =
+    (kind: "watchdog" | "critic") =>
+    async (input: { worker: { id: string; worktree_path: string }; digestId: string }) => {
+      legRuns.push(`${kind}:${input.digestId}`);
+      const job = createJob(db, kind, {
+        workerId: input.worker.id,
+        digestId: input.digestId,
+        projectId: project.id,
+      });
+      startJob(db, job.id);
+      const workspace = await observeWorkspaceEvidence(input.worker.worktree_path);
+      finishJob(db, job.id, {
+        ...(kind === "watchdog" ? { ...legs.watchdog, evidence: [] } : legs.critic),
+        evidenceKey: workspace.key,
+        digestId: input.digestId,
+        workerId: input.worker.id,
+      });
+    };
   const monitor = createMonitor({
     db,
     config,
     now: () => clock.now,
     broadcast: (event) => events.push(event),
+    runWatchdog: fakeLeg("watchdog"),
+    runCritic: fakeLeg("critic"),
     runTriage: async (target) => {
       // The real triage records its job — the trigger cutoff depends on it.
       createJob(db, "triage", { projectId: target.id });
@@ -111,7 +150,14 @@ async function fixture(): Promise<Fixture> {
     events,
     monitor,
     clock,
+    legs,
+    legRuns,
   };
+}
+
+/** Leg launches are fire-and-forget — give their promises a beat to land. */
+async function settleLegs(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 25));
 }
 
 function setStatus(db: GalapagosDb, workerId: string, status: string): void {
@@ -239,8 +285,8 @@ test("claims without evidence raise unsupported_claim; new evidence auto-resolve
   assert.match(after[0]?.detail ?? "", /Fresh evidence now supports/);
 });
 
-test("a clean, fully evidenced completion is auto-reviewed with zero LLM calls", async () => {
-  const { db, workerId, worktree, monitor, events } = await fixture();
+test("a clean completion is auto-reviewed only after ALL legs return clean", async () => {
+  const { db, workerId, worktree, monitor, events, legRuns } = await fixture();
   setStatus(db, workerId, "idle");
   const worker = getWorker(db, workerId);
   assert.ok(worker);
@@ -263,6 +309,22 @@ test("a clean, fully evidenced completion is auto-reviewed with zero LLM calls",
     });
   }
 
+  // Tick 1: legs are pending, so NOTHING is rubber-stamped yet — the tick
+  // launches the watchdog and critic instead.
+  await monitor.tick();
+  assert.equal(
+    latestDigestForWorker(db, workerId)?.status,
+    "parsed",
+    "no auto-review before the judgment legs have reviewed",
+  );
+  assert.deepEqual(
+    legRuns.map((entry) => entry.split(":")[0]).sort(),
+    ["critic", "watchdog"],
+    "both legs launched exactly once",
+  );
+
+  // Tick 2: verdicts are in and clean — reviewed, with zero interruptions.
+  await settleLegs();
   await monitor.tick();
   assert.equal(latestDigestForWorker(db, workerId)?.status, "manager_reviewed");
   assert.equal(
@@ -273,9 +335,11 @@ test("a clean, fully evidenced completion is auto-reviewed with zero LLM calls",
   assert.ok(
     events.some((event) => event.type === "digest_reviewed" && event.workerId === workerId),
   );
+  await monitor.tick();
+  assert.equal(legRuns.length, 2, "verdicts are not re-run while fresh");
 });
 
-test("an unevidenced completion is NOT auto-reviewed", async () => {
+test("an unevidenced completion is NOT auto-reviewed, even with clean legs", async () => {
   const { db, workerId, monitor } = await fixture();
   setStatus(db, workerId, "idle");
   createCompletionDigest(db, {
@@ -286,11 +350,114 @@ test("an unevidenced completion is NOT auto-reviewed", async () => {
     touchedAreas: [],
   });
   await monitor.tick();
+  await settleLegs();
+  await monitor.tick();
   assert.equal(
     latestDigestForWorker(db, workerId)?.status,
     "parsed",
     "no evidence, no rubber stamp — this one goes to triage",
   );
+});
+
+test("a tripwire alert blocks the completion and lands on the queue", async () => {
+  const { db, workerId, worktree, monitor } = await fixture();
+  setStatus(db, workerId, "idle");
+  createCompletionDigest(db, {
+    workerId,
+    narrative: "done",
+    beforeAfter: [],
+    claims: [],
+    touchedAreas: [],
+  });
+  // The worker "fixes" the checks instead of the code: rewrite the test
+  // script in ITS OWN worktree copy of package.json.
+  const packageJsonPath = path.join(worktree, "package.json");
+  const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+    scripts: Record<string, string>;
+  };
+  packageJson.scripts.test = "echo all good";
+  writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2));
+
+  await monitor.tick();
+  const alerts = listWorkerAttentionItems(db, workerId).filter(
+    (item) => item.kind === "integrity_alert",
+  );
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0]?.priority, "high");
+  assert.match(alerts[0]?.title ?? "", /check-script-modified/);
+  assert.match(alerts[0]?.detail ?? "", /package\.json/);
+
+  await settleLegs();
+  await monitor.tick();
+  assert.equal(
+    latestDigestForWorker(db, workerId)?.status,
+    "parsed",
+    "a tripwired completion is never auto-reviewed, whatever the legs say",
+  );
+  assert.equal(
+    listWorkerAttentionItems(db, workerId).filter((i) => i.kind === "integrity_alert").length,
+    1,
+    "the same tripwire is not re-raised",
+  );
+});
+
+test("a watchdog gaming verdict raises a high-priority integrity alert", async () => {
+  const { db, workerId, monitor, legs } = await fixture();
+  setStatus(db, workerId, "idle");
+  legs.watchdog = {
+    verdict: "gaming",
+    summary: "the transcript shows the suite being weakened until it passed",
+  };
+  createCompletionDigest(db, {
+    workerId,
+    narrative: "done",
+    beforeAfter: [],
+    claims: [],
+    touchedAreas: [],
+  });
+  await monitor.tick(); // launches the legs
+  await settleLegs();
+  await monitor.tick(); // reads the verdicts
+  const alerts = listWorkerAttentionItems(db, workerId).filter(
+    (item) => item.kind === "integrity_alert",
+  );
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0]?.priority, "high");
+  assert.match(alerts[0]?.title ?? "", /gamed/);
+  assert.match(alerts[0]?.detail ?? "", /weakened until it passed/);
+  assert.equal(latestDigestForWorker(db, workerId)?.status, "parsed");
+});
+
+test("a critic rejection raises a high-priority integrity alert naming the blocker", async () => {
+  const { db, workerId, monitor, legs } = await fixture();
+  setStatus(db, workerId, "idle");
+  legs.critic = {
+    verdict: "reject",
+    summary: "the asked-for behavior is missing",
+    findings: [
+      {
+        severity: "blocker",
+        title: "the brief asked for validation",
+        evidence: "the diff only renames a variable",
+      },
+    ],
+  };
+  createCompletionDigest(db, {
+    workerId,
+    narrative: "done",
+    beforeAfter: [],
+    claims: [],
+    touchedAreas: [],
+  });
+  await monitor.tick();
+  await settleLegs();
+  await monitor.tick();
+  const alerts = listWorkerAttentionItems(db, workerId).filter(
+    (item) => item.kind === "integrity_alert",
+  );
+  assert.equal(alerts.length, 1);
+  assert.match(alerts[0]?.title ?? "", /does not hold against its brief/);
+  assert.match(alerts[0]?.detail ?? "", /only renames a variable/);
 });
 
 test("main-checkout watch: a new lane-relevant file in the primary checkout raises attention once", async () => {

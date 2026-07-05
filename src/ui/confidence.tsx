@@ -2,9 +2,19 @@
 
 // The one gauge (architecture §9): a single bar per worker and per project —
 // 0-100 with strong/steady/draining/blocked. Caps and signals live in a
-// collapsed debug drilldown, never as default sub-bars; every number
-// explains itself and carries its source.
-import type { ConfidenceReportView } from "./types";
+// collapsed debug drilldown grouped by the engine's four independent legs
+// (facts / tripwires / watchdog / critic — user-confirmed 2026-07-05), never
+// as default sub-bars; every number explains itself and carries its source.
+import type { ConfidenceLegView, ConfidenceReportView } from "./types";
+
+const LEG_ORDER: ConfidenceLegView[] = ["facts", "tripwires", "watchdog", "critic"];
+
+const LEG_LABEL: Record<ConfidenceLegView, string> = {
+  facts: "facts — deterministic evidence",
+  tripwires: "tripwires — test integrity",
+  watchdog: "watchdog — transcript review",
+  critic: "critic — blinded critique",
+};
 
 export function ConfidenceGauge({
   report,
@@ -54,36 +64,49 @@ export function ConfidenceGauge({
         <div className="confidence-breakdown">
           {computedAt ? (
             <div className="confidence-source">
-              computed from evidence at {computedAt.slice(11, 19)} UTC
+              computed from evidence at {computedAt.slice(11, 19)} UTC · sum of signals{" "}
+              {report.uncappedScore}, then caps
             </div>
           ) : null}
-          <div className="breakdown-section">signals (sum {report.uncappedScore})</div>
-          {report.signals.map((signal) => (
-            <div key={signal.id} className="breakdown-row">
-              <span className={`breakdown-delta ${signal.delta >= 0 ? "positive" : "negative"}`}>
-                {signal.delta >= 0 ? `+${signal.delta}` : signal.delta}
-              </span>
-              <span className="breakdown-label">{signal.label}</span>
-            </div>
-          ))}
-          {report.caps.length > 0 ? (
-            <>
-              <div className="breakdown-section">caps — positives cannot overcome these</div>
-              {report.caps.map((cap) => (
-                <div key={cap.id} className={`breakdown-row${cap === binding ? " binding" : ""}`}>
-                  <span className="breakdown-delta negative">≤{cap.capTo}</span>
-                  <span className="breakdown-label">
-                    {cap.label}
-                    {cap.blocking ? " [blocks]" : cap.draining ? " [drains]" : ""}
-                  </span>
-                </div>
-              ))}
-            </>
-          ) : (
+          {LEG_ORDER.map((leg) => {
+            const signals = report.signals.filter((signal) => signal.leg === leg);
+            const caps = report.caps.filter((cap) => cap.leg === leg);
+            if (signals.length === 0 && caps.length === 0) {
+              return null;
+            }
+            return (
+              <div key={leg} className="breakdown-leg">
+                <div className="breakdown-section">{LEG_LABEL[leg]}</div>
+                {signals.map((signal) => (
+                  <div key={signal.id} className="breakdown-row">
+                    <span
+                      className={`breakdown-delta ${signal.delta >= 0 ? "positive" : "negative"}`}
+                    >
+                      {signal.delta >= 0 ? `+${signal.delta}` : signal.delta}
+                    </span>
+                    <span className="breakdown-label">{signal.label}</span>
+                  </div>
+                ))}
+                {caps.map((cap) => (
+                  <div
+                    key={cap.id}
+                    className={`breakdown-row${cap === binding ? " binding" : ""}`}
+                  >
+                    <span className="breakdown-delta negative">≤{cap.capTo}</span>
+                    <span className="breakdown-label">
+                      {cap.label}
+                      {cap.blocking ? " [blocks]" : cap.draining ? " [drains]" : ""}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+          {report.caps.length === 0 ? (
             <div className="breakdown-row">
               <span className="breakdown-label">no caps active</span>
             </div>
-          )}
+          ) : null}
         </div>
       </details>
     </div>

@@ -38,11 +38,24 @@ export type MonitorBroadcast =
   | { type: "digest_reviewed"; projectId: string; workerId: string }
   | { type: "monitor_tick"; projectId: string };
 
+export type LegReviewInput = {
+  worker: WorkerRow;
+  lane: LaneRow | null;
+  digestId: string;
+};
+
 export type MonitorDeps = {
   db: GalapagosDb;
   config: GalapagosConfig;
   /** Event-driven triage — invoked ONLY when new open attention items exist. */
   runTriage: (project: ProjectRow) => Promise<void>;
+  /**
+   * The judgment legs, launched once per completion (and again when the
+   * workspace moves past a verdict). Injected so tests use fakes and the
+   * tick itself stays LLM-free — the legs are events, like triage.
+   */
+  runWatchdog: (input: LegReviewInput) => Promise<unknown>;
+  runCritic: (input: LegReviewInput) => Promise<unknown>;
   broadcast?: (event: MonitorBroadcast) => void;
   now?: () => Date;
 };
@@ -69,6 +82,8 @@ export function createMonitor(deps: MonitorDeps) {
   // (a restart just re-baselines on the next tick) and in-flight guards.
   const checkoutSnapshots = new Map<string, CheckoutSnapshot>();
   const triaging = new Set<string>();
+  /** One leg run in flight per worker per leg — key `<leg>:<workerId>`. */
+  const legRuns = new Set<string>();
   let interval: NodeJS.Timeout | null = null;
   let ticking = false;
 
@@ -186,10 +201,36 @@ export function createMonitor(deps: MonitorDeps) {
     }
   };
 
+  /** Launch a judgment leg once per completion, one in flight per worker. */
+  const ensureLegRun = (
+    leg: "watchdog" | "critic",
+    run: (input: LegReviewInput) => Promise<unknown>,
+    input: LegReviewInput,
+    project: ProjectRow,
+  ): void => {
+    const key = `${leg}:${input.worker.id}`;
+    if (legRuns.has(key)) {
+      return;
+    }
+    legRuns.add(key);
+    void run(input)
+      .catch((error) => {
+        console.error(
+          `[monitor] ${leg} review failed for worker ${input.worker.id.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      })
+      .finally(() => {
+        legRuns.delete(key);
+        // A verdict landed (or honestly failed) — gauges and the queue move.
+        deps.broadcast?.({ type: "attention_changed", projectId: project.id });
+      });
+  };
+
   /**
    * Completion-claims scan over unreviewed digests: raise what the evidence
-   * cannot support, auto-resolve what new evidence now supports, and
-   * auto-review completions the evidence already proves clean — zero LLM.
+   * cannot support, auto-resolve what new evidence now supports, launch the
+   * judgment legs that are due, surface integrity findings, and auto-review
+   * completions ALL legs prove clean — the tick itself stays zero-LLM.
    */
   const scanDigests = async (project: ProjectRow): Promise<boolean> => {
     let changed = false;
@@ -205,6 +246,86 @@ export function createMonitor(deps: MonitorDeps) {
         staleWorkerSeconds: config.staleWorkerSeconds,
         now: now(),
       });
+
+      // Judgment legs: due when no verdict covers this digest at the current
+      // workspace state. Failed runs are NOT auto-retried (they surface as
+      // "unavailable" and drain) — a fresh digest or workspace change re-arms.
+      const watchdogInput = evidence.input.watchdog;
+      if (
+        watchdogInput &&
+        (watchdogInput.status === "pending" ||
+          (watchdogInput.status === "reviewed" && !watchdogInput.fresh))
+      ) {
+        ensureLegRun("watchdog", deps.runWatchdog, { worker, lane, digestId: digest.id }, project);
+      }
+      const criticInput = evidence.input.critic;
+      if (
+        criticInput &&
+        (criticInput.status === "pending" ||
+          (criticInput.status === "reviewed" && !criticInput.fresh))
+      ) {
+        ensureLegRun("critic", deps.runCritic, { worker, lane, digestId: digest.id }, project);
+      }
+
+      // Integrity findings → the queue. Tripwire alerts and watchdog gaming
+      // are trust breaches (high); watchdog suspicion is a judgment call for
+      // triage (normal); critic blockers name what the brief did not get.
+      if (evidence.input.integrity.available) {
+        for (const finding of evidence.input.integrity.tripwires) {
+          if (finding.severity !== "alert") {
+            continue;
+          }
+          if (
+            raise({
+              project,
+              workerId: worker.id,
+              kind: "integrity_alert",
+              title: `Test-integrity tripwire: ${finding.id}`,
+              detail: `${finding.label}.\n${finding.paths.join("\n")}`,
+              priority: "high",
+            })
+          ) {
+            changed = true;
+          }
+        }
+      }
+      if (watchdogInput?.status === "reviewed" && watchdogInput.fresh) {
+        if (
+          watchdogInput.verdict !== "clean" &&
+          raise({
+            project,
+            workerId: worker.id,
+            kind: "integrity_alert",
+            title:
+              watchdogInput.verdict === "gaming"
+                ? "Watchdog: transcript shows the checks being gamed"
+                : "Watchdog: transcript is suspicious",
+            detail: watchdogInput.summary,
+            priority: watchdogInput.verdict === "gaming" ? "high" : "normal",
+          })
+        ) {
+          changed = true;
+        }
+      }
+      if (criticInput?.status === "reviewed" && criticInput.fresh) {
+        const blockers = criticInput.findings.filter(
+          (finding) => finding.severity === "blocker",
+        );
+        if (
+          (criticInput.verdict === "reject" || blockers.length > 0) &&
+          raise({
+            project,
+            workerId: worker.id,
+            kind: "integrity_alert",
+            title: "Critic: the work does not hold against its brief",
+            detail:
+              blockers.map((finding) => finding.label).join("\n") || criticInput.summary,
+            priority: "high",
+          })
+        ) {
+          changed = true;
+        }
+      }
 
       const problems = evidence.linkedClaims.filter(
         (claim) => claim.verification === "unsupported" || claim.verification === "contradicted",

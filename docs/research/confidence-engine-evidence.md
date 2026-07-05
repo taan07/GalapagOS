@@ -153,9 +153,17 @@ unverified detail.
    co-evolve; calibrate the judge against the user's own overrides over
    time; expect and instrument for gaming, don't assume its absence.
 
-## The pending direction call (asked 2026-07-05, unanswered — re-raise)
+## The direction call — ANSWERED (user-confirmed 2026-07-05)
 
-Three questions for the user before §9 changes; recommendations attached:
+The user ruled in chat: adopt the legs AND keep them structurally separate —
+"separate work environments within the branch, so code stays clean and we
+can view deeper specifics into each one … 3 main brains or legs so to say."
+Implemented same day: §9 amended, `core/legs/` + `adapters/legs/` one module
+per leg, one doc per leg (docs/legs/), leg-tagged signals in every report,
+and the UI drilldown grouped by leg. Build order and critic budget followed
+the recommendations below (all three at once fit in the session; critic runs
+on every completion) — overturnable as ever. Original questions kept for the
+record:
 
 1. **Direction** — adopt the combined target for §9? Deterministic facts
    floor (chunk 4, kept) + three new legs feeding the same capped engine:

@@ -11,7 +11,11 @@ import type {
   WorkerConfidenceInput,
 } from "../src/core/confidence/types";
 
-/** A healthy, fully evidenced worker — the baseline scenarios mutate from. */
+/**
+ * A healthy, fully evidenced worker — the baseline scenarios mutate from.
+ * All four legs are green: fresh required checks, no tripwires, watchdog
+ * clean, critic approve. Strong is only reachable from here.
+ */
 function healthyWorker(overrides: Partial<WorkerConfidenceInput> = {}): WorkerConfidenceInput {
   return {
     label: "auth ui",
@@ -28,6 +32,15 @@ function healthyWorker(overrides: Partial<WorkerConfidenceInput> = {}): WorkerCo
         { key: "typecheck", status: "passed", fresh: true },
         { key: "test", status: "passed", fresh: true },
       ],
+    },
+    integrity: { available: true, tripwires: [] },
+    watchdog: { status: "reviewed", verdict: "clean", fresh: true, summary: "honest run" },
+    critic: {
+      status: "reviewed",
+      verdict: "approve",
+      fresh: true,
+      findings: [],
+      summary: "satisfies the brief",
     },
     ...overrides,
   };
@@ -99,12 +112,15 @@ test("gold: a worker's claims alone cannot reach strong", () => {
   assert.ok(report.score < 80);
   assert.equal(report.state, "blocked");
   // An in-progress worker (no completion claimed, nothing demanded yet) is
-  // merely capped below strong — never born blocked.
+  // merely capped below strong — never born blocked. The judgment legs are
+  // not applicable before completion.
   const inProgress = scoreWorker(
     healthyWorker({
       hasDigest: false,
       claims: [],
       checks: { requiredKeys: [], runs: [] },
+      watchdog: null,
+      critic: null,
     }),
   );
   assert.equal(inProgress.state, "steady");
@@ -306,10 +322,18 @@ test("gold: no opaque numbers — every signal and cap carries a reason", () => 
     for (const signal of report.signals) {
       assert.ok(signal.id && signal.label.trim().length > 0, `signal ${signal.id} has a reason`);
       assert.ok(Number.isFinite(signal.delta));
+      assert.ok(
+        ["facts", "tripwires", "watchdog", "critic"].includes(signal.leg),
+        `signal ${signal.id} names its leg`,
+      );
     }
     for (const cap of report.caps) {
       assert.ok(cap.id && cap.label.trim().length > 0, `cap ${cap.id} has a reason`);
       assert.ok(cap.capTo >= 0 && cap.capTo <= 100);
+      assert.ok(
+        ["facts", "tripwires", "watchdog", "critic"].includes(cap.leg),
+        `cap ${cap.id} names its leg`,
+      );
     }
     // The binding cap is first and actually binds.
     const first = report.caps[0];
@@ -320,6 +344,171 @@ test("gold: no opaque numbers — every signal and cap carries a reason", () => 
       }
     }
   }
+});
+
+// ─── The three legs (user-confirmed 2026-07-05): gold scenarios ───
+
+test("gold: a fired tripwire alert blocks — corrupting the judge is a contradiction", () => {
+  const report = scoreWorker(
+    healthyWorker({
+      integrity: {
+        available: true,
+        tripwires: [
+          {
+            id: "check-script-modified",
+            severity: "alert",
+            label: "the package.json test script was modified",
+            paths: ["package.json"],
+          },
+        ],
+      },
+    }),
+  );
+  assert.equal(report.state, "blocked");
+  assert.ok(report.score <= 40);
+  const cap = report.caps.find((entry) => entry.id === "tripwires.check-script-modified");
+  assert.ok(cap && cap.leg === "tripwires" && cap.label.includes("package.json"));
+});
+
+test("gold: a tripwire warning lowers without blocking", () => {
+  const clean = scoreWorker(healthyWorker());
+  const warned = scoreWorker(
+    healthyWorker({
+      integrity: {
+        available: true,
+        tripwires: [
+          {
+            id: "judge-tests-edited",
+            severity: "warn",
+            label: "the worker edited both code and the tests that judge it",
+            paths: ["tests/login.test.ts"],
+          },
+        ],
+      },
+    }),
+  );
+  assert.notEqual(warned.state, "blocked");
+  assert.ok(warned.score < clean.score);
+  const signal = warned.signals.find((entry) => entry.id === "tripwires.judge-tests-edited");
+  assert.ok(signal && signal.delta < 0 && signal.leg === "tripwires");
+});
+
+test("gold: a completion no independent leg has reviewed cannot be strong", () => {
+  const pending = scoreWorker(
+    healthyWorker({ watchdog: { status: "pending" }, critic: { status: "pending" } }),
+  );
+  assert.ok(pending.score < 80, `expected <80, got ${pending.score}`);
+  assert.notEqual(pending.state, "strong");
+  assert.notEqual(pending.state, "blocked", "pending review is not a failure");
+  assert.ok(pending.caps.some((cap) => cap.id === "watchdog.pending"));
+  assert.ok(pending.caps.some((cap) => cap.id === "critic.pending"));
+});
+
+test("gold: a watchdog gaming verdict caps hard and blocks", () => {
+  const report = scoreWorker(
+    healthyWorker({
+      watchdog: {
+        status: "reviewed",
+        verdict: "gaming",
+        fresh: true,
+        summary: "the transcript shows tests being rewritten to always pass",
+      },
+    }),
+  );
+  assert.equal(report.state, "blocked");
+  assert.ok(report.score <= 40);
+  const cap = report.caps.find((entry) => entry.id === "watchdog.gaming");
+  assert.ok(cap && cap.leg === "watchdog" && cap.label.includes("rewritten to always pass"));
+});
+
+test("gold: a suspicious watchdog verdict drains without blocking", () => {
+  const report = scoreWorker(
+    healthyWorker({
+      watchdog: {
+        status: "reviewed",
+        verdict: "suspicious",
+        fresh: true,
+        summary: "long thrashing loop near the test run",
+      },
+    }),
+  );
+  assert.equal(report.state, "draining");
+  assert.ok(report.score <= 60);
+  assert.ok(!report.caps.some((cap) => cap.blocking));
+});
+
+test("gold: a critic rejection blocks, naming the evidence-anchored blocker", () => {
+  const report = scoreWorker(
+    healthyWorker({
+      critic: {
+        status: "reviewed",
+        verdict: "reject",
+        fresh: true,
+        findings: [
+          {
+            severity: "blocker",
+            label: "the brief asked for validation on submit; the diff only adds a CSS class",
+          },
+        ],
+        summary: "the asked-for behavior is not implemented",
+      },
+    }),
+  );
+  assert.equal(report.state, "blocked");
+  assert.ok(report.score <= 40);
+  const cap = report.caps.find((entry) => entry.id === "critic.reject");
+  assert.ok(cap && cap.leg === "critic" && cap.label.includes("only adds a CSS class"));
+});
+
+test("gold: critic needs_work caps below strong without blocking; majors lower", () => {
+  const report = scoreWorker(
+    healthyWorker({
+      critic: {
+        status: "reviewed",
+        verdict: "needs_work",
+        fresh: true,
+        findings: [
+          { severity: "major", label: "no error path is handled" },
+          { severity: "minor", label: "naming diverges from the module convention" },
+        ],
+        summary: "usable with follow-up",
+      },
+    }),
+  );
+  assert.notEqual(report.state, "blocked");
+  assert.ok(report.score <= 70);
+  assert.ok(report.signals.some((s) => s.id === "critic.major.1" && s.delta < 0));
+});
+
+test("gold: a leg that could not run drains — missing judgment is never quiet health", () => {
+  const report = scoreWorker(
+    healthyWorker({
+      watchdog: { status: "unavailable", reason: "session spawn failed: not logged in" },
+    }),
+  );
+  assert.equal(report.state, "draining");
+  const cap = report.caps.find((entry) => entry.id === "watchdog.unavailable");
+  assert.ok(cap && cap.label.includes("not logged in"));
+});
+
+test("gold: a stale leg verdict counts as unreviewed, not as clean", () => {
+  const report = scoreWorker(
+    healthyWorker({
+      critic: {
+        status: "reviewed",
+        verdict: "approve",
+        fresh: false,
+        findings: [],
+        summary: "approved an older state",
+      },
+    }),
+  );
+  assert.notEqual(report.state, "strong");
+  assert.ok(report.caps.some((cap) => cap.id === "critic.stale"));
+  assert.ok(
+    !report.signals.some((signal) => signal.id === "critic.approve"),
+    "an expired approval earns nothing",
+  );
 });
 
 // ─── Supporting scenarios the chunk exit criterion depends on ───

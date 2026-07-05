@@ -107,13 +107,23 @@ export type AttentionView = {
   workerId?: string | null;
 };
 
+/** The engine's four independent "brains" — every signal/cap names its leg. */
+export type ConfidenceLegView = "facts" | "tripwires" | "watchdog" | "critic";
+
 /** One confidence report as served by /api/confidence — mirrors core types. */
 export type ConfidenceReportView = {
   score: number;
   state: "strong" | "steady" | "draining" | "blocked";
   uncappedScore: number;
-  signals: { id: string; label: string; delta: number }[];
-  caps: { id: string; label: string; capTo: number; blocking: boolean; draining: boolean }[];
+  signals: { id: string; leg: ConfidenceLegView; label: string; delta: number }[];
+  caps: {
+    id: string;
+    leg: ConfidenceLegView;
+    label: string;
+    capTo: number;
+    blocking: boolean;
+    draining: boolean;
+  }[];
   stateReason: string;
 };
 

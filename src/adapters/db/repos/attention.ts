@@ -19,7 +19,11 @@ export type AttentionKind =
   // Chunk 4 (§3 comment updated in the same commit): a worker session that
   // died mid-run — nobody was watching a tool result, so the queue is the
   // only place this failure can surface.
-  | "worker_failed";
+  | "worker_failed"
+  // Chunk 4 legs (user-confirmed 2026-07-05): the work's integrity is in
+  // question — a test-integrity tripwire fired, the watchdog flagged the
+  // transcript, or the critic rejected the work against its brief.
+  | "integrity_alert";
 
 export type AttentionStatus = "open" | "resolved" | "dismissed";
 
