@@ -31,6 +31,7 @@ import {
 } from "../adapters/db/repos/workers";
 import { collectAuditFiles } from "../adapters/agent/worker-runtime";
 import { buildWorkerEvidence } from "../adapters/evidence/adapter";
+import { runTripwires } from "../adapters/legs/tripwires";
 import { observeGitRepository } from "../adapters/git/runner";
 
 export type MonitorBroadcast =
@@ -169,6 +170,39 @@ export function createMonitor(deps: MonitorDeps) {
     return false;
   };
 
+  /**
+   * Tripwire alerts for a worker, deduplicated — called for every live
+   * worker each tick AND during the digest scan, so tampering lands on the
+   * queue whether it happens before or after a completion was reviewed
+   * (found live 2026-07-05: a post-review tamper blocked the gauge but
+   * never reached the queue).
+   */
+  const raiseTripwireAlerts = (
+    project: ProjectRow,
+    worker: WorkerRow,
+    tripwires: { id: string; severity: string; label: string; paths: string[] }[],
+  ): boolean => {
+    let changed = false;
+    for (const finding of tripwires) {
+      if (finding.severity !== "alert") {
+        continue;
+      }
+      if (
+        raise({
+          project,
+          workerId: worker.id,
+          kind: "integrity_alert",
+          title: `Test-integrity tripwire: ${finding.id}`,
+          detail: `${finding.label}.\n${finding.paths.join("\n")}`,
+          priority: "high",
+        })
+      ) {
+        changed = true;
+      }
+    }
+    return changed;
+  };
+
   /** The detective lane audit, mid-run (architecture §7 layer 2). */
   const scanLane = async (
     project: ProjectRow,
@@ -271,22 +305,8 @@ export function createMonitor(deps: MonitorDeps) {
       // are trust breaches (high); watchdog suspicion is a judgment call for
       // triage (normal); critic blockers name what the brief did not get.
       if (evidence.input.integrity.available) {
-        for (const finding of evidence.input.integrity.tripwires) {
-          if (finding.severity !== "alert") {
-            continue;
-          }
-          if (
-            raise({
-              project,
-              workerId: worker.id,
-              kind: "integrity_alert",
-              title: `Test-integrity tripwire: ${finding.id}`,
-              detail: `${finding.label}.\n${finding.paths.join("\n")}`,
-              priority: "high",
-            })
-          ) {
-            changed = true;
-          }
+        if (raiseTripwireAlerts(project, worker, evidence.input.integrity.tripwires)) {
+          changed = true;
         }
       }
       if (watchdogInput?.status === "reviewed" && watchdogInput.fresh) {
@@ -451,6 +471,14 @@ export function createMonitor(deps: MonitorDeps) {
       }
       if (lane && lane.status === "active" && (await scanLane(project, worker, lane))) {
         attentionChanged = true;
+      }
+      // Tripwires cover every live worker every tick — tampering after a
+      // completion was reviewed must still land on the queue.
+      if (lane) {
+        const integrity = await runTripwires(worker.worktree_path, lane.base_sha);
+        if (integrity.available && raiseTripwireAlerts(project, worker, integrity.tripwires)) {
+          attentionChanged = true;
+        }
       }
     }
 
