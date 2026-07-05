@@ -1,5 +1,86 @@
 # Handoff — Chunk 3 (Workers + lanes)
 
+## Kickoff prompt (paste this to the implementing agent verbatim)
+
+```
+Chunk 3 — Workers + lanes (Darwin gets hands)
+
+Repo: ~/Dev/galapagos (github.com/taan07/GalapagOS). Check out
+claude/chunk-2-durable-memory-w3g1cs, then create and work on a stacked
+branch claude/chunk-3-workers-lanes from it — never commit Chunk 3 code to
+the chunk-2 branch; the two chunks are verified and merged independently
+(if chunk 2 has already merged to main, stack on main instead — check
+first). Start by reading docs/handoffs/chunk-3.md (your handoff — branch
+policy, inherited-module map, load-bearing conventions), then
+docs/vision.md and docs/architecture.md — the binding contracts that
+override everything else, including this prompt. Then implement
+docs/chunks/3.md.
+
+State you inherit — Chunk 1 is COMPLETE and verified live (stamp in
+docs/chunks/1.md); Chunk 2 is BUILT, awaiting the user's live drills
+(stamp in docs/chunks/2.md, drills in docs/chunks/2-verification.md; if
+the user reports chunk-2 issues mid-work, fixing them comes FIRST, on the
+chunk-2 branch, then rebase your stack). Standing today: daemon on :4517
+owns all Agent SDK sessions; web UI on :3005; central SQLite at
+~/.galapagos/state.db (projects, manager_sessions, manager_turns, jobs —
+you ADD lanes/workers/worker_events/completion_digests/attention_items per
+architecture §3); per-project records store live in each target repo's
+docs/galapagos/ (8 glp_types, wx creates, status lifecycle); Darwin's
+tools: git_truth, record_specific (write-through to store + vault mirror),
+list_specifics, read_records, write_record, update_record; post-turn
+distillation runs on a session FORK with GALAPAGOS_DISTILL_MODEL (default
+claude-haiku-4-5, user-confirmed) and auto-commits docs/galapagos/ via the
+narrow-staging runner (only that path, ever); compact-by-re-brief seeds
+fresh sessions from records, rendered as a collapsed chip with a
+clear-to-blank action; /records page ships. 66/66 tests green via npm test.
+
+Chunk 3 in one line: give Darwin hands — lane-scoped workers in worktrees
+under <GALAPAGOS_STATE_DIR>/worktrees/<project-slug>/<lane-slug>/ (NEVER
+inside the target repo), spawn_worker/steer_worker/stop_worker/
+list_workers/worker_status tools (spawn rejects allowed-glob overlap with
+any active lane and writes a worker_brief record), streaming-input query()
+per worker with cwd = its worktree, every streamed message persisted to
+worker_events, canUseTool denying out-of-lane Edit/Write (preventive only —
+Bash bypass is expected), the fenced galapagos-completion JSON parsed into
+completion_digests (missing/malformed → unstructured_completion attention
+row, worker NOT rendered done), pure lane-check run once at worker stop,
+and a /workers page with live event streams. GALAPAGOS_WORKER_MODEL
+defaults claude-fable-5. Forbidden: monitor loop, confidence engine,
+auto-triage, evidence runner, shared files between lanes, worktrees inside
+target repos, workers without a lane contract.
+
+Operational facts that will save you hours:
+- Auth is keychain-bound. Every session spawns through
+  src/adapters/agent/spawn.ts (pathToClaudeCodeExecutable → the user's
+  installed binary); live sessions authenticate ONLY when the daemon runs
+  from the user's own terminal. Build and npm test anywhere; the user
+  verifies live worker runs. Don't burn time on "Not logged in" from an
+  agent shell. Auth-errored turns are never persisted as conversation and
+  never trigger fresh-session retries — same rule for workers.
+- cwd is load-bearing: manager pins the project root, workers pin their
+  worktree. Never spawn without an explicit cwd.
+- Consult the Claude Agent SDK docs (code.claude.com/docs/en/agent-sdk)
+  for streaming input and canUseTool — never guess SDK APIs.
+- karz98rk is NOT reachable and NOT to be ported from (user's explicit
+  call — "didn't want that failed messy project to contaminate
+  galapagos"). Where architecture §10 says "port", implement ground-up to
+  the documented behavior with equivalent tests.
+- Load-bearing Chunk 2 conventions (details in the handoff): system turns
+  carry JSON payloads; hasHistory counts only non-system turns (protects
+  clear-to-blank — do not regress); cross-session history orders by rowid;
+  the busy flag + SSE stream are held through distillation (one manager
+  turn per project at a time — worker sessions are outside that lock);
+  tool failures return as tool TEXT so the model self-corrects; honest
+  empty states everywhere. Strict TS with noUncheckedIndexedAccess.
+
+Working standard (set by Chunk 1, kept by Chunk 2 — keep it): purposeful
+commits with explanatory bodies, tests green before every commit, push to
+origin, no half-wired surfaces — a feature ships with the real data that
+feeds it or not at all. Interrogate the user for specifics before building
+anything ambiguous, and stamp what gets agreed into the docs in the same
+commit — the product's defining behavior applies to building the product.
+```
+
 You are a fresh implementer picking up Galapagos after Chunk 2. Start by
 reading `docs/vision.md` and `docs/architecture.md` — they are the binding
 contracts and override everything else, including this handoff. Then
