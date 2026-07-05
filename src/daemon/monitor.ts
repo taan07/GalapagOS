@@ -295,13 +295,19 @@ export function createMonitor(deps: MonitorDeps) {
     });
   };
 
-  /** Latest triage attempt for this project — the trigger cutoff. */
+  /**
+   * Latest triage attempt for this project — the trigger cutoff. The END of
+   * the run when known: items triage itself raised mid-run (ask_user) must
+   * not retrigger the pass that created them. The accepted edge: a fact
+   * arising during the seconds-long triage window rides along with the next
+   * genuinely new item instead of triggering its own pass.
+   */
   const lastTriageCutoff = (projectId: string): string | null => {
     for (const job of listRecentJobsByKind(db, "triage")) {
       try {
         const payload = JSON.parse(job.payload ?? "{}") as { projectId?: string };
         if (payload.projectId === projectId) {
-          return job.created_at;
+          return job.finished_at ?? job.created_at;
         }
       } catch {
         // Unparseable payload — not this project's.

@@ -69,6 +69,10 @@ const MANAGER_ALLOWED_TOOLS = [
   "mcp__galapagos__stop_worker",
   "mcp__galapagos__list_workers",
   "mcp__galapagos__worker_status",
+  "mcp__galapagos__run_checks",
+  "mcp__galapagos__list_attention",
+  "mcp__galapagos__resolve_attention",
+  "mcp__galapagos__review_completion",
   "Read",
   "Glob",
   "Grep",
@@ -148,7 +152,12 @@ export async function runManagerTurn(input: {
     projectRoot: project.root_path,
     projectSlug: project.slug,
     vaultPath: config.vaultPath,
-    ...(input.workers ? { workers: input.workers, project } : {}),
+    // Evidence + attention surface (chunk 4): Darwin runs checks, reads and
+    // resolves the queue, and records completion verdicts.
+    db,
+    config,
+    project,
+    ...(input.workers ? { workers: input.workers } : {}),
     onToolEvent: (event) => {
       const turn = appendTurn(db, {
         sessionId: session.id,
