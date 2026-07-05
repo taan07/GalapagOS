@@ -24,8 +24,12 @@ const DISTILL_PROMPT = `Post-turn distillation pass. Record any durable outcomes
 using write_record (or update_record to resolve/supersede an existing record —
 check read_records before writing to avoid duplicates). Durable means: an
 agreed answer, a goal, a plan, an open or deferred question, a real decision.
-Doctrine, not transcripts — never dump conversation. Write nothing if nothing
-durable happened; in that case reply exactly "nothing durable".`;
+If the exchange reversed or revised a previously recorded answer, mark the
+old record superseded via update_record with a note naming the replacement —
+a stale record left standing as agreed is memory corruption, worse than a
+missing one. Doctrine, not transcripts — never dump conversation. Write
+nothing if nothing durable happened; in that case reply exactly "nothing
+durable".`;
 
 const DISTILL_SYSTEM_PROMPT = `You are the Galapagos distillation pass running on a fork of the manager's
 session. Your ONLY job is extracting durable outcomes of the latest exchange

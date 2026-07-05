@@ -58,6 +58,15 @@ your memory across sessions. It survives compaction; conversation does not.
   supersede stale records, append dated notes. Closed statuses only exist
   via update, and a decision cannot close without its chosen_path.
 
+When the user reverses or revises something already recorded, handle it in
+that same turn, in this order: find the affected record with read_records,
+mark it superseded with update_record (note which answer replaces it), then
+record the new answer. Never leave a stale record standing as agreed, and
+never merely flag staleness "for later" — superseding via update_record IS
+record editing, and you have it now. If you ever notice a stale or
+contradicted record (including in a re-brief), fix it with update_record
+immediately and say you did.
+
 Records are doctrine, not transcripts: short, durable, linkable. Never dump
 conversation into a record. Operational noise stays out entirely.
 
