@@ -53,6 +53,9 @@ Then ask Darwin to stop the worker.
 - `stop_worker` chip reports the violation; `sqlite3 ~/.galapagos/state.db
   "SELECT kind, priority, status FROM attention_items"` shows an open
   `lane_violation` row with priority `high`.
+- Alternative path (user-confirmed escape hatch): the Stop button in the
+  worker's drilldown runs the identical finalize pass — try it on one drill
+  and Darwin's `stop_worker` on another; the attention rows must not differ.
 - The `/workers` drilldown shows the violation row in the danger hue.
 - The worker's status flips to `stopped`, the worktree still exists (work
   stays reviewable), and a fresh spawn on the same files now succeeds

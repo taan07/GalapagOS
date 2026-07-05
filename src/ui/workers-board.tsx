@@ -107,7 +107,27 @@ const EventItem = memo(function EventItem({ event }: { event: WorkerEventView })
   );
 });
 
-function Drilldown({ detail, now }: { detail: WorkerDetailView; now: number }) {
+/** Statuses a live session may still be behind — the only stoppable ones. */
+const STOPPABLE: readonly WorkerView["status"][] = [
+  "spawning",
+  "running",
+  "awaiting_input",
+  "idle",
+];
+
+function Drilldown({
+  detail,
+  now,
+  stopping,
+  stopNote,
+  onStop,
+}: {
+  detail: WorkerDetailView;
+  now: number;
+  stopping: boolean;
+  stopNote: string | null;
+  onStop: () => void;
+}) {
   const { worker, events, digest, attention } = detail;
   const streamRef = useRef<HTMLDivElement>(null);
 
@@ -123,7 +143,18 @@ function Drilldown({ detail, now }: { detail: WorkerDetailView; now: number }) {
         <span className="lane-name">{worker.laneName ?? "(lane missing)"}</span>
         <StatusPill status={worker.status} />
         <span className="liveness">{agoLabel(worker.lastMessageAt, now)}</span>
+        {STOPPABLE.includes(worker.status) ? (
+          <button
+            className="stop-worker"
+            onClick={onStop}
+            disabled={stopping}
+            title="Escape hatch: ends the session, audits the worktree against the lane, retires the lane. Normally this flows through Darwin."
+          >
+            {stopping ? "Stopping…" : "Stop worker"}
+          </button>
+        ) : null}
       </header>
+      {stopNote ? <div className="stop-note">{stopNote}</div> : null}
 
       <div className="lane-contract">
         <div className="contract-row">
@@ -220,6 +251,8 @@ export function WorkersBoard() {
   const [detail, setDetail] = useState<WorkerDetailView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  const [stopping, setStopping] = useState(false);
+  const [stopNote, setStopNote] = useState<{ workerId: string; text: string } | null>(null);
   const selectedWorkerRef = useRef<string | null>(null);
   selectedWorkerRef.current = selectedWorkerId;
   const projectRef = useRef<string | null>(null);
@@ -274,6 +307,60 @@ export function WorkersBoard() {
       setDetail(null);
     }
   }, [selectedWorkerId, refreshDetail]);
+
+  // The escape hatch (user-confirmed): stop without a chat turn. The daemon
+  // runs the same finalize pass Darwin's stop_worker uses; the note reports
+  // its outcome honestly.
+  const stopWorker = useCallback(
+    async (workerId: string) => {
+      setStopping(true);
+      setStopNote(null);
+      try {
+        const response = await fetch("/api/workers/stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workerId }),
+        });
+        const payload = (await response.json().catch(() => ({}))) as {
+          error?: string;
+          violations?: unknown[];
+          hasDigest?: boolean;
+          auditError?: string | null;
+        };
+        if (!response.ok) {
+          setStopNote({ workerId, text: payload.error ?? `Stop failed (${response.status}).` });
+        } else {
+          const violations = Array.isArray(payload.violations) ? payload.violations.length : 0;
+          setStopNote({
+            workerId,
+            text: [
+              "Worker stopped; its lane is retired and the worktree survives for review.",
+              payload.auditError
+                ? `Lane audit could not run: ${payload.auditError}`
+                : violations > 0
+                  ? `${violations} out-of-lane change${violations === 1 ? "" : "s"} — raised as a high-priority attention item.`
+                  : "Lane audit clean.",
+              payload.hasDigest
+                ? "A completion report was parsed."
+                : "No completion report — not rendered done.",
+            ].join(" "),
+          });
+        }
+      } catch (fetchError) {
+        setStopNote({
+          workerId,
+          text: `Stop failed: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
+        });
+      } finally {
+        setStopping(false);
+      }
+      if (projectRef.current) {
+        void refreshWorkers(projectRef.current);
+      }
+      void refreshDetail(workerId);
+    },
+    [refreshWorkers, refreshDetail],
+  );
 
   // Live updates: append streamed events to the open drilldown, refresh the
   // list on status changes, refetch after results (digest/attention shift).
@@ -402,7 +489,17 @@ export function WorkersBoard() {
               ))}
             </div>
             {detailForSelection ? (
-              <Drilldown detail={detailForSelection} now={now} />
+              <Drilldown
+                detail={detailForSelection}
+                now={now}
+                stopping={stopping}
+                stopNote={
+                  stopNote && stopNote.workerId === detailForSelection.worker.id
+                    ? stopNote.text
+                    : null
+                }
+                onStop={() => void stopWorker(detailForSelection.worker.id)}
+              />
             ) : (
               <p className="empty-note pad">
                 {selectedWorkerId ? "Loading worker…" : "Select a worker to see its stream."}

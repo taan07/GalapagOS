@@ -600,6 +600,22 @@ select:focus {
   gap: 12px;
 }
 
+.stop-worker {
+  margin-left: auto;
+  font-size: 12px;
+  padding: 4px 12px;
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+  color: var(--danger);
+}
+
+.stop-note {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
 .lane-contract {
   border: 1px solid var(--line);
   border-radius: 8px;
