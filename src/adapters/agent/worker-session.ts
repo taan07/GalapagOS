@@ -238,13 +238,45 @@ export function spawnWorkerSession(input: SpawnWorkerSessionInput): WorkerSessio
             continue;
           }
           if (message.type === "assistant") {
+            // Every content block becomes an event or is skipped DELIBERATELY.
+            // The drill-5 finding: WebFetch can execute as a server-side tool,
+            // arriving as server_tool_use / web_fetch_tool_result blocks — an
+            // allowlisted-on-condition-of-visibility tool must never leave a
+            // hole in the stream, so unknown block types fall through to a
+            // generic event rather than silently vanishing.
             for (const block of message.message.content) {
-              if (block.type === "text" && block.text.trim().length > 0) {
-                yield { kind: "assistant", payload: { text: block.text } };
-              } else if (block.type === "tool_use") {
+              if (block.type === "text") {
+                if (block.text.trim().length > 0) {
+                  yield { kind: "assistant", payload: { text: block.text } };
+                }
+              } else if (
+                block.type === "tool_use" ||
+                block.type === "server_tool_use" ||
+                block.type === "mcp_tool_use"
+              ) {
                 yield {
                   kind: "tool_use",
                   payload: { tool: block.name, input: block.input },
+                };
+              } else if (block.type.endsWith("_tool_result")) {
+                const result = block as { type: string; content?: unknown; is_error?: boolean };
+                yield {
+                  kind: "tool_result",
+                  payload: {
+                    content: toolResultText(result.content),
+                    isError: result.is_error === true,
+                  },
+                };
+              } else if (
+                block.type === "thinking" ||
+                block.type === "redacted_thinking" ||
+                block.type === "compaction"
+              ) {
+                // Internal reasoning/bookkeeping — deliberately not persisted.
+              } else {
+                yield {
+                  kind: "tool_use",
+                  payload: { tool: block.type, input: block },
                 };
               }
             }

@@ -66,6 +66,10 @@ Rules for the report:
 - Claims are checked against evidence. "evidence_kind" must be how you
   actually verified the claim — use "manual" when you only eyeballed it.
   Never claim "test" or "build" for something you did not run.
+- The same honesty applies to fetched content: if a WebFetch or download
+  fails, report the failure — never present content you did not actually
+  retrieve as fetched. Writing from your own knowledge is sometimes fine,
+  but say that is what you did, and label such claims "manual".
 - A completion without this block is not rendered as done; it becomes an
   attention item on the manager's queue.
 - If you are NOT done (you hit a blocker or need an answer), do not emit the
