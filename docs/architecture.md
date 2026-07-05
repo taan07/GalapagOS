@@ -89,7 +89,7 @@ lanes(id PK, project_id FK, name, allowed_globs JSON, forbidden_globs JSON,
 workers(id PK, project_id FK, lane_id FK, sdk_session_id, worktree_path, branch,
         brief_record_id, status,                                    -- spawning|running|awaiting_input|idle|stopped|failed
         last_heartbeat_at, last_message_at, last_summary, created_at)
-worker_events(id PK, worker_id FK, kind,                            -- assistant|tool_use|tool_result|result|error
+worker_events(id PK, worker_id FK, kind,                            -- assistant|tool_use|tool_result|result|error|steer
               payload JSON, created_at)
 completion_digests(id PK, worker_id FK, narrative, before_after JSON,
                    claims JSON,                                     -- [{text, evidence_kind, evidence_run_id NULL, files[]}]
