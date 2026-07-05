@@ -19,6 +19,7 @@ import { buildManagerDoctrine } from "../../daemon/doctrine";
 import { createRecordsStore, type RecordDoc, type RecordsStore } from "../records/store";
 import { createManagerToolServer } from "./manager-tools";
 import { baseQueryOptions } from "./spawn";
+import type { WorkerRuntime } from "./worker-runtime";
 
 export type ManagerTurnEvent =
   | { type: "turn_started"; sessionId: string }
@@ -63,6 +64,11 @@ const MANAGER_ALLOWED_TOOLS = [
   "mcp__galapagos__read_records",
   "mcp__galapagos__write_record",
   "mcp__galapagos__update_record",
+  "mcp__galapagos__spawn_worker",
+  "mcp__galapagos__steer_worker",
+  "mcp__galapagos__stop_worker",
+  "mcp__galapagos__list_workers",
+  "mcp__galapagos__worker_status",
   "Read",
   "Glob",
   "Grep",
@@ -112,6 +118,8 @@ export async function runManagerTurn(input: {
   emit: EmitManagerTurnEvent;
   /** Aborting this kills the in-flight SDK turn (triple-Esc interrupt). */
   abortController?: AbortController;
+  /** The daemon's live worker runtime; absent in contexts without workers. */
+  workers?: WorkerRuntime;
 }): Promise<ManagerTurnOutcome> {
   const { db, config, project, userText, emit } = input;
   const store = createRecordsStore(project.root_path, project.slug);
@@ -140,6 +148,7 @@ export async function runManagerTurn(input: {
     projectRoot: project.root_path,
     projectSlug: project.slug,
     vaultPath: config.vaultPath,
+    ...(input.workers ? { workers: input.workers, project } : {}),
     onToolEvent: (event) => {
       const turn = appendTurn(db, {
         sessionId: session.id,

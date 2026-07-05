@@ -2,15 +2,24 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { GLP_TYPES, type GlpType } from "../../core/records/schema";
 import type { Frontmatter } from "../../core/records/frontmatter";
+import type { ProjectRow } from "../db/repos/projects";
 import { observeGitRepository, recentLog } from "../git/runner";
 import { createRecordsStore, type RecordDoc } from "../records/store";
 import { recordAgreedSpecific } from "../records/write-through";
 import { listAgreedSpecifics } from "../vault/specifics";
+import type { WorkerRuntime, WorkerStatusView } from "./worker-runtime";
 
 export type ManagerToolContext = {
   projectRoot: string;
   projectSlug: string;
   vaultPath: string;
+  /**
+   * Worker control (chunk 3). Present only when the caller owns live worker
+   * sessions — the daemon's manager turns. Absent for distillation forks,
+   * whose tool surface is records-only.
+   */
+  workers?: WorkerRuntime;
+  project?: ProjectRow;
   onToolEvent?: (event: { tool: string; summary: string; detail: string }) => void;
 };
 
@@ -75,11 +84,61 @@ function renderFullRecord(doc: RecordDoc): string {
   return lines.join("\n");
 }
 
+function renderWorkerStatus(view: WorkerStatusView): string {
+  const { worker, lane, events, digest, attention } = view;
+  const lines = [
+    `worker ${worker.id} [${worker.status}] on lane "${lane?.name ?? "(lane missing)"}"`,
+    `branch ${worker.branch} in ${worker.worktree_path} (base ${lane?.base_sha.slice(0, 8) ?? "?"})`,
+    lane
+      ? `lane globs — allowed: ${JSON.parse(lane.allowed_globs).join(", ")}; forbidden: ${JSON.parse(lane.forbidden_globs).join(", ") || "(none)"}`
+      : "",
+    `last activity: ${worker.last_message_at ?? "(none yet)"}${worker.last_summary ? ` — ${worker.last_summary}` : ""}`,
+    digest
+      ? `completion digest (${digest.status}): ${digest.narrative}`
+      : "no completion digest — NOT done, whatever the transcript claims",
+  ].filter(Boolean);
+
+  const openAttention = attention.filter((item) => item.status === "open");
+  if (openAttention.length > 0) {
+    lines.push(
+      "open attention:",
+      ...openAttention.map((item) => `  - [${item.priority}] ${item.kind}: ${item.title}`),
+    );
+  }
+
+  const recent = events.slice(-10);
+  if (recent.length > 0) {
+    lines.push(
+      `recent events (${events.length} total, showing last ${recent.length}):`,
+      ...recent.map((event) => {
+        const payload = JSON.parse(event.payload) as Record<string, unknown>;
+        const summary =
+          typeof payload.text === "string"
+            ? payload.text
+            : typeof payload.tool === "string"
+              ? `${payload.tool} ${JSON.stringify(payload.input ?? {})}`
+              : typeof payload.message === "string"
+                ? payload.message
+                : typeof payload.subtype === "string"
+                  ? payload.subtype
+                  : JSON.stringify(payload);
+        const oneLine = summary.replace(/\s+/g, " ").trim();
+        return `  ${event.created_at.slice(11, 19)} ${event.kind}: ${oneLine.length > 160 ? `${oneLine.slice(0, 159)}…` : oneLine}`;
+      }),
+    );
+  }
+  return lines.join("\n");
+}
+
 export function createManagerToolServer(context: ManagerToolContext) {
   const emit = (toolName: string, summary: string, detail: string) => {
     context.onToolEvent?.({ tool: toolName, summary, detail });
   };
   const store = createRecordsStore(context.projectRoot, context.projectSlug);
+  const requireWorkers = (): { workers: WorkerRuntime; project: ProjectRow } | null =>
+    context.workers && context.project
+      ? { workers: context.workers, project: context.project }
+      : null;
 
   return createSdkMcpServer({
     name: "galapagos",
@@ -240,6 +299,155 @@ export function createManagerToolServer(context: ManagerToolContext) {
             emit("update_record", `update rejected for ${id}`, message);
             return text(`Update rejected: ${message}`);
           }
+        },
+      ),
+      tool(
+        "spawn_worker",
+        "Spawn ONE worker on a scoped task in its own git worktree, bound to a lane (exclusive allowed/forbidden file globs). The spawn is refused if the lane's allowed globs overlap any active lane — lanes are exclusive. Write the brief like a real hand-off: goal, constraints, how to verify; the worker sees only the brief and its worktree, none of this conversation. A worker_brief record is written and committed automatically.",
+        {
+          lane_name: z.string().describe("Short lane name, e.g. 'auth ui'"),
+          allowed_globs: z
+            .array(z.string())
+            .describe("Files the worker may change, e.g. ['src/auth/**']"),
+          forbidden_globs: z.array(z.string()).optional(),
+          brief_title: z.string(),
+          brief: z.string().describe("The full task brief — the worker's first message"),
+          model: z.string().optional().describe("Override the default worker model"),
+        },
+        async (input) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const outcome = await bridge.workers.spawn({
+            project: bridge.project,
+            laneName: input.lane_name,
+            allowedGlobs: input.allowed_globs,
+            ...(input.forbidden_globs ? { forbiddenGlobs: input.forbidden_globs } : {}),
+            briefTitle: input.brief_title,
+            brief: input.brief,
+            ...(input.model ? { model: input.model } : {}),
+          });
+          if (!outcome.ok) {
+            emit("spawn_worker", `spawn rejected: ${input.lane_name}`, outcome.reason);
+            return text(`Spawn rejected: ${outcome.reason}`);
+          }
+          const detail = [
+            `worker ${outcome.workerId}`,
+            `lane "${input.lane_name}" — allowed: ${input.allowed_globs.join(", ")}`,
+            `worktree ${outcome.worktreePath} on ${outcome.branch} (base ${outcome.baseSha.slice(0, 8)})`,
+            `brief record ${outcome.briefRecordId}`,
+            ...(outcome.briefCommitNote ? [outcome.briefCommitNote] : []),
+          ].join("\n");
+          emit("spawn_worker", `spawned worker on lane "${input.lane_name}"`, detail);
+          return text(
+            `Spawned worker ${outcome.workerId} on lane "${input.lane_name}".\n${detail}\nIt is working now — check on it with worker_status.`,
+          );
+        },
+      ),
+      tool(
+        "steer_worker",
+        "Inject a message into a running worker mid-task: course corrections, answers to its questions, added context. The worker treats it as part of the same task.",
+        { id: z.string(), message: z.string() },
+        async ({ id, message }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const outcome = bridge.workers.steer(id, message);
+          if (!outcome.ok) {
+            emit("steer_worker", `steer failed for ${id}`, outcome.reason);
+            return text(`Steer failed: ${outcome.reason}`);
+          }
+          emit("steer_worker", `steered worker ${id.slice(0, 8)}`, message);
+          return text(`Message delivered to worker ${id}.`);
+        },
+      ),
+      tool(
+        "stop_worker",
+        "Stop a worker: ends its session, audits every change in its worktree against the lane (out-of-lane files raise a high-priority lane_violation), retires the lane, and checks for a structured completion report. The worktree and branch survive for review.",
+        { id: z.string() },
+        async ({ id }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const outcome = await bridge.workers.stop(id);
+          if (!outcome.ok) {
+            emit("stop_worker", `stop failed for ${id}`, outcome.reason);
+            return text(`Stop failed: ${outcome.reason}`);
+          }
+          const lines = [
+            `Worker ${id} is ${outcome.status}; its lane is retired and its worktree survives for review.`,
+            outcome.auditError
+              ? `LANE AUDIT COULD NOT RUN: ${outcome.auditError} (raised as an attention item).`
+              : outcome.violations.length > 0
+                ? `LANE VIOLATIONS (${outcome.violations.length}, raised as a high-priority attention item):\n${outcome.violations.map((entry) => `  - ${entry.path} (${entry.reason})`).join("\n")}`
+                : "Lane audit clean — every change matches the lane.",
+            outcome.hasDigest
+              ? "A structured completion report was parsed for this worker."
+              : "No structured completion report was ever parsed — the worker is NOT done (raised as an attention item).",
+          ];
+          emit("stop_worker", `stopped worker ${id.slice(0, 8)}`, lines.join("\n"));
+          return text(lines.join("\n"));
+        },
+      ),
+      tool(
+        "list_workers",
+        "List every worker for this project with lane, status, and liveness.",
+        {},
+        async () => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const entries = bridge.workers.list(bridge.project.id);
+          emit(
+            "list_workers",
+            `listed ${entries.length} worker${entries.length === 1 ? "" : "s"}`,
+            entries
+              .map(
+                ({ worker, lane }) =>
+                  `- ${worker.id} [${worker.status}] lane "${lane?.name ?? "?"}"`,
+              )
+              .join("\n") || "(none)",
+          );
+          if (entries.length === 0) {
+            return text("No workers exist for this project yet.");
+          }
+          return text(
+            entries
+              .map(({ worker, lane }) =>
+                [
+                  `${worker.id} [${worker.status}] lane "${lane?.name ?? "(missing)"}"`,
+                  `  last activity: ${worker.last_message_at ?? "(none yet)"}${worker.last_summary ? ` — ${worker.last_summary}` : ""}`,
+                ].join("\n"),
+              )
+              .join("\n"),
+          );
+        },
+      ),
+      tool(
+        "worker_status",
+        "Full status of one worker: lane contract, liveness, completion digest (or its honest absence), open attention items, and the most recent events.",
+        { id: z.string() },
+        async ({ id }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const view = bridge.workers.status(id);
+          if (!view) {
+            emit("worker_status", `no worker ${id}`, "");
+            return text(`No worker with id ${id}. Use list_workers to see what exists.`);
+          }
+          const rendered = renderWorkerStatus(view);
+          emit(
+            "worker_status",
+            `checked worker ${id.slice(0, 8)} [${view.worker.status}]`,
+            rendered,
+          );
+          return text(rendered);
         },
       ),
     ],
