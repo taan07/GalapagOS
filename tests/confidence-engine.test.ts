@@ -358,6 +358,22 @@ test("open attention items lower project confidence", () => {
   assert.ok(loud.signals.some((signal) => signal.id === "attention.high" && signal.delta < 0));
 });
 
+test("a low but stable score is steady, not draining (found live 2026-07-05)", () => {
+  // A fresh project: no records yet, no evidence yet, one healthy worker.
+  // Nothing is failing or leaking — "draining — needs eyes soon" would be a
+  // false alarm on the exact surface whose credibility the product rests on.
+  const report = scoreProject(
+    clearProject({
+      clarity: { hasSynthesis: false, hasActiveGoal: false, openQuestionCount: 0 },
+      checks: { requiredKeys: [], runs: [] },
+      workers: [{ label: "greeting", report: scoreWorker(healthyWorker()) }],
+    }),
+  );
+  assert.ok(report.score < 45, `low score expected, got ${report.score}`);
+  assert.equal(report.state, "steady");
+  assert.match(report.stateReason, /little is recorded or evidenced/);
+});
+
 test("open questions lower clarity, answered questions restore it", () => {
   const open = scoreProject(
     clearProject({ clarity: { hasSynthesis: true, hasActiveGoal: true, openQuestionCount: 3 } }),

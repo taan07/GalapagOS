@@ -41,6 +41,10 @@ function buildReport(signals: ConfidenceSignal[], caps: ConfidenceCap[]): Confid
   const blockingCap = sortedCaps.find((cap) => cap.blocking);
   const drainingCap = sortedCaps.find((cap) => cap.draining);
 
+  // Draining means trust is ACTIVELY leaking (staleness, silence) — a low
+  // but stable score is honest steady; the number itself says how little is
+  // known. Verified live 2026-07-05: a fresh project with no records yet
+  // must not read "needs eyes soon" while everything observable is healthy.
   let state: ConfidenceState;
   let stateReason: string;
   if (blockingCap) {
@@ -57,8 +61,9 @@ function buildReport(signals: ConfidenceSignal[], caps: ConfidenceCap[]): Confid
     const capNote = binding ? ` (${binding.label})` : "";
     stateReason = `No standing failures, but not evidenced enough for strong${capNote}.`;
   } else {
-    state = "draining";
-    stateReason = "Too many negative signals — this needs eyes soon.";
+    state = "steady";
+    stateReason =
+      "Nothing is failing or leaking — the score is low because little is recorded or evidenced yet.";
   }
 
   return { score, state, uncappedScore: uncapped, signals, caps: sortedCaps, stateReason };
