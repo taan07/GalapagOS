@@ -48,6 +48,13 @@ export function finishJob(db: GalapagosDb, jobId: string, result: unknown): void
   );
 }
 
+/** Newest first — for "when did this last run for project X" questions. */
+export function listRecentJobsByKind(db: GalapagosDb, kind: string, limit = 100): JobRow[] {
+  return db
+    .prepare("SELECT * FROM jobs WHERE kind = ? ORDER BY rowid DESC LIMIT ?")
+    .all(kind, limit) as JobRow[];
+}
+
 export function failJob(db: GalapagosDb, jobId: string, error: string): void {
   db.prepare("UPDATE jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?").run(
     error,

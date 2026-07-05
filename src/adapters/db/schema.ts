@@ -93,6 +93,8 @@ CREATE TABLE IF NOT EXISTS completion_digests (
 );
 CREATE INDEX IF NOT EXISTS idx_completion_digests_worker ON completion_digests(worker_id);
 
+-- kind: lane_violation | stale_worker | question_for_user | unsupported_claim |
+--       check_failed | decision_needed | unstructured_completion | worker_failed
 CREATE TABLE IF NOT EXISTS attention_items (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),

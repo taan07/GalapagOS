@@ -97,7 +97,7 @@ completion_digests(id PK, worker_id FK, narrative, before_after JSON,
                    created_at)
 attention_items(id PK, project_id FK, worker_id NULL, kind,
                 -- lane_violation|stale_worker|question_for_user|unsupported_claim|
-                -- check_failed|decision_needed|unstructured_completion
+                -- check_failed|decision_needed|unstructured_completion|worker_failed
                 title, detail, priority, status,                    -- open|resolved|dismissed
                 record_id NULL, created_at, resolved_at)
 evidence_runs(id PK, project_id FK, worker_id NULL, check_key,      -- typecheck|lint|test|build|diff-check

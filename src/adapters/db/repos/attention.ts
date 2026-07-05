@@ -15,7 +15,11 @@ export type AttentionKind =
   | "unsupported_claim"
   | "check_failed"
   | "decision_needed"
-  | "unstructured_completion";
+  | "unstructured_completion"
+  // Chunk 4 (§3 comment updated in the same commit): a worker session that
+  // died mid-run — nobody was watching a tool result, so the queue is the
+  // only place this failure can surface.
+  | "worker_failed";
 
 export type AttentionStatus = "open" | "resolved" | "dismissed";
 

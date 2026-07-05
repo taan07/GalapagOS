@@ -41,6 +41,7 @@ import {
 import {
   createAttentionItem,
   listWorkerAttentionItems,
+  openAttentionItemExists,
   type AttentionItemRow,
 } from "../db/repos/attention";
 import type { ProjectRow } from "../db/repos/projects";
@@ -203,6 +204,34 @@ export function createWorkerRuntime(deps: {
   };
 
   /**
+   * A session that dies MID-RUN fails with nobody watching a tool result, so
+   * the attention queue is the only surface that can carry it to triage and
+   * the user. Spawn failures stay off the queue — they return synchronously
+   * to whoever asked. One open item per worker; a failed worker stays failed.
+   */
+  const raiseWorkerFailure = (worker: WorkerRow, message: string) => {
+    const title = "Worker session failed";
+    if (
+      openAttentionItemExists(db, {
+        projectId: worker.project_id,
+        workerId: worker.id,
+        kind: "worker_failed",
+        title,
+      })
+    ) {
+      return;
+    }
+    createAttentionItem(db, {
+      projectId: worker.project_id,
+      workerId: worker.id,
+      kind: "worker_failed",
+      title,
+      detail: `${message}\nThe session will not be retried; its work up to this point remains in ${worker.worktree_path}.`,
+      priority: "high",
+    });
+  };
+
+  /**
    * Handle one successful result: parse the completion contract. A valid
    * report becomes a digest; a malformed block is an immediate attention item
    * (the worker claimed completion and botched the format); NO block is
@@ -246,9 +275,9 @@ export function createWorkerRuntime(deps: {
       try {
         const worker = getWorker(db, workerId);
         if (worker) {
-          persistEvent(worker, "error", {
-            message: `Worker event loop crashed: ${error instanceof Error ? error.message : String(error)}`,
-          });
+          const message = `Worker event loop crashed: ${error instanceof Error ? error.message : String(error)}`;
+          persistEvent(worker, "error", { message });
+          raiseWorkerFailure(worker, message);
           setStatus(worker, "failed");
         }
       } catch {
@@ -305,6 +334,7 @@ export function createWorkerRuntime(deps: {
             // Auth/model/max-turn failure: the session cannot continue. Never
             // retried on a fresh session (chunk 2 rule, same for workers).
             failed = true;
+            raiseWorkerFailure(worker, `The worker's turn ended in error (${event.payload.subtype}).`);
             setStatus(worker, "failed");
           } else {
             const parseStatus =
@@ -326,6 +356,7 @@ export function createWorkerRuntime(deps: {
           }
           persistEvent(worker, "error", event.payload);
           failed = true;
+          raiseWorkerFailure(worker, event.payload.message);
           setStatus(worker, "failed");
           break;
         }
@@ -336,9 +367,9 @@ export function createWorkerRuntime(deps: {
     const entry = live.get(workerId);
     if (worker && !failed && !entry?.stopRequested && worker.status !== "failed") {
       // The stream ended without a stop request: the session process died.
-      persistEvent(worker, "error", {
-        message: "Worker session ended unexpectedly — its process exited.",
-      });
+      const message = "Worker session ended unexpectedly — its process exited.";
+      persistEvent(worker, "error", { message });
+      raiseWorkerFailure(worker, message);
       setStatus(worker, "failed");
     }
   };
@@ -362,14 +393,28 @@ export function createWorkerRuntime(deps: {
           violations.push({ path: violation.path, reason: violation.reason });
         }
         if (violations.length > 0) {
-          createAttentionItem(db, {
-            projectId: worker.project_id,
-            workerId: worker.id,
-            kind: "lane_violation",
-            title: `Out-of-lane changes in lane "${lane.name}"`,
-            detail: violations.map((entry) => `${entry.path} (${entry.reason})`).join("\n"),
-            priority: "high",
-          });
+          // The monitor may have caught these exact files mid-run — the same
+          // open fact is not appended twice (a CHANGED violation set is).
+          const title = `Out-of-lane changes in lane "${lane.name}"`;
+          const detail = violations.map((entry) => `${entry.path} (${entry.reason})`).join("\n");
+          if (
+            !openAttentionItemExists(db, {
+              projectId: worker.project_id,
+              workerId: worker.id,
+              kind: "lane_violation",
+              title,
+              detail,
+            })
+          ) {
+            createAttentionItem(db, {
+              projectId: worker.project_id,
+              workerId: worker.id,
+              kind: "lane_violation",
+              title,
+              detail,
+              priority: "high",
+            });
+          }
         }
       } catch (error) {
         auditError = error instanceof Error ? error.message : String(error);
