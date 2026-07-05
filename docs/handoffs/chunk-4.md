@@ -154,6 +154,16 @@ override everything, including this handoff. Then implement
 - Manager/distill sessions load filesystem settings (see SDK facts above).
 - Records written during a turn whose distill commit was skipped sit
   uncommitted until the next successful commit — documented, surfaced.
+- **The detective audit never observes the target repo's main checkout.**
+  It diffs the WORKTREE against the lane base; a worker using Bash with
+  absolute paths could mutate the project's primary checkout undetected
+  and the stop audit would report clean. The chunk-4 monitor is the right
+  place to close this (e.g. fingerprint the target repo's dirty state per
+  tick and attribute unexplained changes) — coordinate the design with the
+  user; naive porcelain-diffing false-positives on the user's own edits.
+- `/api/workers/detail` returns the full event log and the board refetches
+  it on every status flip — fine at current scale, needs a rowid cursor if
+  workers grow long-lived (flagged in review, deliberately not built).
 
 ## The working standard (unchanged since Chunk 1 — keep it)
 

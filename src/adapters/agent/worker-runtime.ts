@@ -6,6 +6,8 @@
 import type { GalapagosConfig } from "../../config";
 import { checkLane, findLaneOverlap, type LaneContract } from "../../core/lanes/lane-check";
 import { parseCompletionReport } from "../../core/digests/completion";
+import { parseStatusPorcelain } from "../../core/git/parsers";
+import { oneLine } from "../../core/text";
 import type { GalapagosDb } from "../db/db";
 import {
   createLane,
@@ -17,11 +19,13 @@ import {
 } from "../db/repos/lanes";
 import {
   appendWorkerEvent,
+  countWorkerEvents,
   createWorker,
   getWorker,
   listLiveStatusWorkers,
-  listWorkerEvents,
+  listRecentWorkerEvents,
   listWorkers,
+  setWorkerBriefRecord,
   setWorkerSdkSessionId,
   setWorkerStatus,
   touchWorker,
@@ -45,7 +49,7 @@ import { addWorktree, removeWorktree, workerWorktreePath } from "../git/mutating
 import { commitRecords } from "../git/mutating-runner";
 import { LocalGitCommandRunner } from "../git/runner";
 import { createRecordsStore } from "../records/store";
-import { buildWorkerDoctrine } from "../../daemon/worker-doctrine";
+import { buildWorkerDoctrine } from "./worker-doctrine";
 import {
   spawnWorkerSession,
   type WorkerSession,
@@ -103,7 +107,9 @@ export type StopWorkerOutcome =
 export type WorkerStatusView = {
   worker: WorkerRow;
   lane: LaneRow | null;
-  events: WorkerEventRow[];
+  /** Newest events only — status is a glance, not the transcript. */
+  recentEvents: WorkerEventRow[];
+  eventsTotal: number;
   digest: CompletionDigestRow | null;
   attention: AttentionItemRow[];
 };
@@ -114,44 +120,32 @@ type LiveEntry = {
   stopRequested: boolean;
 };
 
-function oneLine(value: string, max = 200): string {
-  const flat = value.replace(/\s+/g, " ").trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
-}
-
 /**
  * The detective audit's file set (architecture §7): committed changes since
- * the lane's base sha ∪ porcelain modified/untracked in the worktree.
+ * the lane's base sha ∪ porcelain modified/untracked in the worktree. Both
+ * reads use -z (NUL-delimited, no C-style quoting — a path like café.ts must
+ * reach the globs verbatim, not as an escaped string no glob matches), and
+ * the porcelain output goes through the tested core parser.
  */
 export async function collectAuditFiles(worktreePath: string, baseSha: string): Promise<string[]> {
   const runner = new LocalGitCommandRunner();
   const [diffOutput, porcelainOutput] = await Promise.all([
-    runner.runGit(["diff", "--name-only", `${baseSha}...HEAD`], worktreePath),
+    runner.runGit(["diff", "--name-only", "-z", `${baseSha}...HEAD`], worktreePath),
     // -uall lists untracked FILES: the default collapses a new directory to
     // "dir/", which globs can neither honestly clear nor blame.
-    runner.runGit(["status", "--porcelain", "-uall"], worktreePath),
+    runner.runGit(["status", "--porcelain=v1", "-z", "-uall"], worktreePath),
   ]);
 
   const files = new Set<string>();
-  for (const line of diffOutput.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed) {
-      files.add(trimmed);
+  for (const token of diffOutput.split("\0")) {
+    if (token) {
+      files.add(token);
     }
   }
-  for (const line of porcelainOutput.split("\n")) {
-    if (line.length < 4) {
-      continue;
-    }
-    // "XY path" or "XY old -> new" for renames — audit the new path.
-    let filePath = line.slice(3);
-    const arrow = filePath.indexOf(" -> ");
-    if (arrow !== -1) {
-      filePath = filePath.slice(arrow + 4);
-    }
-    filePath = filePath.trim().replace(/^"|"$/g, "");
-    if (filePath) {
-      files.add(filePath);
+  const status = parseStatusPorcelain(porcelainOutput);
+  for (const entry of [...status.stagedFiles, ...status.dirtyFiles, ...status.untrackedFiles]) {
+    if (entry.path) {
+      files.add(entry.path);
     }
   }
   return Array.from(files);
@@ -168,6 +162,10 @@ export function createWorkerRuntime(deps: {
   const { db, config } = deps;
   const sessionFactory = deps.sessionFactory ?? spawnWorkerSession;
   const live = new Map<string, LiveEntry>();
+  // Workers whose stop/finalize pass is currently running: a second stop
+  // (manager tool racing the HTTP route) must not run the audit twice and
+  // duplicate attention items.
+  const stopping = new Set<string>();
 
   const broadcastStatus = (worker: { id: string; project_id: string }) => {
     const row = getWorker(db, worker.id);
@@ -209,8 +207,14 @@ export function createWorkerRuntime(deps: {
    * report becomes a digest; a malformed block is an immediate attention item
    * (the worker claimed completion and botched the format); NO block is
    * ordinary mid-task conversation — the at-stop check owns that case.
+   * Returns the parse status so the caller can set the worker's state: a
+   * block-less turn end is, per the worker doctrine, a stated blocker or
+   * question — awaiting_input, not idle.
    */
-  const handleSuccessResult = (worker: WorkerRow, resultText: string) => {
+  const handleSuccessResult = (
+    worker: WorkerRow,
+    resultText: string,
+  ): "parsed" | "missing" | "malformed" => {
     const parsed = parseCompletionReport(resultText);
     if (parsed.status === "parsed") {
       createCompletionDigest(db, {
@@ -230,6 +234,7 @@ export function createWorkerRuntime(deps: {
         detail: parsed.problems.join("\n"),
       });
     }
+    return parsed.status;
   };
 
   const consumeSession = async (workerId: string, session: WorkerSession): Promise<void> => {
@@ -269,9 +274,20 @@ export function createWorkerRuntime(deps: {
         case "assistant":
           persistEvent(worker, "assistant", event.payload, oneLine(event.payload.text));
           break;
-        case "tool_use":
-          persistEvent(worker, "tool_use", event.payload);
+        case "tool_use": {
+          // Write/Edit inputs can carry whole files; the worktree already
+          // holds the real content — persist a bounded preview, not megabytes
+          // per row broadcast to every SSE client.
+          const rawInput = JSON.stringify(event.payload.input ?? {});
+          persistEvent(worker, "tool_use", {
+            tool: event.payload.tool,
+            input:
+              rawInput.length > 4000
+                ? `${rawInput.slice(0, 4000)}… (${rawInput.length} chars total — see the worktree for the real content)`
+                : event.payload.input,
+          });
           break;
+        }
         case "tool_result":
           persistEvent(worker, "tool_result", {
             content: oneLine(event.payload.content, 4000),
@@ -281,15 +297,24 @@ export function createWorkerRuntime(deps: {
         case "result":
           persistEvent(worker, "result", event.payload);
           if (event.payload.isError) {
+            if (live.get(workerId)?.stopRequested) {
+              // Interrupting an in-flight turn can surface as an error
+              // RESULT: the user stopped this worker; it did not fail.
+              break;
+            }
             // Auth/model/max-turn failure: the session cannot continue. Never
             // retried on a fresh session (chunk 2 rule, same for workers).
             failed = true;
             setStatus(worker, "failed");
           } else {
-            if (event.payload.resultText !== null) {
-              handleSuccessResult(worker, event.payload.resultText);
-            }
-            setStatus(worker, "idle");
+            const parseStatus =
+              event.payload.resultText !== null
+                ? handleSuccessResult(worker, event.payload.resultText)
+                : "missing";
+            // A turn ending WITHOUT a completion block is, per the worker
+            // doctrine, a stated blocker or question — the worker is waiting
+            // on its manager, not resting.
+            setStatus(worker, parseStatus === "missing" ? "awaiting_input" : "idle");
           }
           break;
         case "error": {
@@ -398,6 +423,21 @@ export function createWorkerRuntime(deps: {
         return { ok: false, reason: "A worker brief needs a title and a body." };
       }
 
+      let baseSha: string;
+      try {
+        const runner = new LocalGitCommandRunner();
+        baseSha = (await runner.runGit(["rev-parse", "--verify", "HEAD"], project.root_path)).trim();
+      } catch (error) {
+        return {
+          ok: false,
+          reason: `Could not resolve the project HEAD to base the lane on: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+
+      // Exclusivity validation runs AFTER the last await and the lane row is
+      // inserted synchronously right behind it: two concurrent spawns (the
+      // manager tool racing a direct POST /workers) cannot both pass the
+      // check before either inserts.
       const laneSlug = slugify(laneName);
       for (const active of listActiveLanes(db, project.id)) {
         if (active.slug === laneSlug) {
@@ -413,17 +453,6 @@ export function createWorkerRuntime(deps: {
             reason: `Lane rejected: allowed glob "${overlap.candidateGlob}" overlaps "${overlap.existingGlob}" of active lane "${active.name}". Lanes are exclusive — no two workers may touch the same files. Narrow the globs or stop that worker first.`,
           };
         }
-      }
-
-      let baseSha: string;
-      try {
-        const runner = new LocalGitCommandRunner();
-        baseSha = (await runner.runGit(["rev-parse", "--verify", "HEAD"], project.root_path)).trim();
-      } catch (error) {
-        return {
-          ok: false,
-          reason: `Could not resolve the project HEAD to base the lane on: ${error instanceof Error ? error.message : String(error)}`,
-        };
       }
 
       const lane = createLane(db, {
@@ -482,7 +511,7 @@ export function createWorkerRuntime(deps: {
           },
         });
         briefRecordId = record.id;
-        db.prepare("UPDATE workers SET brief_record_id = ? WHERE id = ?").run(record.id, worker.id);
+        setWorkerBriefRecord(db, worker.id, record.id);
         const commit = await commitRecords(
           project.root_path,
           `galapagos(records): worker brief for lane ${laneSlug}`,
@@ -491,7 +520,12 @@ export function createWorkerRuntime(deps: {
           briefCommitNote = `Brief record written but its commit was skipped: ${commit.reason}. It will land with the next records commit.`;
         }
       } catch (error) {
-        await removeWorktree({ projectRoot: project.root_path, worktreePath, stateDir: config.stateDir });
+        await removeWorktree({
+          projectRoot: project.root_path,
+          worktreePath,
+          stateDir: config.stateDir,
+          branch,
+        });
         return abort(
           `Writing the worker_brief record failed: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -516,6 +550,12 @@ export function createWorkerRuntime(deps: {
           lane: { allowedGlobs, forbiddenGlobs },
         });
       } catch (error) {
+        await removeWorktree({
+          projectRoot: project.root_path,
+          worktreePath,
+          stateDir: config.stateDir,
+          branch,
+        });
         return abort(
           `Spawning the worker session failed: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -539,6 +579,14 @@ export function createWorkerRuntime(deps: {
       const worker = getWorker(db, workerId);
       if (!worker) {
         return { ok: false, reason: `No worker with id ${workerId}.` };
+      }
+      if (worker.status === "failed" || worker.status === "stopped") {
+        // A failed session may linger in the live map until its stream
+        // closes; steering it would flip a dead worker back to "running".
+        return {
+          ok: false,
+          reason: `Worker ${workerId} is ${worker.status} — it cannot be steered. Spawn a fresh worker instead.`,
+        };
       }
       const entry = live.get(workerId);
       if (!entry) {
@@ -568,13 +616,31 @@ export function createWorkerRuntime(deps: {
       if (worker.status === "stopped") {
         return { ok: false, reason: `Worker ${workerId} is already stopped.` };
       }
-      const entry = live.get(workerId);
-      if (entry) {
-        entry.stopRequested = true;
-        await entry.session.stop();
-        await entry.loopDone;
+      if (stopping.has(workerId)) {
+        return { ok: false, reason: `Worker ${workerId} is already being stopped.` };
       }
-      return finalizeStop(worker);
+      // A failed worker with a retired lane was already finalized (its audit
+      // ran at spawn-abort, an earlier stop, or boot reconciliation) —
+      // re-running finalizeStop would duplicate its attention items.
+      const lane = getLane(db, worker.lane_id);
+      if (worker.status === "failed" && lane?.status === "retired" && !live.has(workerId)) {
+        return {
+          ok: false,
+          reason: `Worker ${workerId} already failed and its lane is retired — the at-stop audit has already run.`,
+        };
+      }
+      stopping.add(workerId);
+      try {
+        const entry = live.get(workerId);
+        if (entry) {
+          entry.stopRequested = true;
+          await entry.session.stop();
+          await entry.loopDone;
+        }
+        return await finalizeStop(worker);
+      } finally {
+        stopping.delete(workerId);
+      }
     },
 
     list(projectId: string): { worker: WorkerRow; lane: LaneRow | null }[] {
@@ -592,7 +658,8 @@ export function createWorkerRuntime(deps: {
       return {
         worker,
         lane: getLane(db, worker.lane_id) ?? null,
-        events: listWorkerEvents(db, workerId),
+        recentEvents: listRecentWorkerEvents(db, workerId, 10),
+        eventsTotal: countWorkerEvents(db, workerId),
         digest: latestDigestForWorker(db, workerId) ?? null,
         attention: listWorkerAttentionItems(db, workerId),
       };

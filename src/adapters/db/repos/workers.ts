@@ -135,11 +135,35 @@ export function appendWorkerEvent(
   return row;
 }
 
+export function setWorkerBriefRecord(db: GalapagosDb, id: string, recordId: string): void {
+  db.prepare("UPDATE workers SET brief_record_id = ? WHERE id = ?").run(recordId, id);
+}
+
 /** Insertion order via rowid — the same convention as manager history. */
 export function listWorkerEvents(db: GalapagosDb, workerId: string): WorkerEventRow[] {
   return db
     .prepare("SELECT * FROM worker_events WHERE worker_id = ? ORDER BY rowid")
     .all(workerId) as WorkerEventRow[];
+}
+
+/** The newest `limit` events in insertion order — status views never need the full log. */
+export function listRecentWorkerEvents(
+  db: GalapagosDb,
+  workerId: string,
+  limit: number,
+): WorkerEventRow[] {
+  return (
+    db
+      .prepare("SELECT * FROM worker_events WHERE worker_id = ? ORDER BY rowid DESC LIMIT ?")
+      .all(workerId, limit) as WorkerEventRow[]
+  ).reverse();
+}
+
+export function countWorkerEvents(db: GalapagosDb, workerId: string): number {
+  const row = db
+    .prepare("SELECT COUNT(*) AS total FROM worker_events WHERE worker_id = ?")
+    .get(workerId) as { total: number };
+  return row.total;
 }
 
 /**

@@ -307,12 +307,16 @@ test("a malformed completion block raises attention immediately; a block-less tu
   const fake = sessions[0];
   assert.ok(fake);
 
-  // Mid-task question turn — no block, no attention.
+  // Mid-task question turn — no block, no attention; the worker is waiting
+  // on its manager, so the honest status is awaiting_input, not idle.
   fake.emit({
     kind: "result",
     payload: { subtype: "success", isError: false, resultText: "Should I also cover SSO?" },
   });
-  await waitFor(() => getWorker(db, outcome.workerId)?.status === "idle", "idle after question");
+  await waitFor(
+    () => getWorker(db, outcome.workerId)?.status === "awaiting_input",
+    "awaiting_input after question",
+  );
   assert.equal(listWorkerAttentionItems(db, outcome.workerId).length, 0);
 
   // Botched completion claim — malformed block, immediate attention.
@@ -453,6 +457,56 @@ test("an error result marks the worker failed and is never retried", async () =>
   sessions[0]?.end();
   await waitFor(() => getWorker(db, outcome.workerId)?.status === "failed", "worker failed");
   assert.equal(runtime.list(project.id).length, 1, "no fresh-session retry spawned");
+
+  // A failed worker cannot be steered back to life…
+  const steered = runtime.steer(outcome.workerId, "keep going");
+  assert.equal(steered.ok, false);
+  assert.equal(getWorker(db, outcome.workerId)?.status, "failed");
+
+  // …its first stop runs the audit and keeps it failed…
+  const stopped = await runtime.stop(outcome.workerId);
+  assert.ok(stopped.ok);
+  if (stopped.ok) {
+    assert.equal(stopped.status, "failed");
+  }
+  const attentionAfterFirstStop = listWorkerAttentionItems(db, outcome.workerId).length;
+
+  // …and a second stop is refused instead of duplicating attention items.
+  const again = await runtime.stop(outcome.workerId);
+  assert.equal(again.ok, false);
+  if (!again.ok) {
+    assert.match(again.reason, /already failed/);
+  }
+  assert.equal(listWorkerAttentionItems(db, outcome.workerId).length, attentionAfterFirstStop);
+});
+
+test("an interrupt-induced error result during stop leaves the worker stopped, not failed", async () => {
+  const { db, project, runtime, sessions } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  const fake = sessions[0];
+  assert.ok(fake);
+  fake.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "running", "running");
+
+  // Some interrupts surface as an error RESULT rather than a stream error.
+  const originalStop = fake.session.stop.bind(fake.session);
+  fake.session.stop = async () => {
+    fake.emit({
+      kind: "result",
+      payload: { subtype: "error_during_execution", isError: true, resultText: null },
+    });
+    await originalStop();
+  };
+
+  const stopped = await runtime.stop(outcome.workerId);
+  assert.ok(stopped.ok);
+  if (stopped.ok) {
+    assert.equal(stopped.status, "stopped", "a user-stopped worker is not a failed worker");
+  }
 });
 
 test("reconcileOrphans finalizes live-status workers after a daemon restart", async () => {
@@ -505,10 +559,14 @@ test("collectAuditFiles unions committed diff with porcelain, handling renames",
   // entry that globs can neither honestly clear nor blame.
   mkdirSync(path.join(repo, "newdir", "deep"), { recursive: true });
   writeFileSync(path.join(repo, "newdir", "deep", "fresh.ts"), "fresh\n");
+  // Non-ASCII paths must reach the globs verbatim — git's default C-style
+  // quoting would render this as "caf\\303\\251.ts", which no glob matches.
+  writeFileSync(path.join(repo, "café.ts"), "accent\n");
 
   const files = await collectAuditFiles(repo, baseSha);
   assert.deepEqual(files.sort(), [
     "RENAMED.md",
+    "café.ts",
     "committed.ts",
     "dirty.ts",
     "newdir/deep/fresh.ts",

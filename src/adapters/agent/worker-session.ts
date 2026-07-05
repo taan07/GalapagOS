@@ -44,8 +44,9 @@ export type WorkerSessionFactory = (input: SpawnWorkerSessionInput) => WorkerSes
 // Auto-approved tools. Edit/Write/NotebookEdit are deliberately NOT listed:
 // an allow rule would skip canUseTool entirely, and the preventive lane
 // guard lives there. Bash IS listed — the known bypass (architecture §11.3);
-// the detective lane-check at stop is the authority.
-const WORKER_ALLOWED_TOOLS = ["Read", "Glob", "Grep", "Bash", "TodoWrite"];
+// the detective lane-check at stop is the authority. BashOutput/KillShell
+// manage Bash's own background jobs and carry no new capability.
+const WORKER_ALLOWED_TOOLS = ["Read", "Glob", "Grep", "Bash", "BashOutput", "KillShell", "TodoWrite"];
 
 // Generous but bounded: workers do real multi-step implementation work, and
 // a runaway session must still terminate on its own.
@@ -69,9 +70,14 @@ export function workerCanUseTool(lane: LaneContract, worktreePath: string): CanU
   return async (toolName, input) => {
     const pathField = FILE_WRITE_TOOLS[toolName];
     if (!pathField) {
-      // Not a file-writing tool. It reached the callback only because it is
-      // not pre-approved; the lane contract has nothing to say about it.
-      return { behavior: "allow", updatedInput: input };
+      // Deny-by-default: workers have a fixed tool surface (the allowlist
+      // plus lane-checked file writes). Anything else — WebFetch, Task,
+      // whatever future tools appear — is refused, not silently granted;
+      // a headless daemon has no human watching approvals.
+      return {
+        behavior: "deny",
+        message: `${toolName} is not part of the worker tool surface. You have: Read, Glob, Grep, Bash, TodoWrite, and in-lane Edit/Write. If the task truly needs more, say so and stop — the manager will decide.`,
+      };
     }
 
     const rawPath = input[pathField];

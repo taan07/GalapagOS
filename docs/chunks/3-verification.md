@@ -64,7 +64,9 @@ Then ask Darwin to stop the worker.
 - If the worker finished with a fenced `galapagos-completion` block: the
   drilldown shows the digest card (narrative, before/after, claims with
   evidence badges — `manual` tinted amber). `worker_status` via Darwin says
-  a report was parsed.
+  a report was parsed, and the status pill reads `idle`.
+- If a turn ended WITHOUT a block (the worker asked a question or hit a
+  blocker): the pill reads `awaiting input` — steer it with the answer.
 - If it was stopped mid-task without one: an `unstructured_completion`
   attention row exists and the drilldown says "No completion report — this
   worker is not done, whatever its transcript says."

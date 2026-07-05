@@ -112,7 +112,11 @@ export type WorkerDetailView = {
   attention: AttentionView[];
 };
 
-/** Live events from the daemon's GET /events stream (via /api/events). */
+/**
+ * Live events from the daemon's GET /events stream (via /api/events). The
+ * stream carries other event types too; parse to this union and let the
+ * type guards fall through — a catch-all variant would kill narrowing.
+ */
 export type DaemonStreamEvent =
   | {
       type: "worker_event";
@@ -126,8 +130,7 @@ export type DaemonStreamEvent =
       workerId: string;
       status: WorkerView["status"];
       lastSummary: string | null;
-    }
-  | { type: string; [key: string]: unknown };
+    };
 
 /** One durable record as served by /api/records — every field attributed. */
 export type RecordView = {

@@ -4,14 +4,14 @@
 // live event stream. Read-only by design — spawning, steering, and stopping
 // flow through Darwin; this page observes. Initial data comes from SQLite via
 // the route handlers; liveness arrives over the daemon's SSE stream.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type {
   DaemonStreamEvent,
-  ProjectView,
   WorkerDetailView,
   WorkerEventView,
   WorkerView,
 } from "./types";
+import { useProjectSelection } from "./use-project-selection";
 
 function agoLabel(iso: string | null, now: number): string {
   if (!iso) {
@@ -46,7 +46,7 @@ function StatusPill({ status }: { status: WorkerView["status"] }) {
   return <span className={`status-pill status-${status}`}>{STATUS_LABEL[status]}</span>;
 }
 
-function EventItem({ event }: { event: WorkerEventView }) {
+const EventItem = memo(function EventItem({ event }: { event: WorkerEventView }) {
   const time = event.createdAt.slice(11, 19);
   if (event.kind === "assistant") {
     return (
@@ -105,7 +105,7 @@ function EventItem({ event }: { event: WorkerEventView }) {
       <div className="event-text">{String(event.payload.message ?? JSON.stringify(event.payload))}</div>
     </div>
   );
-}
+});
 
 function Drilldown({ detail, now }: { detail: WorkerDetailView; now: number }) {
   const { worker, events, digest, attention } = detail;
@@ -210,8 +210,11 @@ function Drilldown({ detail, now }: { detail: WorkerDetailView; now: number }) {
 }
 
 export function WorkersBoard() {
-  const [projects, setProjects] = useState<ProjectView[] | null>(null);
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const {
+    projects,
+    selectedId: selectedProjectId,
+    setSelectedId: setSelectedProjectId,
+  } = useProjectSelection();
   const [workers, setWorkers] = useState<WorkerView[] | null>(null);
   const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
   const [detail, setDetail] = useState<WorkerDetailView | null>(null);
@@ -225,24 +228,6 @@ export function WorkersBoard() {
   useEffect(() => {
     const interval = setInterval(() => setNow(Date.now()), 10_000);
     return () => clearInterval(interval);
-  }, []);
-
-  useEffect(() => {
-    void (async () => {
-      const response = await fetch("/api/projects", { cache: "no-store" });
-      const payload = (await response.json()) as { projects: ProjectView[] };
-      setProjects(payload.projects);
-      const fromQuery = new URLSearchParams(window.location.search).get("projectId");
-      const exists = (id: string | null) =>
-        id !== null && payload.projects.some((project) => project.id === id);
-      setSelectedProjectId(
-        exists(fromQuery)
-          ? fromQuery
-          : exists(localStorage.getItem("galapagos.lastProjectId"))
-            ? localStorage.getItem("galapagos.lastProjectId")
-            : (payload.projects[0]?.id ?? null),
-      );
-    })();
   }, []);
 
   const refreshWorkers = useCallback(async (projectId: string) => {
@@ -301,50 +286,50 @@ export function WorkersBoard() {
       } catch {
         return;
       }
-      if (event.type === "worker_event" && event.projectId === projectRef.current) {
+      const projectId = projectRef.current;
+      if (event.type === "worker_event" && event.projectId === projectId) {
         setNow(Date.now());
-        const workerEvent = event as Extract<DaemonStreamEvent, { type: "worker_event" }>;
-        setWorkers((current) =>
-          current
+        setWorkers((current) => {
+          if (current && !current.some((worker) => worker.id === event.workerId)) {
+            // A worker this page has never seen — Darwin just spawned it.
+            // The live board must show it without a reload.
+            void refreshWorkers(projectId ?? "");
+            return current;
+          }
+          return current
             ? current.map((worker) =>
-                worker.id === workerEvent.workerId
-                  ? { ...worker, lastMessageAt: workerEvent.event.createdAt }
+                worker.id === event.workerId
+                  ? { ...worker, lastMessageAt: event.event.createdAt }
                   : worker,
               )
-            : current,
-        );
-        if (workerEvent.workerId === selectedWorkerRef.current) {
-          if (workerEvent.event.kind === "result" || workerEvent.event.kind === "error") {
-            void refreshDetail(workerEvent.workerId);
+            : current;
+        });
+        if (event.workerId === selectedWorkerRef.current) {
+          if (event.event.kind === "result" || event.event.kind === "error") {
+            void refreshDetail(event.workerId);
           } else {
             setDetail((current) =>
-              current && !current.events.some((existing) => existing.id === workerEvent.event.id)
-                ? { ...current, events: [...current.events, workerEvent.event] }
+              current && !current.events.some((existing) => existing.id === event.event.id)
+                ? { ...current, events: [...current.events, event.event] }
                 : current,
             );
           }
         }
       }
-      if (event.type === "worker_status" && event.projectId === projectRef.current) {
-        const statusEvent = event as Extract<DaemonStreamEvent, { type: "worker_status" }>;
-        setWorkers((current) =>
-          current
-            ? current.map((worker) =>
-                worker.id === statusEvent.workerId
-                  ? { ...worker, status: statusEvent.status, lastSummary: statusEvent.lastSummary }
-                  : worker,
-              )
-            : current,
-        );
-        if (statusEvent.workerId === selectedWorkerRef.current) {
-          // Stops and failures write attention rows and retire lanes —
-          // refetch so the drilldown shows them without a reload.
-          void refreshDetail(statusEvent.workerId);
+      if (event.type === "worker_status" && event.projectId === projectId) {
+        // Status changes also move the list's digest/attention badges (a
+        // stop writes attention rows, a result writes a digest), so refetch
+        // the list — it is cheap and statuses change per turn, not per event.
+        if (projectId) {
+          void refreshWorkers(projectId);
+        }
+        if (event.workerId === selectedWorkerRef.current) {
+          void refreshDetail(event.workerId);
         }
       }
     };
     return () => source.close();
-  }, [refreshDetail]);
+  }, [refreshDetail, refreshWorkers]);
 
   const detailForSelection = detail && detail.worker.id === selectedWorkerId ? detail : null;
 

@@ -386,14 +386,22 @@ async function handleSpawnWorker(
     sendJson(res, 404, { error: `Unknown project: ${projectId}` });
     return;
   }
+  // A present-but-invalid forbiddenGlobs must be an error, not a silently
+  // dropped constraint — the caller asked for a narrower lane than they get.
+  const forbiddenGlobs = asStringArray(body.forbiddenGlobs);
+  if (body.forbiddenGlobs !== undefined && !forbiddenGlobs) {
+    sendJson(res, 400, { error: "forbiddenGlobs must be an array of strings when provided." });
+    return;
+  }
+  const model = asString(body.model);
   const outcome = await workers.spawn({
     project,
     laneName,
     allowedGlobs,
-    ...(asStringArray(body.forbiddenGlobs) ? { forbiddenGlobs: asStringArray(body.forbiddenGlobs) } : {}),
+    ...(forbiddenGlobs ? { forbiddenGlobs } : {}),
     briefTitle,
     brief,
-    ...(asString(body.model) ? { model: asString(body.model) } : {}),
+    ...(model ? { model } : {}),
   });
   if (!outcome.ok) {
     sendJson(res, 409, { error: outcome.reason });
@@ -540,22 +548,34 @@ const server = http.createServer((req, res) => {
   sendJson(res, 404, { error: `No route: ${route}` });
 });
 
-server.listen(config.daemonPort, "127.0.0.1", () => {
-  void (async () => {
-    await resolveCodeIdentity();
-    console.log(
-      `galapagos daemon listening on http://127.0.0.1:${config.daemonPort} (rev: ${codeIdentity.revision} on ${codeIdentity.branch}, state: ${config.stateDir}, model: ${config.managerModel})`,
-    );
-    // Workers whose rows say "live" after a restart are orphans — their
-    // sessions died with the old process. Reconcile before anything else so
-    // lanes free up and the UI shows honest states.
+void (async () => {
+  // Workers whose rows say "live" after a restart are orphans — their
+  // sessions died with the old process. Reconcile BEFORE accepting requests:
+  // otherwise a status check in the gap reports a dead worker as running and
+  // a spawn is refused by a corpse's still-active lane. Guarded — boot must
+  // survive a reconcile failure (and still run vault ingestion after it).
+  try {
     const orphans = await workers.reconcileOrphans();
     if (orphans > 0) {
       console.log(`[workers] reconciled ${orphans} orphaned worker${orphans === 1 ? "" : "s"} after restart`);
     }
-    // Idempotent per-project vault ingestion on every start (chunk 2 brief).
-    for (const project of listProjects(db)) {
-      await ingestProjectVault(project);
-    }
-  })();
-});
+  } catch (error) {
+    console.error(
+      `[workers] orphan reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  await resolveCodeIdentity();
+  server.listen(config.daemonPort, "127.0.0.1", () => {
+    console.log(
+      `galapagos daemon listening on http://127.0.0.1:${config.daemonPort} (rev: ${codeIdentity.revision} on ${codeIdentity.branch}, state: ${config.stateDir}, model: ${config.managerModel})`,
+    );
+    // Idempotent per-project vault ingestion on every start (chunk 2 brief);
+    // ingestProjectVault never rejects (fully guarded internally).
+    void (async () => {
+      for (const project of listProjects(db)) {
+        await ingestProjectVault(project);
+      }
+    })();
+  });
+})();

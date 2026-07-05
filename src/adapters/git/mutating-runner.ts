@@ -152,18 +152,26 @@ export async function addWorktree(input: {
  * Remove a worker worktree. Deliberately NOT called on worker stop — the
  * worktree is the work product and stays inspectable; this exists to clean
  * up a half-created worktree when a spawn fails partway. --force because the
- * cleanup target may hold a dirty tree nobody will ever resume.
+ * cleanup target may hold a dirty tree nobody will ever resume. Pass the
+ * branch addWorktree created so it is deleted too — a leftover branch would
+ * make every future spawn under the same lane name fail on "branch already
+ * exists", permanently burning the name.
  */
 export async function removeWorktree(input: {
   projectRoot: string;
   worktreePath: string;
   stateDir: string;
+  branch?: string;
 }): Promise<WorktreeResult> {
   assertWorktreePlacement(input);
   try {
     await git(input.projectRoot, ["worktree", "remove", "--force", input.worktreePath]);
-    return { status: "removed", worktreePath: input.worktreePath };
   } catch (error) {
     return { status: "failed", reason: error instanceof Error ? error.message : String(error) };
   }
+  if (input.branch) {
+    // Best-effort: the branch may not exist if the add failed before -b.
+    await git(input.projectRoot, ["branch", "-D", input.branch]).catch(() => {});
+  }
+  return { status: "removed", worktreePath: input.worktreePath };
 }

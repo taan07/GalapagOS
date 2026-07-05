@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
-import { getLane, laneGlobs } from "../../../../adapters/db/repos/lanes";
 import { getWorker, listWorkerEvents } from "../../../../adapters/db/repos/workers";
 import { latestDigestForWorker } from "../../../../adapters/db/repos/digests";
 import { listWorkerAttentionItems } from "../../../../adapters/db/repos/attention";
 import { readDb } from "../../../../server/read-db";
+import { toWorkerView } from "../../../../server/worker-views";
 import type { WorkerDetailView } from "../../../../ui/types";
 
 export const dynamic = "force-dynamic";
@@ -27,28 +27,11 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: `Unknown worker: ${workerId}` }, { status: 404 });
   }
 
-  const lane = getLane(db, worker.lane_id);
-  const globs = lane ? laneGlobs(lane) : null;
-  const digest = latestDigestForWorker(db, workerId);
+  const digest = latestDigestForWorker(db, workerId) ?? null;
+  const attention = listWorkerAttentionItems(db, workerId);
 
   const detail: WorkerDetailView = {
-    worker: {
-      id: worker.id,
-      status: worker.status,
-      laneName: lane?.name ?? null,
-      allowedGlobs: globs?.allowedGlobs ?? [],
-      forbiddenGlobs: globs?.forbiddenGlobs ?? [],
-      baseSha: lane?.base_sha ?? null,
-      branch: worker.branch,
-      worktreePath: worker.worktree_path,
-      lastMessageAt: worker.last_message_at,
-      lastSummary: worker.last_summary,
-      createdAt: worker.created_at,
-      hasDigest: digest !== undefined,
-      openAttentionCount: listWorkerAttentionItems(db, workerId).filter(
-        (item) => item.status === "open",
-      ).length,
-    },
+    worker: toWorkerView(db, worker, { attention, digest }),
     events: listWorkerEvents(db, workerId).map((event) => ({
       id: event.id,
       kind: event.kind,
@@ -65,7 +48,7 @@ export async function GET(request: Request) {
           createdAt: digest.created_at,
         }
       : null,
-    attention: listWorkerAttentionItems(db, workerId).map((item) => ({
+    attention: attention.map((item) => ({
       id: item.id,
       kind: item.kind,
       title: item.title,

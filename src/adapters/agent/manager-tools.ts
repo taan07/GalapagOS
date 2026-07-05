@@ -2,6 +2,8 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { GLP_TYPES, type GlpType } from "../../core/records/schema";
 import type { Frontmatter } from "../../core/records/frontmatter";
+import { oneLine } from "../../core/text";
+import { laneGlobs } from "../db/repos/lanes";
 import type { ProjectRow } from "../db/repos/projects";
 import { observeGitRepository, recentLog } from "../git/runner";
 import { createRecordsStore, type RecordDoc } from "../records/store";
@@ -84,13 +86,30 @@ function renderFullRecord(doc: RecordDoc): string {
   return lines.join("\n");
 }
 
+function summarizeEventPayload(payload: Record<string, unknown>): string {
+  if (typeof payload.text === "string") {
+    return payload.text;
+  }
+  if (typeof payload.tool === "string") {
+    return `${payload.tool} ${JSON.stringify(payload.input ?? {})}`;
+  }
+  if (typeof payload.message === "string") {
+    return payload.message;
+  }
+  if (typeof payload.subtype === "string") {
+    return payload.subtype;
+  }
+  return JSON.stringify(payload);
+}
+
 function renderWorkerStatus(view: WorkerStatusView): string {
-  const { worker, lane, events, digest, attention } = view;
+  const { worker, lane, recentEvents, eventsTotal, digest, attention } = view;
+  const globs = lane ? laneGlobs(lane) : null;
   const lines = [
     `worker ${worker.id} [${worker.status}] on lane "${lane?.name ?? "(lane missing)"}"`,
     `branch ${worker.branch} in ${worker.worktree_path} (base ${lane?.base_sha.slice(0, 8) ?? "?"})`,
-    lane
-      ? `lane globs — allowed: ${JSON.parse(lane.allowed_globs).join(", ")}; forbidden: ${JSON.parse(lane.forbidden_globs).join(", ") || "(none)"}`
+    globs
+      ? `lane globs — allowed: ${globs.allowedGlobs.join(", ")}; forbidden: ${globs.forbiddenGlobs.join(", ") || "(none)"}`
       : "",
     `last activity: ${worker.last_message_at ?? "(none yet)"}${worker.last_summary ? ` — ${worker.last_summary}` : ""}`,
     digest
@@ -106,24 +125,12 @@ function renderWorkerStatus(view: WorkerStatusView): string {
     );
   }
 
-  const recent = events.slice(-10);
-  if (recent.length > 0) {
+  if (recentEvents.length > 0) {
     lines.push(
-      `recent events (${events.length} total, showing last ${recent.length}):`,
-      ...recent.map((event) => {
+      `recent events (${eventsTotal} total, showing last ${recentEvents.length}):`,
+      ...recentEvents.map((event) => {
         const payload = JSON.parse(event.payload) as Record<string, unknown>;
-        const summary =
-          typeof payload.text === "string"
-            ? payload.text
-            : typeof payload.tool === "string"
-              ? `${payload.tool} ${JSON.stringify(payload.input ?? {})}`
-              : typeof payload.message === "string"
-                ? payload.message
-                : typeof payload.subtype === "string"
-                  ? payload.subtype
-                  : JSON.stringify(payload);
-        const oneLine = summary.replace(/\s+/g, " ").trim();
-        return `  ${event.created_at.slice(11, 19)} ${event.kind}: ${oneLine.length > 160 ? `${oneLine.slice(0, 159)}…` : oneLine}`;
+        return `  ${event.created_at.slice(11, 19)} ${event.kind}: ${oneLine(summarizeEventPayload(payload), 160)}`;
       }),
     );
   }

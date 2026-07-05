@@ -99,15 +99,20 @@ test("canUseTool covers NotebookEdit's notebook_path and missing paths", async (
   }
 });
 
-test("canUseTool lets non-file tools through — the lane says nothing about them", async () => {
+test("canUseTool denies tools outside the worker surface — deny-by-default", async () => {
   const root = worktree();
   const decide = workerCanUseTool(LANE, root);
-  const result = await decide(
-    "WebSearch",
-    { query: "picomatch brace syntax" },
-    { signal: new AbortController().signal, toolUseID: "t1", requestId: "r1" },
-  );
-  assert.equal(result?.behavior, "allow");
+  for (const tool of ["WebSearch", "WebFetch", "Task"]) {
+    const result = await decide(
+      tool,
+      { query: "anything" },
+      { signal: new AbortController().signal, toolUseID: "t1", requestId: "r1" },
+    );
+    assert.equal(result?.behavior, "deny", `${tool} must be denied`);
+    if (result?.behavior === "deny") {
+      assert.match(result.message, /not part of the worker tool surface/);
+    }
+  }
 });
 
 test("message queue yields the brief first, then pushed steers, then ends", async () => {

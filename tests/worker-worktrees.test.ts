@@ -147,7 +147,23 @@ test("removeWorktree cleans up a created worktree, dirty or not", async () => {
   });
   writeFileSync(path.join(worktreePath, "half-done.ts"), "// abandoned\n");
 
-  const result = await removeWorktree({ projectRoot: dir, worktreePath, stateDir });
+  const result = await removeWorktree({
+    projectRoot: dir,
+    worktreePath,
+    stateDir,
+    branch: "galapagos/worker/doomed",
+  });
   assert.equal(result.status, "removed");
   assert.equal(existsSync(worktreePath), false);
+
+  // The branch is gone too, so the lane name is reusable — a leftover branch
+  // would fail every future `worktree add -b` under this name.
+  const retry = await addWorktree({
+    projectRoot: dir,
+    worktreePath,
+    branch: "galapagos/worker/doomed",
+    baseSha: headSha,
+    stateDir,
+  });
+  assert.equal(retry.status, "created");
 });
