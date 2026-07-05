@@ -233,6 +233,28 @@ export function createWorkerRuntime(deps: {
   };
 
   const consumeSession = async (workerId: string, session: WorkerSession): Promise<void> => {
+    // Runs unawaited in the background: it must never reject, or the daemon
+    // dies on an unhandled rejection. Failures are persisted, not thrown.
+    try {
+      await consumeSessionInner(workerId, session);
+    } catch (error) {
+      try {
+        const worker = getWorker(db, workerId);
+        if (worker) {
+          persistEvent(worker, "error", {
+            message: `Worker event loop crashed: ${error instanceof Error ? error.message : String(error)}`,
+          });
+          setStatus(worker, "failed");
+        }
+      } catch {
+        console.error(`[workers] event loop for ${workerId} crashed and could not be recorded`);
+      }
+    } finally {
+      live.delete(workerId);
+    }
+  };
+
+  const consumeSessionInner = async (workerId: string, session: WorkerSession): Promise<void> => {
     let failed = false;
     for await (const event of session.events) {
       const worker = getWorker(db, workerId);
@@ -294,7 +316,6 @@ export function createWorkerRuntime(deps: {
       });
       setStatus(worker, "failed");
     }
-    live.delete(workerId);
   };
 
   /**
@@ -476,22 +497,29 @@ export function createWorkerRuntime(deps: {
         );
       }
 
-      const session = sessionFactory({
-        config,
-        worktreePath,
-        systemPrompt: buildWorkerDoctrine({
-          projectName: project.name,
-          laneName,
-          allowedGlobs,
-          forbiddenGlobs,
-          baseSha,
-          branch,
+      let session: WorkerSession;
+      try {
+        session = sessionFactory({
+          config,
           worktreePath,
-        }),
-        briefText: input.brief,
-        model: input.model?.trim() || config.workerModel,
-        lane: { allowedGlobs, forbiddenGlobs },
-      });
+          systemPrompt: buildWorkerDoctrine({
+            projectName: project.name,
+            laneName,
+            allowedGlobs,
+            forbiddenGlobs,
+            baseSha,
+            branch,
+            worktreePath,
+          }),
+          briefText: input.brief,
+          model: input.model?.trim() || config.workerModel,
+          lane: { allowedGlobs, forbiddenGlobs },
+        });
+      } catch (error) {
+        return abort(
+          `Spawning the worker session failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
       const loopDone = consumeSession(worker.id, session);
       live.set(worker.id, { session, loopDone, stopRequested: false });
 
