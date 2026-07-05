@@ -352,9 +352,14 @@ export function App() {
           GALAPAGOS <span>/ Darwin</span>
         </div>
         {selected ? (
-          <a className="nav-link" href={`/records?projectId=${encodeURIComponent(selected.id)}`}>
-            Records
-          </a>
+          <>
+            <a className="nav-link" href={`/workers?projectId=${encodeURIComponent(selected.id)}`}>
+              Workers
+            </a>
+            <a className="nav-link" href={`/records?projectId=${encodeURIComponent(selected.id)}`}>
+              Records
+            </a>
+          </>
         ) : null}
         {projects.length > 0 ? (
           <ProjectPicker

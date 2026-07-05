@@ -62,6 +62,73 @@ export type ManagerStreamEvent =
     }
   | { type: "turn_error"; message: string };
 
+/** One worker row as served by /api/workers — lane joined, liveness raw. */
+export type WorkerView = {
+  id: string;
+  status: "spawning" | "running" | "awaiting_input" | "idle" | "stopped" | "failed";
+  laneName: string | null;
+  allowedGlobs: string[];
+  forbiddenGlobs: string[];
+  baseSha: string | null;
+  branch: string;
+  worktreePath: string;
+  lastMessageAt: string | null;
+  lastSummary: string | null;
+  createdAt: string;
+  hasDigest: boolean;
+  openAttentionCount: number;
+};
+
+export type WorkerEventView = {
+  id: string;
+  kind: "assistant" | "tool_use" | "tool_result" | "result" | "error" | "steer";
+  payload: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type DigestView = {
+  narrative: string;
+  beforeAfter: { before: string; after: string }[];
+  claims: { text: string; evidence_kind: string; files: string[] }[];
+  touchedAreas: string[];
+  status: string;
+  createdAt: string;
+};
+
+export type AttentionView = {
+  id: string;
+  kind: string;
+  title: string;
+  detail: string;
+  priority: "high" | "normal";
+  status: string;
+  createdAt: string;
+};
+
+export type WorkerDetailView = {
+  worker: WorkerView;
+  events: WorkerEventView[];
+  digest: DigestView | null;
+  attention: AttentionView[];
+};
+
+/** Live events from the daemon's GET /events stream (via /api/events). */
+export type DaemonStreamEvent =
+  | {
+      type: "worker_event";
+      projectId: string;
+      workerId: string;
+      event: { id: string; kind: WorkerEventView["kind"]; payload: Record<string, unknown>; createdAt: string };
+    }
+  | {
+      type: "worker_status";
+      projectId: string;
+      workerId: string;
+      status: WorkerView["status"];
+      lastSummary: string | null;
+    }
+  | { type: string; [key: string]: unknown };
+
 /** One durable record as served by /api/records — every field attributed. */
 export type RecordView = {
   id: string;

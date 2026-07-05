@@ -135,6 +135,12 @@ export function RecordsBrowser() {
         <a className="nav-link" href="/">
           ← Darwin
         </a>
+        <a
+          className="nav-link"
+          href={selectedId ? `/workers?projectId=${encodeURIComponent(selectedId)}` : "/workers"}
+        >
+          Workers
+        </a>
         <div className="picker">
           {projects && projects.length > 0 ? (
             <select
