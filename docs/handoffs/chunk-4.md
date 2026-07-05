@@ -33,7 +33,7 @@ canUseTool lane guard (preventive; Bash bypass documented), every message
 persisted to worker_events, completion digests parsed (hybrid timing —
 stamped in docs/chunks/3.md), lane-check at stop raising lane_violation/
 unstructured_completion/check_failed attention rows, boot reconciliation
-for orphaned workers. 115/115 tests green via npm test.
+for orphaned workers. 116/116 tests green via npm test.
 
 Chunk 4 in one line: the monitor loop (30s daemon tick, ZERO LLM calls —
 staleness, lane audit, evidence freshness, unsupported-claims scan), the
@@ -60,7 +60,9 @@ Operational facts that will save you hours:
 - SDK permission facts (verified, load-bearing): dontAsk never consults
   canUseTool; an allowedTools entry bypasses canUseTool for that tool;
   omitted settingSources loads the target repo's .claude/settings.json.
-  Workers therefore run permissionMode "default" + settingSources: [].
+  Workers therefore run permissionMode "default" + settingSources: [],
+  deny-by-default outside their fixed tool surface (WebFetch allowlisted,
+  user-confirmed; WebSearch/Task denied).
   Known open niggle: manager/distill sessions still load filesystem
   settings — a target repo's allow rules could widen their surface.
 - karz98rk is NOT reachable and NOT to be ported from (architecture §10:
@@ -90,7 +92,7 @@ override everything, including this handoff. Then implement
   Check what has merged before branching (kickoff prompt has the rule).
 - Both chunks await the user's live drills; user-reported fixes land on the
   OWNING chunk's branch first, then rebase your stack.
-- 115 tests green at handoff (`npm test` = typecheck + `node --test` on
+- 116 tests green at handoff (`npm test` = typecheck + `node --test` on
   `dist-node/tests`). Keep them green before every commit.
 
 ## What Chunk 3 added (concrete map)
@@ -119,14 +121,15 @@ override everything, including this handoff. Then implement
   spawn/steer/stop/list/status/reconcileOrphans. `collectAuditFiles`
   (diff base...HEAD ∪ porcelain -uall) lives here — your monitor tick
   wants it. Tests inject a fake sessionFactory; yours can too.
-- `src/daemon/worker-doctrine.ts` — the worker system prompt (lane echoed,
-  completion contract, honest evidence labels).
+- `src/adapters/agent/worker-doctrine.ts` — the worker system prompt (lane
+  echoed, completion contract, honest evidence labels).
 - Daemon routes: `POST /workers`, `POST /workers/:id/steer`,
   `POST /workers/:id/stop`; `GET /events` broadcasts `worker_event` and
   `worker_status`. UI reads via `/api/workers`, `/api/workers/detail`,
   SSE proxy `/api/events`.
-- `/workers` page (read-only): list + drilldown, live stream, digest card,
-  attention rows. Your gauges and attention queue extend these surfaces.
+- `/workers` page: list + drilldown, live stream, digest card, attention
+  rows, and a user-confirmed Stop escape hatch (spawn/steer stay
+  chat-only). Your gauges and attention queue extend these surfaces.
 - Config: `GALAPAGOS_WORKER_MODEL` (default claude-fable-5).
 
 ## Conventions established in Chunk 3 — follow them
