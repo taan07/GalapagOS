@@ -2,7 +2,7 @@
 
 Auth is keychain-bound: run everything below from your own terminal. Setup:
 `git checkout claude/chunk-3-workers-lanes-vl5mh8 && npm install && npm test`
-(expect 116/116), then `npm run dev`. Workers write ONLY inside their own
+(expect 115/115), then `npm run dev`. Workers write ONLY inside their own
 worktrees under `~/.galapagos/worktrees/` and the daemon commits only
 `docs/galapagos/` in the target repo, so a real project is safe; a scratch
 project is fine too.

@@ -33,7 +33,7 @@ canUseTool lane guard (preventive; Bash bypass documented), every message
 persisted to worker_events, completion digests parsed (hybrid timing —
 stamped in docs/chunks/3.md), lane-check at stop raising lane_violation/
 unstructured_completion/check_failed attention rows, boot reconciliation
-for orphaned workers. 116/116 tests green via npm test.
+for orphaned workers. 115/115 tests green via npm test.
 
 Chunk 4 in one line: the monitor loop (30s daemon tick, ZERO LLM calls —
 staleness, lane audit, evidence freshness, unsupported-claims scan), the
@@ -90,7 +90,7 @@ override everything, including this handoff. Then implement
   Check what has merged before branching (kickoff prompt has the rule).
 - Both chunks await the user's live drills; user-reported fixes land on the
   OWNING chunk's branch first, then rebase your stack.
-- 116 tests green at handoff (`npm test` = typecheck + `node --test` on
+- 115 tests green at handoff (`npm test` = typecheck + `node --test` on
   `dist-node/tests`). Keep them green before every commit.
 
 ## What Chunk 3 added (concrete map)
