@@ -12,6 +12,7 @@ import type {
   WorkerView,
 } from "./types";
 import { useProjectSelection } from "./use-project-selection";
+import { localClockTime } from "./time";
 
 function agoLabel(iso: string | null, now: number): string {
   if (!iso) {
@@ -47,7 +48,7 @@ function StatusPill({ status }: { status: WorkerView["status"] }) {
 }
 
 const EventItem = memo(function EventItem({ event }: { event: WorkerEventView }) {
-  const time = event.createdAt.slice(11, 19);
+  const time = localClockTime(event.createdAt);
   if (event.kind === "assistant") {
     return (
       <div className="worker-event assistant">
@@ -88,6 +89,17 @@ const EventItem = memo(function EventItem({ event }: { event: WorkerEventView })
     );
   }
   if (event.kind === "result") {
+    if (event.payload.subtype === "stopped") {
+      // A deliberate stop is not a failure — say who ended it.
+      return (
+        <div className="worker-event steer">
+          <div className="event-meta">{time} · stopped</div>
+          <div className="event-text">
+            Stopped by {String(event.payload.stoppedBy ?? "an unspecified caller")}.
+          </div>
+        </div>
+      );
+    }
     const isError = event.payload.isError === true;
     const resultText = typeof event.payload.resultText === "string" ? event.payload.resultText : "";
     return (
@@ -176,6 +188,14 @@ function Drilldown({
           <span className="contract-label">worktree</span>
           <span className="contract-value mono">{worker.worktreePath}</span>
         </div>
+        {worker.resumedFrom ? (
+          <div className="contract-row">
+            <span className="contract-label">continues</span>
+            <span className="contract-value mono">
+              worker {worker.resumedFrom.slice(0, 8)} (resumed in the same worktree)
+            </span>
+          </div>
+        ) : null}
       </div>
 
       {openAttention.length > 0 ? (

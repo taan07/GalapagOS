@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { RecordView } from "./types";
 import { useProjectSelection } from "./use-project-selection";
+import { localDateTime } from "./time";
 
 function Field(props: { label: string; value: string; source: string }) {
   return (
@@ -32,12 +33,12 @@ function RecordCard({ record }: { record: RecordView }) {
         <Field label="id" value={record.id} source={record.fieldSources.id ?? ""} />
         <Field
           label="created"
-          value={record.createdAt || "(missing)"}
+          value={record.createdAt ? localDateTime(record.createdAt) : "(missing)"}
           source={record.fieldSources.createdAt ?? ""}
         />
         <Field
           label="updated"
-          value={record.updatedAt || "(missing)"}
+          value={record.updatedAt ? localDateTime(record.updatedAt) : "(missing)"}
           source={record.fieldSources.updatedAt ?? ""}
         />
         <Field
