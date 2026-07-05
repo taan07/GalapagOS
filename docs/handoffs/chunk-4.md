@@ -5,21 +5,25 @@
 ```
 Chunk 4 — Monitoring, evidence, confidence (the system grows judgment)
 
-Repo: ~/Dev/galapagos (github.com/taan07/GalapagOS). Chunks 2 and 3 live on
-stacked branches (claude/chunk-2-durable-memory-w3g1cs →
-claude/chunk-3-workers-lanes-vl5mh8); check what has merged to main first.
-If chunk 3 is merged, branch claude/chunk-4-monitoring from main; otherwise
-stack on the chunk-3 branch — never commit Chunk 4 code to earlier chunks'
-branches; chunks are verified and merged independently. Start by reading
-docs/handoffs/chunk-4.md (your handoff), then docs/vision.md and
-docs/architecture.md — the binding contracts that override everything else,
-including this prompt. Then implement docs/chunks/4.md.
+Repo: ~/Dev/galapagos (github.com/taan07/GalapagOS). Chunk 2 is MERGED to
+main (merge commit b40e22e; its branch is deleted). Chunk 3 lives on
+claude/chunk-3-workers-lanes-vl5mh8, rebased directly onto main — check
+whether it has merged before branching: if yes, create
+claude/chunk-4-monitoring from main; otherwise stack it on the chunk-3
+branch. Never commit Chunk 4 code to earlier chunks' branches; chunks are
+verified and merged independently. Start by reading docs/handoffs/chunk-4.md
+(your handoff), then docs/vision.md and docs/architecture.md — the binding
+contracts that override everything else, including this prompt. Then
+implement docs/chunks/4.md.
 
-State you inherit — Chunk 1 COMPLETE (verified live). Chunks 2 and 3 BUILT,
-awaiting the user's live drills (stamps + drill lists in docs/chunks/2.md,
-2-verification.md, 3.md, 3-verification.md; if the user reports issues in
-either mid-work, fixing them comes FIRST, on that chunk's branch, then
-rebase your stack). Standing: daemon :4517 owns all Agent SDK sessions; web
+State you inherit — Chunks 1 and 2 COMPLETE (verified live 2026-07-04 and
+2026-07-05; stamps in docs/chunks/1.md and 2.md). Chunk 3 BUILT, awaiting
+the user's live drills (stamp in docs/chunks/3.md, runbook in
+3-verification.md; if the user reports chunk-3 issues mid-work, fixing them
+comes FIRST, on the chunk-3 branch, then rebase your stack — same for any
+chunk-2 regression, which lands on main). Standing: daemon :4517 owns all
+Agent SDK sessions (startup line + GET /health report git revision and
+branch — ALWAYS verify which code is running before diagnosing); web
 UI :3005 (pages /, /workers, /records); central SQLite at
 ~/.galapagos/state.db — projects, manager_sessions, manager_turns, jobs,
 lanes, workers, worker_events, completion_digests, attention_items (you ADD
@@ -84,14 +88,17 @@ You are a fresh implementer picking up Galapagos after Chunk 3. Read
 override everything, including this handoff. Then implement
 `docs/chunks/4.md`.
 
-## Branch state — read this before writing code
+## Branch state — read this before writing code (updated 2026-07-05)
 
-- Chunk 2 (`claude/chunk-2-durable-memory-w3g1cs`) and Chunk 3
-  (`claude/chunk-3-workers-lanes-vl5mh8`, stacked on chunk 2 plus main's
-  lineage-quarantine docs commit) are BUILT and unmerged as of 2026-07-05.
-  Check what has merged before branching (kickoff prompt has the rule).
-- Both chunks await the user's live drills; user-reported fixes land on the
-  OWNING chunk's branch first, then rebase your stack.
+- Chunk 2 is COMPLETE (all live drills passed) and MERGED to main at
+  b40e22e; its branch is deleted. Chunk-2-surface fixes now land on main.
+- Chunk 3 (`claude/chunk-3-workers-lanes-vl5mh8`) is REBASED directly onto
+  main (merge-base == main's tip) and BUILT, awaiting the user's live
+  drills. Chunk-3 fixes land on that branch; rebase your stack after.
+- Post-rebase additions on the chunk-3 branch beyond the original build:
+  triple-Esc turn interrupt, distill restraint (unaccepted proposals →
+  open_question), daemon identity (rev/branch in startup line + /health),
+  workers defaulting to claude-opus-4-8 at high effort (user-confirmed).
 - 116 tests green at handoff (`npm test` = typecheck + `node --test` on
   `dist-node/tests`). Keep them green before every commit.
 
