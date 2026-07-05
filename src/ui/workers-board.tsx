@@ -7,10 +7,13 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type {
   DaemonStreamEvent,
+  ProjectConfidenceView,
+  WorkerConfidenceView,
   WorkerDetailView,
   WorkerEventView,
   WorkerView,
 } from "./types";
+import { ConfidenceGauge } from "./confidence";
 import { useProjectSelection } from "./use-project-selection";
 
 function agoLabel(iso: string | null, now: number): string {
@@ -117,12 +120,14 @@ const STOPPABLE: readonly WorkerView["status"][] = [
 
 function Drilldown({
   detail,
+  confidence,
   now,
   stopping,
   stopNote,
   onStop,
 }: {
   detail: WorkerDetailView;
+  confidence: WorkerConfidenceView | null;
   now: number;
   stopping: boolean;
   stopNote: string | null;
@@ -155,6 +160,10 @@ function Drilldown({
         ) : null}
       </header>
       {stopNote ? <div className="stop-note">{stopNote}</div> : null}
+
+      {confidence ? (
+        <ConfidenceGauge report={confidence.report} label="worker confidence" />
+      ) : null}
 
       <div className="lane-contract">
         <div className="contract-row">
@@ -206,17 +215,29 @@ function Drilldown({
           ))}
           {digest.claims.length > 0 ? (
             <ul className="digest-claims">
-              {digest.claims.map((claim, index) => (
-                <li key={index}>
-                  <span className={`claim-badge evidence-${claim.evidence_kind}`}>
-                    {claim.evidence_kind}
-                  </span>
-                  {claim.text}
-                  {claim.files.length > 0 ? (
-                    <span className="claim-files mono"> — {claim.files.join(", ")}</span>
-                  ) : null}
-                </li>
-              ))}
+              {digest.claims.map((claim, index) => {
+                // claimLinks come from the same digest claims array, in order.
+                const link = confidence?.claimLinks[index];
+                return (
+                  <li key={index}>
+                    {link ? (
+                      <span
+                        className={`claim-badge verification-${link.verification}`}
+                        title={link.reason}
+                      >
+                        {link.verification}
+                      </span>
+                    ) : null}
+                    <span className={`claim-badge evidence-${claim.evidence_kind}`}>
+                      {claim.evidence_kind}
+                    </span>
+                    {claim.text}
+                    {claim.files.length > 0 ? (
+                      <span className="claim-files mono"> — {claim.files.join(", ")}</span>
+                    ) : null}
+                  </li>
+                );
+              })}
             </ul>
           ) : null}
           {digest.touchedAreas.length > 0 ? (
@@ -247,6 +268,7 @@ export function WorkersBoard() {
     setSelectedId: setSelectedProjectId,
   } = useProjectSelection();
   const [workers, setWorkers] = useState<WorkerView[] | null>(null);
+  const [confidence, setConfidence] = useState<ProjectConfidenceView | null>(null);
   const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
   const [detail, setDetail] = useState<WorkerDetailView | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -291,13 +313,24 @@ export function WorkersBoard() {
     }
   }, []);
 
+  const refreshConfidence = useCallback(async (projectId: string) => {
+    const response = await fetch(`/api/confidence?projectId=${encodeURIComponent(projectId)}`, {
+      cache: "no-store",
+    });
+    if (response.ok) {
+      setConfidence((await response.json()) as ProjectConfidenceView);
+    }
+  }, []);
+
   useEffect(() => {
     if (selectedProjectId) {
       setWorkers(null);
       setDetail(null);
+      setConfidence(null);
       void refreshWorkers(selectedProjectId);
+      void refreshConfidence(selectedProjectId);
     }
-  }, [selectedProjectId, refreshWorkers]);
+  }, [selectedProjectId, refreshWorkers, refreshConfidence]);
 
   useEffect(() => {
     if (selectedWorkerId) {
@@ -409,16 +442,37 @@ export function WorkersBoard() {
         // the list — it is cheap and statuses change per turn, not per event.
         if (projectId) {
           void refreshWorkers(projectId);
+          void refreshConfidence(projectId);
         }
         if (event.workerId === selectedWorkerRef.current) {
           void refreshDetail(event.workerId);
         }
       }
+      if (
+        projectId &&
+        (event.type === "monitor_tick" ||
+          event.type === "attention_changed" ||
+          event.type === "digest_reviewed") &&
+        event.projectId === projectId
+      ) {
+        // The monitor's tick moves gauges without any user action (evidence
+        // freshness, staleness), and attention changes move both surfaces.
+        void refreshConfidence(projectId);
+        if (event.type !== "monitor_tick") {
+          void refreshWorkers(projectId);
+          if (selectedWorkerRef.current) {
+            void refreshDetail(selectedWorkerRef.current);
+          }
+        }
+      }
     };
     return () => source.close();
-  }, [refreshDetail, refreshWorkers]);
+  }, [refreshDetail, refreshWorkers, refreshConfidence]);
 
   const detailForSelection = detail && detail.worker.id === selectedWorkerId ? detail : null;
+  const confidenceByWorker = new Map(
+    (confidence?.workers ?? []).map((entry) => [entry.workerId, entry]),
+  );
 
   return (
     <div className="app-shell">
@@ -426,6 +480,9 @@ export function WorkersBoard() {
         <div className="app-title">
           GALAPAGOS <span>/ Workers</span>
         </div>
+        {confidence ? (
+          <ConfidenceGauge report={confidence.project} label="project" compact />
+        ) : null}
         <a className="nav-link" href="/">
           ← Darwin
         </a>
@@ -463,34 +520,45 @@ export function WorkersBoard() {
         {workers !== null && workers.length > 0 ? (
           <div className="workers-split">
             <div className="worker-list">
-              {[...workers].reverse().map((worker) => (
-                <button
-                  key={worker.id}
-                  className={`worker-card${worker.id === selectedWorkerId ? " selected" : ""}`}
-                  onClick={() => setSelectedWorkerId(worker.id)}
-                >
-                  <div className="worker-card-head">
-                    <span className="lane-name">{worker.laneName ?? "(lane missing)"}</span>
-                    <StatusPill status={worker.status} />
-                  </div>
-                  <div className="worker-card-sub">
-                    <span className="liveness">{agoLabel(worker.lastMessageAt, now)}</span>
-                    {worker.openAttentionCount > 0 ? (
-                      <span className="attention-count">
-                        {worker.openAttentionCount} attention
-                      </span>
+              {[...workers].reverse().map((worker) => {
+                const workerConfidence = confidenceByWorker.get(worker.id) ?? null;
+                return (
+                  <button
+                    key={worker.id}
+                    className={`worker-card${worker.id === selectedWorkerId ? " selected" : ""}`}
+                    onClick={() => setSelectedWorkerId(worker.id)}
+                  >
+                    <div className="worker-card-head">
+                      <span className="lane-name">{worker.laneName ?? "(lane missing)"}</span>
+                      <StatusPill status={worker.status} />
+                    </div>
+                    <div className="worker-card-sub">
+                      <span className="liveness">{agoLabel(worker.lastMessageAt, now)}</span>
+                      {worker.openAttentionCount > 0 ? (
+                        <span className="attention-count">
+                          {worker.openAttentionCount} attention
+                        </span>
+                      ) : null}
+                      {worker.hasDigest ? <span className="digest-mark">digest</span> : null}
+                    </div>
+                    {workerConfidence ? (
+                      <ConfidenceGauge
+                        report={workerConfidence.report}
+                        label={worker.laneName ?? worker.id}
+                        compact
+                      />
                     ) : null}
-                    {worker.hasDigest ? <span className="digest-mark">digest</span> : null}
-                  </div>
-                  {worker.lastSummary ? (
-                    <div className="worker-card-summary">{worker.lastSummary}</div>
-                  ) : null}
-                </button>
-              ))}
+                    {worker.lastSummary ? (
+                      <div className="worker-card-summary">{worker.lastSummary}</div>
+                    ) : null}
+                  </button>
+                );
+              })}
             </div>
             {detailForSelection ? (
               <Drilldown
                 detail={detailForSelection}
+                confidence={confidenceByWorker.get(detailForSelection.worker.id) ?? null}
                 now={now}
                 stopping={stopping}
                 stopNote={

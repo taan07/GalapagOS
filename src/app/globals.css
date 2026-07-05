@@ -870,3 +870,311 @@ select:focus {
   flex-direction: column;
   gap: 10px;
 }
+
+/* ── Chunk 4: confidence gauges ──────────────────────────────────────────
+   One bar per worker and per project; state hue is the only saturation.
+   Caps/signals live behind the "why" drilldown — never default sub-bars. */
+
+.confidence-gauge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.gauge-track {
+  flex: 1;
+  min-width: 60px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.gauge-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--muted);
+  transition: width 0.6s ease;
+}
+
+.state-strong .gauge-fill {
+  background: var(--ok);
+}
+
+.state-steady .gauge-fill {
+  background: var(--accent);
+}
+
+.state-draining .gauge-fill {
+  background: var(--attention);
+}
+
+.state-blocked .gauge-fill {
+  background: var(--danger);
+}
+
+.gauge-score {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  min-width: 22px;
+  text-align: right;
+}
+
+.gauge-state {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.state-strong .gauge-state {
+  color: var(--ok);
+}
+
+.state-steady .gauge-state {
+  color: var(--accent);
+}
+
+.state-draining .gauge-state {
+  color: var(--attention);
+}
+
+.state-blocked .gauge-state {
+  color: var(--danger);
+}
+
+.app-header .confidence-gauge {
+  width: 220px;
+}
+
+.confidence-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--surface-raised);
+}
+
+.confidence-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.confidence-label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.confidence-head .confidence-gauge {
+  flex: 1;
+}
+
+.confidence-reason {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.confidence-debug summary {
+  font-size: 11.5px;
+}
+
+.confidence-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.confidence-source {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.breakdown-section {
+  margin-top: 6px;
+  color: var(--faint);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.breakdown-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.breakdown-row.binding .breakdown-label {
+  color: var(--ink);
+}
+
+.breakdown-delta {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  min-width: 34px;
+  text-align: right;
+}
+
+.breakdown-delta.positive {
+  color: var(--ok);
+}
+
+.breakdown-delta.negative {
+  color: var(--danger);
+}
+
+.breakdown-label {
+  color: var(--muted);
+}
+
+/* ── Chunk 4: the attention queue — the one loud surface ─────────────── */
+
+.side-stack {
+  overflow-y: auto;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  background: var(--surface);
+  min-height: 0;
+}
+
+/* Inside the stack the specifics panel is one section, not its own column. */
+.side-stack .side {
+  overflow: visible;
+  padding: 0;
+  background: transparent;
+}
+
+.attention-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.attention-queue h2 {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.queue-count {
+  background: var(--attention);
+  color: var(--bg);
+  border-radius: 9px;
+  min-width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  padding: 0 5px;
+}
+
+.queue-item {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--attention);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--surface-raised);
+}
+
+.queue-item.priority-high {
+  border-left-color: var(--danger);
+}
+
+.queue-item.closed {
+  border-left-color: var(--line);
+  opacity: 0.75;
+}
+
+.queue-item-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.queue-item-title {
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.queue-status {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.queue-detail pre {
+  white-space: pre-wrap;
+}
+
+.queue-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.queue-when {
+  flex: 1;
+  color: var(--faint);
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+.queue-actions button {
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
+.queue-actions button.dismiss {
+  color: var(--muted);
+}
+
+.queue-history summary {
+  color: var(--faint);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.queue-history {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Claim verification badges (vision layer 4: evidence one hover away). */
+.claim-badge.verification-verified {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--line));
+}
+
+.claim-badge.verification-unverified {
+  color: var(--muted);
+}
+
+.claim-badge.verification-unsupported {
+  color: var(--attention);
+  border-color: color-mix(in srgb, var(--attention) 45%, var(--line));
+}
+
+.claim-badge.verification-contradicted {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+}

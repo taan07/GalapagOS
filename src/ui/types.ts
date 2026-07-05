@@ -103,6 +103,41 @@ export type AttentionView = {
   priority: "high" | "normal";
   status: string;
   createdAt: string;
+  /** Present on the project queue; implicit in a worker drilldown. */
+  workerId?: string | null;
+};
+
+/** One confidence report as served by /api/confidence — mirrors core types. */
+export type ConfidenceReportView = {
+  score: number;
+  state: "strong" | "steady" | "draining" | "blocked";
+  uncappedScore: number;
+  signals: { id: string; label: string; delta: number }[];
+  caps: { id: string; label: string; capTo: number; blocking: boolean; draining: boolean }[];
+  stateReason: string;
+};
+
+/** How one digest claim resolved against evidence — the badge and its reason. */
+export type ClaimLinkView = {
+  text: string;
+  evidenceKind: string;
+  verification: "verified" | "unverified" | "unsupported" | "contradicted";
+  reason: string;
+};
+
+export type WorkerConfidenceView = {
+  workerId: string;
+  laneName: string | null;
+  report: ConfidenceReportView;
+  countsTowardProject: boolean;
+  claimLinks: ClaimLinkView[];
+};
+
+export type ProjectConfidenceView = {
+  project: ConfidenceReportView;
+  workers: WorkerConfidenceView[];
+  /** Source attribution: when this picture was computed from evidence. */
+  computedAt: string;
 };
 
 export type WorkerDetailView = {
@@ -130,7 +165,11 @@ export type DaemonStreamEvent =
       workerId: string;
       status: WorkerView["status"];
       lastSummary: string | null;
-    };
+    }
+  | { type: "attention_changed"; projectId: string }
+  | { type: "digest_reviewed"; projectId: string; workerId: string }
+  | { type: "monitor_tick"; projectId: string }
+  | { type: "manager_note"; projectId: string; text: string };
 
 /** One durable record as served by /api/records — every field attributed. */
 export type RecordView = {
