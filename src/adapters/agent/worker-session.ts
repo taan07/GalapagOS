@@ -45,8 +45,19 @@ export type WorkerSessionFactory = (input: SpawnWorkerSessionInput) => WorkerSes
 // an allow rule would skip canUseTool entirely, and the preventive lane
 // guard lives there. Bash IS listed — the known bypass (architecture §11.3);
 // the detective lane-check at stop is the authority. BashOutput/KillShell
-// manage Bash's own background jobs and carry no new capability.
-const WORKER_ALLOWED_TOOLS = ["Read", "Glob", "Grep", "Bash", "BashOutput", "KillShell", "TodoWrite"];
+// manage Bash's own background jobs and carry no new capability. WebFetch
+// is user-confirmed (2026-07-05): workers routinely need API/library docs;
+// WebSearch and Task stay denied until the user rules otherwise.
+const WORKER_ALLOWED_TOOLS = [
+  "Read",
+  "Glob",
+  "Grep",
+  "Bash",
+  "BashOutput",
+  "KillShell",
+  "TodoWrite",
+  "WebFetch",
+];
 
 // Generous but bounded: workers do real multi-step implementation work, and
 // a runaway session must still terminate on its own.
@@ -76,7 +87,7 @@ export function workerCanUseTool(lane: LaneContract, worktreePath: string): CanU
       // a headless daemon has no human watching approvals.
       return {
         behavior: "deny",
-        message: `${toolName} is not part of the worker tool surface. You have: Read, Glob, Grep, Bash, TodoWrite, and in-lane Edit/Write. If the task truly needs more, say so and stop — the manager will decide.`,
+        message: `${toolName} is not part of the worker tool surface. You have: Read, Glob, Grep, Bash, TodoWrite, WebFetch, and in-lane Edit/Write. If the task truly needs more, say so and stop — the manager will decide.`,
       };
     }
 

@@ -100,9 +100,11 @@ test("canUseTool covers NotebookEdit's notebook_path and missing paths", async (
 });
 
 test("canUseTool denies tools outside the worker surface — deny-by-default", async () => {
+  // WebFetch is NOT in this list: it sits in the allowlist (user-confirmed
+  // 2026-07-05) and is auto-approved before the callback ever runs.
   const root = worktree();
   const decide = workerCanUseTool(LANE, root);
-  for (const tool of ["WebSearch", "WebFetch", "Task"]) {
+  for (const tool of ["WebSearch", "Task"]) {
     const result = await decide(
       tool,
       { query: "anything" },
