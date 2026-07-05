@@ -63,8 +63,27 @@ test("critic prompt is blinded: brief, contract, specifics, evidence, diff — a
   assert.match(prompt, /cards only at launch/);
   assert.match(prompt, /UNTRUSTED DATA/);
   assert.match(prompt, /diff truncated/);
+  assert.match(
+    prompt,
+    /none found — weigh what a passing suite proves accordingly/,
+    "missing reference tests are named, never silent",
+  );
   // Blinding is structural: the builder has no parameter that could carry
   // the worker's narrative or claims — nothing to assert beyond its inputs.
+
+  const withTests = buildCriticPrompt({
+    briefTitle: "t",
+    briefBody: "b",
+    laneName: "auth ui",
+    allowedGlobs: ["src/**"],
+    forbiddenGlobs: [],
+    agreedSpecifics: [],
+    evidenceSummary: "",
+    diffText: "diff",
+    referenceTests: [{ path: "tests/login.test.ts", content: "expect(greet('Ada'))" }],
+  });
+  assert.match(withTests, /=== tests\/login\.test\.ts ===/);
+  assert.match(withTests, /expect\(greet\('Ada'\)\)/);
 });
 
 test("critic verdicts parse; unanchored findings are dropped; reject demands a blocker", () => {

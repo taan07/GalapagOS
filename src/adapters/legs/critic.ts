@@ -4,7 +4,7 @@
 // claims, or transcript — run the single-shot critique on
 // GALAPAGOS_CRITIC_MODEL, and persist the verdict as a jobs row (kind
 // "critic") keyed to the workspace evidence state.
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { GalapagosConfig } from "../../config";
 import {
@@ -13,16 +13,18 @@ import {
   parseCriticVerdict,
   type CriticFinding,
 } from "../../core/legs/critic";
+import { isTestPath } from "../../core/legs/tripwires";
 import { parseStatusPorcelain } from "../../core/git/parsers";
 import type { GalapagosDb } from "../db/db";
 import { createJob, failJob, finishJob, startJob } from "../db/repos/jobs";
 import { laneGlobs, type LaneRow } from "../db/repos/lanes";
-import { latestRunsByKey } from "../db/repos/evidence";
+import { evidenceRunsKey, latestRunsByKey } from "../db/repos/evidence";
 import type { ProjectRow } from "../db/repos/projects";
 import type { WorkerRow } from "../db/repos/workers";
 import { observeWorkspaceEvidence } from "../evidence/workspace";
 import { LocalGitCommandRunner } from "../git/runner";
 import { createRecordsStore } from "../records/store";
+import { collectAuditFiles } from "../agent/worker-runtime";
 import { runSingleShotReview } from "./session";
 
 export type CriticJobResult = {
@@ -30,11 +32,85 @@ export type CriticJobResult = {
   summary: string;
   findings: CriticFinding[];
   evidenceKey: string;
+  /** The evidence pool the critique weighed — a new check run stales it. */
+  runsKey: string;
   digestId: string;
   workerId: string;
 };
 
 const UNTRACKED_RENDER_LIMIT = 16 * 1024;
+const REFERENCE_TEST_LIMIT = 8 * 1024;
+const REFERENCE_TEST_MAX_FILES = 3;
+const WALK_MAX_ENTRIES = 500;
+const SKIP_DIRS = new Set([".git", "node_modules", "dist", "dist-node", "build", ".next", "vendor"]);
+
+/**
+ * Unchanged test files that exercise the changed code (found live
+ * 2026-07-05: the diff alone left the critic unable to see what the tests
+ * assert, forcing blind skepticism). Heuristic: test files whose content
+ * mentions a changed non-test file's basename. Bounded walk, bounded reads.
+ */
+function collectReferenceTests(
+  worktreePath: string,
+  changedPaths: string[],
+): { path: string; content: string }[] {
+  const changedBasenames = changedPaths
+    .filter((p) => !isTestPath(p))
+    .map((p) => path.basename(p).replace(/\.[^.]+$/, ""))
+    .filter((name) => name.length > 2 && name !== "index");
+  if (changedBasenames.length === 0) {
+    return [];
+  }
+  const changed = new Set(changedPaths);
+
+  const testFiles: string[] = [];
+  let scanned = 0;
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 6 || scanned > WALK_MAX_ENTRIES || testFiles.length > 40) {
+      return;
+    }
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = readdirSync(path.join(worktreePath, dir), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      scanned += 1;
+      const relative = dir ? `${dir}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith(".")) {
+          walk(relative, depth + 1);
+        }
+      } else if (isTestPath(relative) && !changed.has(relative)) {
+        testFiles.push(relative);
+      }
+    }
+  };
+  walk("", 0);
+
+  const references: { path: string; content: string }[] = [];
+  for (const testFile of testFiles) {
+    if (references.length >= REFERENCE_TEST_MAX_FILES) {
+      break;
+    }
+    try {
+      const content = readFileSync(path.join(worktreePath, testFile), "utf8").slice(
+        0,
+        REFERENCE_TEST_LIMIT,
+      );
+      if (content.includes("\0")) {
+        continue;
+      }
+      if (changedBasenames.some((name) => content.includes(name))) {
+        references.push({ path: testFile, content });
+      }
+    } catch {
+      // Unreadable reference: skipped, never fabricated.
+    }
+  }
+  return references;
+}
 
 /** The real diff vs the lane base, with untracked files appended honestly. */
 async function collectReviewDiff(worktreePath: string, baseSha: string): Promise<string> {
@@ -120,6 +196,8 @@ export async function runCriticReview(input: {
 
     const globs = laneGlobs(input.lane);
     const diffText = await collectReviewDiff(worker.worktree_path, input.lane.base_sha);
+    const changedPaths = await collectAuditFiles(worker.worktree_path, input.lane.base_sha);
+    const referenceTests = collectReferenceTests(worker.worktree_path, changedPaths);
     const prompt = buildCriticPrompt({
       briefTitle: brief.title,
       briefBody: brief.body,
@@ -129,6 +207,7 @@ export async function runCriticReview(input: {
       agreedSpecifics,
       evidenceSummary,
       diffText,
+      referenceTests,
     });
 
     const response = await runSingleShotReview({
@@ -150,6 +229,7 @@ export async function runCriticReview(input: {
     const result: CriticJobResult = {
       ...parsed.verdict,
       evidenceKey: workspace.key,
+      runsKey: evidenceRunsKey(runs),
       digestId: input.digestId,
       workerId: worker.id,
     };

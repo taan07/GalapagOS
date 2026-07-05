@@ -24,6 +24,8 @@ export type WatchdogJobResult = {
   summary: string;
   evidence: string[];
   evidenceKey: string;
+  /** How many transcript events the verdict covered — new events stale it. */
+  eventCount: number;
   digestId: string;
   workerId: string;
 };
@@ -105,6 +107,7 @@ export async function runWatchdogReview(input: {
     const result: WatchdogJobResult = {
       ...parsed.verdict,
       evidenceKey: workspace.key,
+      eventCount: events.length,
       digestId: input.digestId,
       workerId: worker.id,
     };

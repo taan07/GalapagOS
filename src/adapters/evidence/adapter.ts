@@ -16,9 +16,14 @@ import type { CompletionClaim } from "../../core/digests/completion";
 import type { GalapagosDb } from "../db/db";
 import { latestJobByPayload } from "../db/repos/jobs";
 import { laneGlobs, type LaneRow } from "../db/repos/lanes";
-import type { WorkerRow } from "../db/repos/workers";
+import { countWorkerEvents, type WorkerRow } from "../db/repos/workers";
 import { latestDigestForWorker } from "../db/repos/digests";
-import { latestRunsByKey, type CheckKey, type EvidenceRunRow } from "../db/repos/evidence";
+import {
+  evidenceRunsKey,
+  latestRunsByKey,
+  type CheckKey,
+  type EvidenceRunRow,
+} from "../db/repos/evidence";
 import { collectAuditFiles } from "../agent/worker-runtime";
 import { configuredCheckKeys } from "../checks/run-checks";
 import { runTripwires } from "../legs/tripwires";
@@ -186,15 +191,18 @@ export type WorkerEvidence = {
 
 /**
  * Resolve a judgment leg's jobs row into an engine input. The verdict must
- * belong to THIS digest (a new completion needs a new review) and freshness
- * compares its evidence key against the workspace now.
+ * belong to THIS digest (a new completion needs a new review), and freshness
+ * is leg-specific: the workspace key ALWAYS, plus whatever else the verdict
+ * judged (the evidence pool for the critic, the transcript length for the
+ * watchdog) — learned live 2026-07-05, when a critic's "no evidence" reject
+ * stayed 'fresh' after the evidence arrived, with no path to re-review.
  */
 function legInputFromJob<TResult extends { digestId: string; evidenceKey: string }>(
   db: GalapagosDb,
   kind: "watchdog" | "critic",
   workerId: string,
   digestId: string,
-  workspaceKey: string | null,
+  isFresh: (result: TResult) => boolean,
   toInput: (result: TResult, fresh: boolean) => WatchdogInput | CriticInput,
 ): WatchdogInput | CriticInput {
   const job = latestJobByPayload(db, kind, "workerId", workerId);
@@ -212,8 +220,7 @@ function legInputFromJob<TResult extends { digestId: string; evidenceKey: string
     if (result.digestId !== digestId) {
       return { status: "pending" }; // verdict belongs to a superseded completion
     }
-    const fresh = workspaceKey !== null && result.evidenceKey === workspaceKey;
-    return toInput(result, fresh);
+    return toInput(result, isFresh(result));
   } catch {
     return { status: "unavailable", reason: "the stored verdict could not be parsed" };
   }
@@ -308,14 +315,22 @@ export async function buildWorkerEvidence(
     integrity = await runTripwires(worker.worktree_path, lane.base_sha);
   }
 
-  // The judgment legs apply only once completion is claimed.
+  // The judgment legs apply only once completion is claimed. Freshness is
+  // leg-specific: the watchdog judged a transcript of N events (a steered
+  // worker's new events stale it); the critic judged a diff AND an evidence
+  // pool (a new check run stales it even though no file changed).
+  const eventCount = countWorkerEvents(db, worker.id);
+  const runsKey = evidenceRunsKey(latestRuns);
   const watchdog: WatchdogInput | null = digest
     ? (legInputFromJob<WatchdogJobResult>(
         db,
         "watchdog",
         worker.id,
         digest.id,
-        workspaceKey,
+        (result) =>
+          workspaceKey !== null &&
+          result.evidenceKey === workspaceKey &&
+          result.eventCount === eventCount,
         (result, fresh) => ({
           status: "reviewed",
           verdict: result.verdict,
@@ -330,7 +345,10 @@ export async function buildWorkerEvidence(
         "critic",
         worker.id,
         digest.id,
-        workspaceKey,
+        (result) =>
+          workspaceKey !== null &&
+          result.evidenceKey === workspaceKey &&
+          result.runsKey === runsKey,
         (result, fresh) => ({
           status: "reviewed",
           verdict: result.verdict,

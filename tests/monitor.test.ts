@@ -18,9 +18,13 @@ import {
   listWorkerAttentionItems,
 } from "../src/adapters/db/repos/attention";
 import { createCompletionDigest, latestDigestForWorker } from "../src/adapters/db/repos/digests";
-import { createEvidenceRun } from "../src/adapters/db/repos/evidence";
+import {
+  createEvidenceRun,
+  evidenceRunsKey,
+  latestRunsByKey,
+} from "../src/adapters/db/repos/evidence";
 import { createJob, finishJob, startJob } from "../src/adapters/db/repos/jobs";
-import { getWorker } from "../src/adapters/db/repos/workers";
+import { countWorkerEvents, getWorker } from "../src/adapters/db/repos/workers";
 import { createWorkerRuntime } from "../src/adapters/agent/worker-runtime";
 import type { WorkerSession } from "../src/adapters/agent/worker-session";
 import { observeWorkspaceEvidence } from "../src/adapters/evidence/workspace";
@@ -121,7 +125,18 @@ async function fixture(): Promise<Fixture> {
       startJob(db, job.id);
       const workspace = await observeWorkspaceEvidence(input.worker.worktree_path);
       finishJob(db, job.id, {
-        ...(kind === "watchdog" ? { ...legs.watchdog, evidence: [] } : legs.critic),
+        ...(kind === "watchdog"
+          ? {
+              ...legs.watchdog,
+              evidence: [],
+              eventCount: countWorkerEvents(db, input.worker.id),
+            }
+          : {
+              ...legs.critic,
+              runsKey: evidenceRunsKey(
+                latestRunsByKey(db, { projectId: project.id, workerId: input.worker.id }),
+              ),
+            }),
         evidenceKey: workspace.key,
         digestId: input.digestId,
         workerId: input.worker.id,
@@ -426,6 +441,48 @@ test("a watchdog gaming verdict raises a high-priority integrity alert", async (
   assert.match(alerts[0]?.title ?? "", /gamed/);
   assert.match(alerts[0]?.detail ?? "", /weakened until it passed/);
   assert.equal(latestDigestForWorker(db, workerId)?.status, "parsed");
+});
+
+test("a new evidence run stales the critic verdict and re-arms the review (found live 2026-07-05)", async () => {
+  const { db, workerId, worktree, monitor, legs, legRuns } = await fixture();
+  setStatus(db, workerId, "idle");
+  const worker = getWorker(db, workerId);
+  assert.ok(worker);
+  // First critique lands while NO evidence exists — a skeptical reject.
+  legs.critic = { verdict: "reject", summary: "no execution evidence", findings: [
+    { severity: "blocker", title: "nothing proves the tests pass", evidence: "no check runs exist" },
+  ] };
+  createCompletionDigest(db, {
+    workerId,
+    narrative: "done",
+    beforeAfter: [],
+    claims: [],
+    touchedAreas: [],
+  });
+  await monitor.tick();
+  await settleLegs();
+  const runsAfterFirst = legRuns.filter((entry) => entry.startsWith("critic")).length;
+  assert.equal(runsAfterFirst, 1);
+
+  // Evidence arrives (triage ran the checks). The tree did NOT change — but
+  // the verdict judged a different evidence pool, so it must re-arm.
+  const workspace = await observeWorkspaceEvidence(worktree);
+  createEvidenceRun(db, {
+    projectId: worker.project_id,
+    workerId,
+    checkKey: "test",
+    status: "passed",
+    summary: "passed",
+    headSha: workspace.key,
+  });
+  legs.critic = { verdict: "approve", summary: "evidence now proves it", findings: [] };
+  await monitor.tick();
+  await settleLegs();
+  assert.equal(
+    legRuns.filter((entry) => entry.startsWith("critic")).length,
+    2,
+    "the critic re-ran after the evidence pool changed",
+  );
 });
 
 test("a critic rejection raises a high-priority integrity alert naming the blocker", async () => {

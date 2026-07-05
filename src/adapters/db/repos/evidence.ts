@@ -105,6 +105,18 @@ export function listEvidenceRuns(
     .all(scope.workerId) as EvidenceRunRow[];
 }
 
+/**
+ * The evidence pool's identity: when a new check run lands, a verdict that
+ * judged "no evidence" is outdated even though no file changed. Stamped into
+ * critic results and compared at read time.
+ */
+export function evidenceRunsKey(latestRuns: Map<CheckKey, EvidenceRunRow>): string {
+  return Array.from(latestRuns.values())
+    .map((run) => run.id)
+    .sort()
+    .join("|");
+}
+
 export function getEvidenceRun(db: GalapagosDb, id: string): EvidenceRunRow | undefined {
   return db.prepare("SELECT * FROM evidence_runs WHERE id = ?").get(id) as
     | EvidenceRunRow

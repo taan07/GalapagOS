@@ -36,10 +36,14 @@ claims-vs-evidence scan with auto-resolve, zero-LLM auto-review of clean
 completions, main-checkout watch); event-driven triage runs on a fresh
 records-seeded haiku session ONLY when new attention items exist; the
 PURE confidence engine (core/confidence) implements §9's gold scenarios
-exactly (caps positives cannot overcome, every number explains itself);
+exactly and aggregates FOUR independent legs — facts, tripwires
+(deterministic test-integrity patterns), watchdog (haiku reads the full
+transcript), critic (blinded diff-vs-brief critique) — one module, test
+file, and doc per leg (docs/legs/), every signal naming its leg, and a
+completion nobody independent reviewed is never strong or auto-reviewed;
 evidence_runs are keyed to `<sha>` or `<sha>+dirty.<fingerprint>` so ANY
 change makes evidence stale; the attention queue UI with resolve/dismiss
-lives on /, gauges on / and /workers. 154/154 tests green via npm test.
+lives on /, gauges on / and /workers. 178/178 tests green via npm test.
 
 Chunk 5 in one line: the pure clarity view-model (every displayed field
 carries source attribution — source, sourceLabel, sourceRecords —
@@ -100,7 +104,7 @@ override everything, including this handoff. Then implement
 - Chunk 4 (`claude/chunk-4-monitoring-confidence-mud9n3`) BUILT on top of
   the chunk-3 branch, awaiting drills (runbook:
   docs/chunks/4-verification.md). Chunk-4 fixes land there.
-- 154 tests green at handoff. Keep them green before every commit.
+- 178 tests green at handoff. Keep them green before every commit.
 
 ## What Chunk 4 added (concrete map)
 
@@ -130,6 +134,18 @@ override everything, including this handoff. Then implement
 - `src/adapters/agent/triage.ts` — `buildTriageSeed`,
   `createAskUserBridge` (chat note + queue item), `runTriageJob` (job row
   = trigger cutoff, taken at run END).
+- **The three legs** (user-confirmed 2026-07-05; docs/legs/{tripwires,
+  watchdog,critic}.md are the deep-dives): `core/legs/` pure halves
+  (pattern detection + diff parsing; prompt building + verdict parsing
+  with no-quote-no-finding and evidence-anchor rules), `adapters/legs/`
+  I/O halves (git diff assembly; single-shot sessions via the shared
+  `session.ts`; verdicts persisted as jobs rows keyed to the workspace
+  evidence key, found via `latestJobByPayload`). The monitor launches
+  watchdog+critic once per completion (re-runs on staleness, one in
+  flight per worker per leg, failed runs surface as unavailable and are
+  not self-retried); tripwires run inline every tick. integrity_alert is
+  the queue kind for tripwire alerts, watchdog gaming/suspicion, and
+  critic rejections.
 - Manager tools grew: run_checks, list_attention, resolve_attention,
   review_completion, ask_user (triage-only wiring). Doctrine updated.
 - UI: `src/ui/confidence.tsx` (gauge + "why N" drilldown),
