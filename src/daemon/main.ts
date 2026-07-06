@@ -23,6 +23,8 @@ import {
   getTurn,
   updateTurnContent,
 } from "../adapters/db/repos/manager";
+import { createDecisionBroker } from "../adapters/agent/decisions";
+import { sweepPendingDecisionTurns } from "../adapters/db/repos/manager";
 import { createWorkerRuntime } from "../adapters/agent/worker-runtime";
 import { commitRecords } from "../adapters/git/mutating-runner";
 import { ingestVaultSpecifics } from "../adapters/records/ingest";
@@ -41,6 +43,7 @@ const workers = createWorkerRuntime({
   config,
   broadcast: (event) => broadcast(event),
 });
+const decisions = createDecisionBroker();
 
 const execFileAsync = promisify(execFile);
 
@@ -184,6 +187,7 @@ async function handleManagerMessage(
       emit,
       abortController: turnController,
       workers,
+      decisions,
     });
 
     // Post-turn distillation runs while the stream (and the busy flag) is
@@ -421,9 +425,44 @@ async function handleSteerWorker(
     sendJson(res, 400, { error: "message is required." });
     return;
   }
-  const outcome = workers.steer(workerId, message);
+  const outcome = await workers.steer(workerId, message, { awaitResponse: false });
   if (!outcome.ok) {
     sendJson(res, 409, { error: outcome.reason });
+    return;
+  }
+  sendJson(res, 200, { ok: true });
+}
+
+async function handleHoldWorker(res: http.ServerResponse, workerId: string): Promise<void> {
+  const outcome = await workers.hold(workerId, "the user, via the workers page");
+  if (!outcome.ok) {
+    sendJson(res, 409, { error: outcome.reason });
+    return;
+  }
+  sendJson(res, 200, { ok: true, response: outcome.response });
+}
+
+/**
+ * The UI's answer to a chat decision (ask_user / amend_lane gate). The busy
+ * flag deliberately does NOT block this route — the pending decision IS the
+ * busy turn waiting on the user.
+ */
+async function handleDecisionAnswer(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const body = await readBody(req);
+  const decisionId = asString(body.decisionId);
+  if (!decisionId) {
+    sendJson(res, 400, { error: "decisionId is required." });
+    return;
+  }
+  const selections = asStringArray(body.selections) ?? [];
+  const custom = typeof body.custom === "string" ? body.custom : "";
+  if (!decisions.answer(decisionId, { selections, custom })) {
+    sendJson(res, 409, {
+      error: "That decision is no longer pending — it was answered, timed out, or belongs to an ended turn.",
+    });
     return;
   }
   sendJson(res, 200, { ok: true });
@@ -520,7 +559,13 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
-  const workerAction = /^\/workers\/([^/]+)\/(steer|stop)$/.exec(url.pathname);
+  if (route === "POST /manager/decision") {
+    void handleDecisionAnswer(req, res).catch((error) => {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    });
+    return;
+  }
+  const workerAction = /^\/workers\/([^/]+)\/(steer|stop|hold)$/.exec(url.pathname);
   if (req.method === "POST" && workerAction) {
     const [, workerId, action] = workerAction;
     if (workerId && action === "steer") {
@@ -531,6 +576,12 @@ const server = http.createServer((req, res) => {
     }
     if (workerId && action === "stop") {
       void handleStopWorker(res, workerId).catch((error) => {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+      });
+      return;
+    }
+    if (workerId && action === "hold") {
+      void handleHoldWorker(res, workerId).catch((error) => {
         sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
       });
       return;
@@ -554,6 +605,10 @@ void (async () => {
   // otherwise a status check in the gap reports a dead worker as running and
   // a spawn is refused by a corpse's still-active lane. Guarded — boot must
   // survive a reconcile failure (and still run vault ingestion after it).
+  const staleDecisions = sweepPendingDecisionTurns(db);
+  if (staleDecisions > 0) {
+    console.log(`[decisions] expired ${staleDecisions} pending decision${staleDecisions === 1 ? "" : "s"} from before the restart`);
+  }
   try {
     const orphans = await workers.reconcileOrphans();
     if (orphans > 0) {

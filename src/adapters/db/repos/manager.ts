@@ -184,6 +184,33 @@ export function updateTurnContent(db: GalapagosDb, turnId: string, content: stri
   db.prepare("UPDATE manager_turns SET content = ? WHERE id = ?").run(content, turnId);
 }
 
+/**
+ * Boot hygiene for the chat decision channel: a decision pending when the
+ * daemon died can never be answered (its turn's promise died with the
+ * process) — stamp it expired so the UI never offers dead buttons.
+ */
+export function sweepPendingDecisionTurns(db: GalapagosDb): number {
+  const rows = db
+    .prepare(
+      `SELECT id, content FROM manager_turns
+       WHERE role = 'system' AND content LIKE '%"kind":"decision"%' AND content LIKE '%"status":"pending"%'`,
+    )
+    .all() as { id: string; content: string }[];
+  let swept = 0;
+  for (const row of rows) {
+    try {
+      const payload = JSON.parse(row.content) as { kind?: string; status?: string };
+      if (payload.kind === "decision" && payload.status === "pending") {
+        updateTurnContent(db, row.id, JSON.stringify({ ...payload, status: "expired" }));
+        swept += 1;
+      }
+    } catch {
+      // not JSON — not a decision turn
+    }
+  }
+  return swept;
+}
+
 /** Stamp every not-yet-distilled turn of a session as covered. */
 export function markTurnsDistilled(db: GalapagosDb, sessionId: string): void {
   db.prepare(

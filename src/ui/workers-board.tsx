@@ -131,14 +131,18 @@ function Drilldown({
   detail,
   now,
   stopping,
+  holding,
   stopNote,
   onStop,
+  onHold,
 }: {
   detail: WorkerDetailView;
   now: number;
   stopping: boolean;
+  holding: boolean;
   stopNote: string | null;
   onStop: () => void;
+  onHold: () => void;
 }) {
   const { worker, events, digest, attention } = detail;
   const streamRef = useRef<HTMLDivElement>(null);
@@ -156,14 +160,24 @@ function Drilldown({
         <StatusPill status={worker.status} />
         <span className="liveness">{agoLabel(worker.lastMessageAt, now)}</span>
         {STOPPABLE.includes(worker.status) ? (
-          <button
-            className="stop-worker"
-            onClick={onStop}
-            disabled={stopping}
-            title="Escape hatch: ends the session, audits the worktree against the lane, retires the lane. Normally this flows through Darwin."
-          >
-            {stopping ? "Stopping…" : "Stop worker"}
-          </button>
+          <span className="worker-controls">
+            <button
+              className="hold-worker"
+              onClick={onHold}
+              disabled={stopping || holding}
+              title="Pause without ending: the worker states where it is and waits. The lane stays active; release it via Darwin (steer 'continue')."
+            >
+              {holding ? "Holding…" : "Hold"}
+            </button>
+            <button
+              className="stop-worker"
+              onClick={onStop}
+              disabled={stopping || holding}
+              title="Escape hatch: ends the session, audits the worktree against the lane, retires the lane. Normally this flows through Darwin."
+            >
+              {stopping ? "Stopping…" : "Stop worker"}
+            </button>
+          </span>
         ) : null}
       </header>
       {stopNote ? <div className="stop-note">{stopNote}</div> : null}
@@ -272,6 +286,7 @@ export function WorkersBoard() {
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [stopping, setStopping] = useState(false);
+  const [holding, setHolding] = useState(false);
   const [stopNote, setStopNote] = useState<{ workerId: string; text: string } | null>(null);
   const selectedWorkerRef = useRef<string | null>(null);
   selectedWorkerRef.current = selectedWorkerId;
@@ -438,6 +453,41 @@ export function WorkersBoard() {
     return () => source.close();
   }, [refreshDetail, refreshWorkers]);
 
+  // Hold: pause without ending — the honest middle ground before Stop.
+  const holdWorker = useCallback(
+    async (workerId: string) => {
+      setHolding(true);
+      try {
+        const response = await fetch("/api/workers/hold", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workerId }),
+        });
+        const payload = (await response.json().catch(() => ({}))) as {
+          error?: string;
+          response?: string | null;
+        };
+        setStopNote({
+          workerId,
+          text: !response.ok
+            ? (payload.error ?? `Hold failed (${response.status}).`)
+            : payload.response
+              ? `Held. The worker's position: ${payload.response}`
+              : "Hold delivered — the worker has not acknowledged yet; its next reply will state where it is.",
+        });
+      } catch (fetchError) {
+        setStopNote({
+          workerId,
+          text: `Hold failed: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
+        });
+      } finally {
+        setHolding(false);
+      }
+      void refreshDetail(workerId);
+    },
+    [refreshDetail],
+  );
+
   const detailForSelection = detail && detail.worker.id === selectedWorkerId ? detail : null;
 
   return (
@@ -513,12 +563,14 @@ export function WorkersBoard() {
                 detail={detailForSelection}
                 now={now}
                 stopping={stopping}
+                holding={holding}
                 stopNote={
                   stopNote && stopNote.workerId === detailForSelection.worker.id
                     ? stopNote.text
                     : null
                 }
                 onStop={() => void stopWorker(detailForSelection.worker.id)}
+                onHold={() => void holdWorker(detailForSelection.worker.id)}
               />
             ) : (
               <p className="empty-note pad">

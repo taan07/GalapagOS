@@ -11,6 +11,7 @@ import { parseStatusPorcelain } from "../../core/git/parsers";
 import { oneLine } from "../../core/text";
 import type { GalapagosDb } from "../db/db";
 import {
+  amendLaneGlobs,
   createLane,
   getLane,
   laneGlobs,
@@ -120,6 +121,13 @@ type LiveEntry = {
   session: WorkerSession;
   loopDone: Promise<void>;
   stopRequested: boolean;
+  /**
+   * The live lane contract — the SAME object the session's canUseTool closes
+   * over, so a user-approved lane amendment takes effect on the next write.
+   */
+  contract: LaneContract;
+  /** One-shot waiters for the worker's next visible reply (steer-with-ack). */
+  replyWaiters: ((summary: string) => void)[];
 };
 
 /**
@@ -168,6 +176,53 @@ export function createWorkerRuntime(deps: {
   // (manager tool racing the HTTP route) must not run the audit twice and
   // duplicate attention items.
   const stopping = new Set<string>();
+  // Same-tool denial counters per live worker (loud-denial ruling): a worker
+  // silently improvising around a permission wall must become visible.
+  const denialCounts = new Map<string, Map<string, number>>();
+  const DENIAL_ATTENTION_THRESHOLD = 3;
+
+  const recordDenial = (workerId: string, projectId: string, tool: string) => {
+    const perWorker = denialCounts.get(workerId) ?? new Map<string, number>();
+    denialCounts.set(workerId, perWorker);
+    const count = (perWorker.get(tool) ?? 0) + 1;
+    perWorker.set(tool, count);
+    if (count === DENIAL_ATTENTION_THRESHOLD) {
+      createAttentionItem(db, {
+        projectId,
+        workerId,
+        kind: "tool_denied",
+        title: `Worker denied ${tool} ${count} times`,
+        detail: `The lane/tool guard denied ${tool} ${count} times in this session. The worker may be improvising around the denial — review its stream, steer it an alternative, or escalate whether ${tool} should be granted.`,
+      });
+    }
+  };
+
+  const drainReplyWaiters = (workerId: string, summary: string) => {
+    const entry = live.get(workerId);
+    if (entry && entry.replyWaiters.length > 0) {
+      const waiters = entry.replyWaiters.splice(0);
+      for (const waiter of waiters) {
+        waiter(summary);
+      }
+    }
+  };
+
+  /** Bounded wait for the worker's next visible reply; null on timeout. */
+  const awaitReply = (entry: LiveEntry, timeoutMs: number): Promise<string | null> =>
+    new Promise<string | null>((resolve) => {
+      const timer = setTimeout(() => {
+        const index = entry.replyWaiters.indexOf(waiter);
+        if (index !== -1) {
+          entry.replyWaiters.splice(index, 1);
+        }
+        resolve(null);
+      }, timeoutMs);
+      const waiter = (summary: string) => {
+        clearTimeout(timer);
+        resolve(summary);
+      };
+      entry.replyWaiters.push(waiter);
+    });
 
   const broadcastStatus = (worker: { id: string; project_id: string }) => {
     const row = getWorker(db, worker.id);
@@ -275,6 +330,7 @@ export function createWorkerRuntime(deps: {
           break;
         case "assistant":
           persistEvent(worker, "assistant", event.payload, oneLine(event.payload.text));
+          drainReplyWaiters(workerId, oneLine(event.payload.text, 400));
           break;
         case "tool_use": {
           // Write/Edit inputs can carry whole files; the worktree already
@@ -318,6 +374,12 @@ export function createWorkerRuntime(deps: {
             // doctrine, a stated blocker or question — the worker is waiting
             // on its manager, not resting.
             setStatus(worker, parseStatus === "missing" ? "awaiting_input" : "idle");
+            drainReplyWaiters(
+              workerId,
+              event.payload.resultText
+                ? oneLine(event.payload.resultText, 400)
+                : "(turn ended without text)",
+            );
           }
           break;
         case "error": {
@@ -561,6 +623,9 @@ export function createWorkerRuntime(deps: {
         );
       }
 
+      // One shared contract object: the session's canUseTool closes over it,
+      // so an approved amend_lane mutation applies to the very next write.
+      const contract: LaneContract = { allowedGlobs, forbiddenGlobs };
       let session: WorkerSession;
       try {
         session = sessionFactory({
@@ -577,7 +642,8 @@ export function createWorkerRuntime(deps: {
           }),
           briefText: input.brief,
           model: input.model?.trim() || config.workerModel,
-          lane: { allowedGlobs, forbiddenGlobs },
+          lane: contract,
+          onToolDenied: (tool) => recordDenial(worker.id, project.id, tool),
         });
       } catch (error) {
         await removeWorktree({
@@ -591,7 +657,7 @@ export function createWorkerRuntime(deps: {
         );
       }
       const loopDone = consumeSession(worker.id, session);
-      live.set(worker.id, { session, loopDone, stopRequested: false });
+      live.set(worker.id, { session, loopDone, stopRequested: false, contract, replyWaiters: [] });
 
       return {
         ok: true,
@@ -743,6 +809,7 @@ required.`;
           briefText,
           model: config.workerModel,
           lane: contract,
+          onToolDenied: (tool) => recordDenial(worker.id, project.id, tool),
         });
       } catch (error) {
         persistEvent(worker, "error", {
@@ -756,7 +823,7 @@ required.`;
         };
       }
       const loopDone = consumeSession(worker.id, session);
-      live.set(worker.id, { session, loopDone, stopRequested: false });
+      live.set(worker.id, { session, loopDone, stopRequested: false, contract, replyWaiters: [] });
 
       return {
         ok: true,
@@ -770,7 +837,17 @@ required.`;
       };
     },
 
-    steer(workerId: string, message: string): { ok: true } | { ok: false; reason: string } {
+    /**
+     * Inject a message mid-run. With awaitResponse (steer-with-acknowledgment,
+     * user-confirmed ruling) the call waits — bounded — for the worker's next
+     * visible reply so the manager catches misinterpretation in the same
+     * turn; on timeout it reports "delivered, no response yet" honestly.
+     */
+    async steer(
+      workerId: string,
+      message: string,
+      options: { awaitResponse?: boolean; timeoutMs?: number } = {},
+    ): Promise<{ ok: true; response: string | null } | { ok: false; reason: string }> {
       const worker = getWorker(db, workerId);
       if (!worker) {
         return { ok: false, reason: `No worker with id ${workerId}.` };
@@ -800,7 +877,132 @@ required.`;
       }
       persistEvent(worker, "steer", { text: message });
       setStatus(worker, "running");
-      return { ok: true };
+
+      if (!options.awaitResponse) {
+        return { ok: true, response: null };
+      }
+      const response = await awaitReply(entry, options.timeoutMs ?? 60_000);
+      return { ok: true, response };
+    },
+
+    /**
+     * Hold (user-confirmed ruling): the brake that is not a Stop. A canned
+     * pause steer — the worker states where it is and waits (rendering
+     * awaiting_input by the completion contract). The lane stays active, the
+     * session stays live; release is an ordinary steer.
+     */
+    async hold(
+      workerId: string,
+      heldBy: string,
+    ): Promise<{ ok: true; response: string | null } | { ok: false; reason: string }> {
+      const worker = getWorker(db, workerId);
+      if (!worker) {
+        return { ok: false, reason: `No worker with id ${workerId}.` };
+      }
+      const entry = live.get(workerId);
+      if (!entry || worker.status === "failed" || worker.status === "stopped") {
+        return {
+          ok: false,
+          reason: `Worker ${workerId} is ${worker.status} — there is no live session to hold.`,
+        };
+      }
+      const holdMessage = `HOLD (requested by ${heldBy}): pause now. Do not start anything new and do not write further changes. Reply with ONE short message stating exactly where you are and what remains, then wait for further instructions. Do not emit a completion block.`;
+      try {
+        entry.session.send(holdMessage);
+      } catch (error) {
+        return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+      }
+      persistEvent(worker, "steer", { text: holdMessage, hold: true, heldBy });
+      const response = await awaitReply(entry, 60_000);
+      return { ok: true, response };
+    },
+
+    /**
+     * Apply a user-APPROVED lane amendment (the approval gate lives in the
+     * amend_lane tool — the runtime only ever applies what the user allowed):
+     * widen the lane through the same exclusivity gate a spawn passes, record
+     * the amendment on the lane row and brief record, tell the worker.
+     */
+    async applyLaneAmendment(input: {
+      project: ProjectRow;
+      workerId: string;
+      addGlobs: string[];
+      reason: string;
+      approvedBy: string;
+    }): Promise<{ ok: true; allowedGlobs: string[] } | { ok: false; reason: string }> {
+      const { project } = input;
+      const worker = getWorker(db, input.workerId);
+      if (!worker) {
+        return { ok: false, reason: `No worker with id ${input.workerId}.` };
+      }
+      const entry = live.get(input.workerId);
+      if (!entry || worker.status === "failed" || worker.status === "stopped") {
+        return {
+          ok: false,
+          reason: `Worker ${input.workerId} is ${worker.status} — amend lanes only on live workers (resume first).`,
+        };
+      }
+      const lane = getLane(db, worker.lane_id);
+      if (!lane) {
+        return { ok: false, reason: `Worker ${input.workerId} has no lane row.` };
+      }
+      const addGlobs = input.addGlobs.map((glob) => glob.trim()).filter(Boolean);
+      if (addGlobs.length === 0) {
+        return { ok: false, reason: "An amendment needs at least one glob to add." };
+      }
+
+      // The SAME exclusivity gate a spawn passes: the widened lane must not
+      // overlap any other active lane.
+      for (const active of listActiveLanes(db, project.id)) {
+        if (active.id === lane.id) {
+          continue;
+        }
+        const overlap = findLaneOverlap(addGlobs, laneGlobs(active).allowedGlobs);
+        if (overlap) {
+          return {
+            ok: false,
+            reason: `Amendment rejected: "${overlap.candidateGlob}" overlaps "${overlap.existingGlob}" of active lane "${active.name}". Lanes stay exclusive — stop that worker first or scope differently.`,
+          };
+        }
+      }
+
+      const current = laneGlobs(lane);
+      const merged = [...current.allowedGlobs, ...addGlobs.filter((glob) => !current.allowedGlobs.includes(glob))];
+      amendLaneGlobs(db, lane.id, merged);
+      // Mutate the live contract object the session's canUseTool closes over.
+      entry.contract.allowedGlobs.length = 0;
+      entry.contract.allowedGlobs.push(...merged);
+
+      // The brief record carries the amendment — the lane contract's paper
+      // trail stays in the target repo's history.
+      if (worker.brief_record_id) {
+        try {
+          const store = createRecordsStore(project.root_path, project.slug);
+          store.update({
+            id: worker.brief_record_id,
+            note: `Lane amended (approved by ${input.approvedBy}): allowed globs now ${merged.join(", ")}. Reason: ${input.reason}`,
+          });
+          await commitRecords(
+            project.root_path,
+            `galapagos(records): lane amendment for ${lane.slug}`,
+          );
+        } catch {
+          // The amendment itself stands; the record note is best-effort and
+          // the next distill commit will carry any pending record changes.
+        }
+      }
+
+      const notice = `LANE AMENDED (approved by ${input.approvedBy}): your allowed globs are now: ${merged.join(", ")}. Reason: ${input.reason}. The forbidden globs are unchanged.`;
+      try {
+        entry.session.send(notice);
+      } catch (error) {
+        return {
+          ok: false,
+          reason: `Amendment applied but the worker could not be told: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      persistEvent(worker, "steer", { text: notice, laneAmendment: { addGlobs } });
+      return { ok: true, allowedGlobs: merged };
     },
 
     async stop(

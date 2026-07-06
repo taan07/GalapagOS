@@ -1,7 +1,112 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { ChatItem, RebriefView } from "./types";
+import type { ChatItem, DecisionView, RebriefView } from "./types";
+
+/**
+ * A decision Darwin put to the user: clickable options with practical
+ * implications, always a free-text field (user-confirmed 2026-07-05).
+ * Single-select answers on click; multi-select collects then submits.
+ */
+function DecisionPrompt({
+  decision,
+  disabled,
+  onAnswer,
+}: {
+  decision: DecisionView;
+  disabled: boolean;
+  onAnswer: (selections: string[], custom: string) => void;
+}) {
+  const [picked, setPicked] = useState<string[]>([]);
+  const [custom, setCustom] = useState("");
+  const [sending, setSending] = useState(false);
+
+  if (decision.status !== "pending") {
+    const outcome =
+      decision.status === "answered"
+        ? [
+            decision.selections.length > 0 ? `Chose: ${decision.selections.join("; ")}` : null,
+            decision.custom ? `Note: ${decision.custom}` : null,
+          ]
+            .filter(Boolean)
+            .join(" · ") || "Answered without a selection"
+        : decision.status === "timeout"
+          ? "Not answered in time — Darwin treats it as deferred"
+          : decision.status === "expired"
+            ? "Expired (the daemon restarted before an answer)"
+            : "Interrupted before an answer";
+    return (
+      <div className="decision settled">
+        <div className="decision-question">{decision.question}</div>
+        <div className="decision-outcome">{outcome}</div>
+      </div>
+    );
+  }
+
+  const submit = (selections: string[]) => {
+    setSending(true);
+    onAnswer(selections, custom.trim());
+  };
+
+  return (
+    <div className="decision">
+      <div className="decision-question">{decision.question}</div>
+      <div className="decision-options">
+        {decision.options.map((option) => {
+          const selected = picked.includes(option.label);
+          return (
+            <button
+              key={option.label}
+              className={`decision-option${selected ? " selected" : ""}`}
+              disabled={disabled || sending}
+              onClick={() => {
+                if (decision.multiSelect) {
+                  setPicked((current) =>
+                    selected
+                      ? current.filter((label) => label !== option.label)
+                      : [...current, option.label],
+                  );
+                } else {
+                  submit([option.label]);
+                }
+              }}
+            >
+              <span className="decision-label">{option.label}</span>
+              <span className="decision-implication">{option.implication}</span>
+            </button>
+          );
+        })}
+      </div>
+      <div className="decision-custom">
+        <input
+          value={custom}
+          placeholder="Add a note, or answer in your own words…"
+          disabled={disabled || sending}
+          onChange={(event) => setCustom(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !decision.multiSelect && custom.trim()) {
+              event.preventDefault();
+              submit([]);
+            }
+          }}
+        />
+        {decision.multiSelect || decision.options.length === 0 ? (
+          <button
+            disabled={disabled || sending || (picked.length === 0 && !custom.trim())}
+            onClick={() => submit(picked)}
+          >
+            {sending ? "Sending…" : "Answer"}
+          </button>
+        ) : custom.trim() ? (
+          <button disabled={disabled || sending} onClick={() => submit([])}>
+            {sending ? "Sending…" : "Answer with note only"}
+          </button>
+        ) : null}
+      </div>
+      <div className="decision-hint">Darwin is waiting on this before continuing.</div>
+    </div>
+  );
+}
 
 export function Chat({
   items,
@@ -11,6 +116,7 @@ export function Chat({
   projectName,
   onSend,
   onClearRebrief,
+  onAnswerDecision,
 }: {
   items: ChatItem[];
   working: boolean;
@@ -19,6 +125,7 @@ export function Chat({
   projectName: string;
   onSend: (text: string) => void;
   onClearRebrief: (rebrief: RebriefView) => void;
+  onAnswerDecision: (decisionId: string, selections: string[], custom: string) => void;
 }) {
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -102,6 +209,18 @@ export function Chat({
                   )}
                 </div>
               </details>
+            );
+          }
+          if (item.kind === "decision") {
+            return (
+              <DecisionPrompt
+                key={item.decision.decisionId}
+                decision={item.decision}
+                disabled={disabled}
+                onAnswer={(selections, custom) =>
+                  onAnswerDecision(item.decision.decisionId, selections, custom)
+                }
+              />
             );
           }
           return (

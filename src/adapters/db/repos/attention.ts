@@ -12,7 +12,8 @@ export type AttentionKind =
   | "unsupported_claim"
   | "check_failed"
   | "decision_needed"
-  | "unstructured_completion";
+  | "unstructured_completion"
+  | "tool_denied";
 
 export type AttentionStatus = "open" | "resolved" | "dismissed";
 

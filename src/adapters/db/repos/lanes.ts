@@ -72,6 +72,18 @@ export function reactivateLane(db: GalapagosDb, id: string): void {
   db.prepare("UPDATE lanes SET status = 'active' WHERE id = ?").run(id);
 }
 
+/**
+ * Replace a lane's allowed globs (user-approved amendment — the gate and the
+ * overlap re-check live in the caller). The at-stop audit reads this row, so
+ * the detective layer judges against the amended contract.
+ */
+export function amendLaneGlobs(db: GalapagosDb, id: string, allowedGlobs: string[]): void {
+  db.prepare("UPDATE lanes SET allowed_globs = ? WHERE id = ?").run(
+    JSON.stringify(allowedGlobs),
+    id,
+  );
+}
+
 export function laneGlobs(lane: LaneRow): { allowedGlobs: string[]; forbiddenGlobs: string[] } {
   return {
     allowedGlobs: JSON.parse(lane.allowed_globs) as string[],

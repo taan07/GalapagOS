@@ -5,6 +5,7 @@ import type { Frontmatter } from "../../core/records/frontmatter";
 import { oneLine } from "../../core/text";
 import { laneGlobs } from "../db/repos/lanes";
 import type { ProjectRow } from "../db/repos/projects";
+import { describeOutcome, type DecisionOption, type DecisionOutcome } from "./decisions";
 import { observeGitRepository, recentLog } from "../git/runner";
 import { createRecordsStore, type RecordDoc } from "../records/store";
 import { recordAgreedSpecific } from "../records/write-through";
@@ -22,6 +23,16 @@ export type ManagerToolContext = {
    */
   workers?: WorkerRuntime;
   project?: ProjectRow;
+  /**
+   * The chat decision channel (user-confirmed 2026-07-05): put a decision to
+   * the user as clickable options and wait. Absent outside live manager
+   * turns; tools that need approval degrade to an honest unavailable text.
+   */
+  askUser?: (
+    question: string,
+    options: DecisionOption[],
+    multiSelect: boolean,
+  ) => Promise<DecisionOutcome>;
   onToolEvent?: (event: { tool: string; summary: string; detail: string }) => void;
 };
 
@@ -389,20 +400,171 @@ export function createManagerToolServer(context: ManagerToolContext) {
       ),
       tool(
         "steer_worker",
-        "Inject a message into a running worker mid-task: course corrections, answers to its questions, added context. The worker treats it as part of the same task.",
-        { id: z.string(), message: z.string() },
-        async ({ id, message }) => {
+        "Inject a message into a running worker mid-task: course corrections, answers to its questions, added context. The worker treats it as part of the same task. By default this waits briefly for the worker's next reply so you can confirm the steer was understood — check the reply before telling the user it landed.",
+        {
+          id: z.string(),
+          message: z.string(),
+          await_response: z
+            .boolean()
+            .optional()
+            .describe("Wait up to ~60s for the worker's reply (default true)"),
+        },
+        async ({ id, message, await_response }) => {
           const bridge = requireWorkers();
           if (!bridge) {
             return text("Worker control is not available in this context.");
           }
-          const outcome = bridge.workers.steer(id, message);
+          const outcome = await bridge.workers.steer(id, message, {
+            awaitResponse: await_response ?? true,
+          });
           if (!outcome.ok) {
             emit("steer_worker", `steer failed for ${id}`, outcome.reason);
             return text(`Steer failed: ${outcome.reason}`);
           }
+          if (outcome.response !== null) {
+            emit("steer_worker", `steered worker ${id.slice(0, 8)} — it replied`, `${message}\n\n↳ ${outcome.response}`);
+            return text(`Message delivered. The worker's reply: ${outcome.response}`);
+          }
           emit("steer_worker", `steered worker ${id.slice(0, 8)}`, message);
-          return text(`Message delivered to worker ${id}.`);
+          return text(
+            await_response === false
+              ? `Message delivered to worker ${id}.`
+              : `Message delivered to worker ${id} — no reply within the wait window yet. Check worker_status shortly; do not assume how the steer was taken.`,
+          );
+        },
+      ),
+      tool(
+        "hold_worker",
+        "Pause a live worker WITHOUT stopping it: sends a hold instruction — the worker states exactly where it is and waits. The lane stays active and the session stays live; release it later with steer_worker ('continue'). Use this when the user wants to think or redirect without losing the session.",
+        { id: z.string() },
+        async ({ id }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const outcome = await bridge.workers.hold(id, "Darwin");
+          if (!outcome.ok) {
+            emit("hold_worker", `hold failed for ${id}`, outcome.reason);
+            return text(`Hold failed: ${outcome.reason}`);
+          }
+          emit(
+            "hold_worker",
+            `held worker ${id.slice(0, 8)}`,
+            outcome.response ?? "(no acknowledgment yet)",
+          );
+          return text(
+            outcome.response !== null
+              ? `Worker held. Its position: ${outcome.response}`
+              : "Hold delivered — the worker has not acknowledged within the wait window; check worker_status shortly.",
+          );
+        },
+      ),
+      tool(
+        "amend_lane",
+        "Widen a LIVE worker's lane mid-flight (add allowed globs) — for the moment a nearly-done task legitimately needs one file outside its lane. The amendment passes the same exclusivity gate a spawn does, and THE USER MUST APPROVE it first: this tool asks them in chat and waits. State a concrete reason; it is shown to the user verbatim.",
+        {
+          id: z.string().describe("The live worker's id"),
+          add_globs: z.array(z.string()).describe("Globs to ADD to the allowed set"),
+          reason: z.string().describe("Why the task needs this, in user terms"),
+        },
+        async ({ id, add_globs, reason }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          if (!context.askUser) {
+            return text(
+              "Lane amendments require the user's approval, and no decision channel is available in this context.",
+            );
+          }
+          const status = bridge.workers.status(id);
+          if (!status) {
+            return text(`No worker with id ${id}.`);
+          }
+          const laneName = status.lane?.name ?? "(unknown lane)";
+          const decision = await context.askUser(
+            `Darwin wants to widen worker lane "${laneName}" to also allow: ${add_globs.join(", ")}. Reason: ${reason}`,
+            [
+              {
+                label: "Allow the amendment",
+                implication: `The worker may now also change files matching ${add_globs.join(", ")} — the change is recorded and audited like everything else.`,
+              },
+              {
+                label: "Deny",
+                implication: "The lane stays as declared; the worker must finish without those files (or be stopped and re-scoped).",
+              },
+            ],
+            false,
+          );
+          if (decision.status !== "answered") {
+            emit("amend_lane", `amendment ${decision.status} for ${laneName}`, reason);
+            return text(
+              decision.status === "timeout"
+                ? "The user did not answer — the lane is UNCHANGED. Treat the amendment as deferred; do not retry without new cause."
+                : "The turn was interrupted before the user answered — the lane is UNCHANGED.",
+            );
+          }
+          const approved = decision.answer.selections.includes("Allow the amendment");
+          if (!approved) {
+            emit("amend_lane", `user denied widening ${laneName}`, decision.answer.custom || reason);
+            return text(
+              `The user DENIED the amendment${decision.answer.custom ? ` — their note: ${decision.answer.custom}` : ""}. The lane is unchanged; adjust the plan accordingly.`,
+            );
+          }
+          const outcome = await bridge.workers.applyLaneAmendment({
+            project: bridge.project,
+            workerId: id,
+            addGlobs: add_globs,
+            reason,
+            approvedBy: "the user (in chat)",
+          });
+          if (!outcome.ok) {
+            emit("amend_lane", `amendment failed for ${laneName}`, outcome.reason);
+            return text(`The user approved, but the amendment failed: ${outcome.reason}`);
+          }
+          emit(
+            "amend_lane",
+            `lane "${laneName}" widened (user-approved)`,
+            `now allows: ${outcome.allowedGlobs.join(", ")}\nreason: ${reason}`,
+          );
+          return text(
+            `Amendment applied with the user's approval. Lane "${laneName}" now allows: ${outcome.allowedGlobs.join(", ")}. The worker has been told.${decision.answer.custom ? ` User note: ${decision.answer.custom}` : ""}`,
+          );
+        },
+      ),
+      tool(
+        "ask_user",
+        "Put a REAL decision to the user as clickable options in the chat, and wait for the answer. Use for decisions that change what gets built or how — never for things you can decide at your altitude, and never re-ask what records already answer. Word each option practically and give its implication in product terms; the user always gets a free-text field too. Your turn pauses until they answer (or a 10-minute timeout).",
+        {
+          question: z.string().describe("The decision, phrased concretely"),
+          options: z
+            .array(
+              z.object({
+                label: z.string().describe("Short choice text (1-6 words)"),
+                implication: z
+                  .string()
+                  .describe("What choosing this means in practice, in product terms"),
+              }),
+            )
+            .max(6)
+            .optional()
+            .describe("2-6 choices; omit for a pure free-text question"),
+          multi_select: z
+            .boolean()
+            .optional()
+            .describe("Allow choosing several options (default false)"),
+        },
+        async ({ question, options, multi_select }) => {
+          if (!context.askUser) {
+            return text("The decision channel is not available in this context — ask in plain chat text instead.");
+          }
+          const decision = await context.askUser(question, options ?? [], multi_select ?? false);
+          emit(
+            "ask_user",
+            decision.status === "answered" ? "the user decided" : `question ${decision.status}`,
+            `${question}\n↳ ${describeOutcome(decision)}`,
+          );
+          return text(describeOutcome(decision));
         },
       ),
       tool(
