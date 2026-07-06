@@ -51,12 +51,22 @@ export function ConfidenceGauge({
     return bar;
   }
 
+  // A dip right after completion is the system WORKING — the judgment legs
+  // are in flight (or their verdicts expired). Label it as process so
+  // honest fluctuation never reads as instability.
+  const reviewing = report.caps.some(
+    (cap) =>
+      (cap.leg === "watchdog" || cap.leg === "critic") &&
+      (cap.id.endsWith(".pending") || cap.id.endsWith(".stale")),
+  );
+
   const binding = report.caps[0];
   return (
     <div className="confidence-block">
       <div className="confidence-head">
         <span className="confidence-label">{label}</span>
         {bar}
+        {reviewing ? <span className="gauge-reviewing">reviewing…</span> : null}
       </div>
       <div className="confidence-reason">{report.stateReason}</div>
       <details className="chip confidence-debug">

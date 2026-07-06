@@ -97,6 +97,37 @@ You are a fresh implementer picking up Galapagos after Chunk 4. Read
 override everything, including this handoff. Then implement
 `docs/chunks/5.md`.
 
+## The user's framing: clarity and confidence dictate each other (stated 2026-07-05 — build to this)
+
+A misconception got corrected late in chunk 4, and it reshapes what
+chunk 5 is FOR. The user had assumed the confidence bar WAS clarity —
+"the agent is confident in the idea and understands what the user wants,
+with the context provided." Chunk 4's build made plain it is not: the
+gauge is external verification, "outside monitors' fluctuating proof of
+the agent's actions." The user's ruling on seeing that: **the proofs and
+the clarity of understanding the intended vision go hand in hand — their
+success is dictated by each other.** They are coupled concerns, not
+separate instruments:
+
+- **Clarity bounds confidence.** Verification quality is capped by brief
+  and record quality: the critic judges the diff against the brief and
+  the agreed specifics, so a vibes-brief can only ever produce weak
+  critique — the gauge of a poorly-briefed worker is structurally less
+  meaningful, and that should be VISIBLE. A worker's clarity (does its
+  brief cite recorded specifics? do open_question records overlap its
+  lane?) belongs in view NEXT TO its confidence gauge — and, pending new
+  §9 gold scenarios agreed with the user in-session, as a facts-leg
+  input to worker confidence itself.
+- **Confidence feeds clarity back.** A critic rejection or a
+  contradicted claim is not just a work defect — it is evidence the idea
+  was never truly shared. The clarity view should surface fresh
+  rejections/contradictions as understanding-gap rows with their
+  evidence linked; the natural durable record for a gap is an
+  open_question (no new record types).
+- **What survives from the old framing:** the gauge still never takes
+  confident-sounding prose as input. The coupling flows through records
+  and evidence — never through vibes.
+
 ## Branch state — read this before writing code (updated 2026-07-05)
 
 - Chunk 2 COMPLETE and merged to main (b40e22e).

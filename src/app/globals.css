@@ -1191,3 +1191,11 @@ select:focus {
 .breakdown-leg:first-of-type {
   border-top: none;
 }
+
+/* Pending/expired judgment-leg verdicts: the dip is process, not instability. */
+.gauge-reviewing {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+  white-space: nowrap;
+}
