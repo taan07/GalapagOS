@@ -31,7 +31,11 @@ evidence_runs per architecture §3); per-project records in each target
 repo's docs/galapagos/; Darwin's tools: git_truth, record_specific,
 list_specifics, read_records, write_record, update_record, spawn_worker,
 resume_worker (continue stopped work in the same worktree — user-confirmed
-ruling), steer_worker, stop_worker, list_workers, worker_status; workers run in
+ruling), steer_worker (waits bounded for the worker's reply), hold_worker
+(pause without ending), stop_worker, amend_lane (user-approval-gated lane
+widening), list_workers, worker_status, ask_user (chat decision prompts —
+clickable options + free text, turn waits; 10-min timeout = deferral);
+workers run in
 worktrees under <GALAPAGOS_STATE_DIR>/worktrees/<project-slug>/<lane-slug>/
 on branches galapagos/worker/<lane-slug>, streaming-input query() with
 canUseTool lane guard (preventive; Bash bypass documented), every message
@@ -117,8 +121,15 @@ escalating only direction calls; (2) every manager turn starts with a
 deterministic LLM-free fleet snapshot from SQLite; (3) Darwin can see
 evidence before he speaks — run_checks (already in your brief) plus a
 bounded worker_diff, and a doctrine line that he may read worker worktrees
-read-only. The review's Tier 2/3 items are ruling-gated — build none of
-them without a user-confirmed stamp.
+read-only. The review's rulings all landed 2026-07-05 (see the review's Rulings
+section): steer-ack, hold, loud denials, the ask_user decision channel,
+and user-gated amend_lane are BUILT on the chunk-3 branch; malformed-
+retry, deferred spawns, and any merge_worker are REJECTED (merging is
+permanently human — architecture §6); quick_task and the garage are
+stamped roadmap, not built. Your triage's ask_user escalation should use
+the SAME decision mechanism (src/adapters/agent/decisions.ts) rather than
+inventing another channel, and tool_denied attention items now exist as a
+monitor/confidence input.
 
 ## What Chunk 3 added (concrete map)
 

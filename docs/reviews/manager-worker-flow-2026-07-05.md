@@ -190,6 +190,25 @@ Everything that exists today to make Darwin's brief efficient:
 (structured fields, spawn-plan gate, memory-fed briefs) — the
 brief-quality track owns those.
 
+## Rulings (user-confirmed 2026-07-05, same day)
+
+- **Tier 2:** steer-acknowledgment, hold semantics, and loud denial
+  patterns — BUILD (built on the chunk-3 branch). Malformed-report
+  auto-retry — REJECTED (a malformed block stays an immediate attention
+  item).
+- **T3-8 amend_lane:** YES, with a stronger gate than proposed — the USER
+  approves every amendment via an accept/deny prompt in the manager chat.
+  This ruling also created the general chat decision mechanism (`ask_user`:
+  single/multi choice, practical implications per option, always a
+  free-text field) — the questionnaire the user asked for by analogy to
+  Codex/Claude Desktop.
+- **T3-9 merge_worker:** REJECTED permanently — merging stays human.
+  Darwin's completion duty is branch name + honest evidence summary.
+- **T3-10 deferred spawn queue:** REJECTED.
+- **T3-11 quick_task, T3-12 the garage:** accepted as stamped roadmap
+  items, not built yet.
+- Tier 1 routing to chunk 4 stands unchanged.
+
 ## Routing
 
 | Item | Route |

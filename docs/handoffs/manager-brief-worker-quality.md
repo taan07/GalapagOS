@@ -55,6 +55,11 @@ Build (four levers, in order):
    or amend. USER RULING NEEDED before building: hard confirm gate
    (Darwin waits for an explicit yes), soft gate (proceeds next turn
    unless stopped), or plan shown only for non-trivial spawns?
+   (NOTE, added 2026-07-05 by the chunk-3 session: the blocking chat
+   decision mechanism you would need for a hard gate now EXISTS —
+   src/adapters/agent/decisions.ts + the ask_user tool + the amend_lane
+   gate as a worked example. If the ruling is a hard/soft gate, build on
+   that broker; do not invent a second channel.)
    Interrogate the user, then stamp the ruling in this doc. The
    interrogation doctrine extends from recording to routing: vague
    request → sharp questions ONLY where genuinely underspecified → plan

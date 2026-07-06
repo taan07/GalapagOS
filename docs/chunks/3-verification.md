@@ -258,6 +258,68 @@ missing.
 
 ---
 
+# Round 3 — the decision channel and worker dexterity (2026-07-05)
+
+Pull, `npm install && npm test` (expect 130/130), restart `npm run dev`,
+confirm `/health` shows your revision. Then:
+
+## R3-1. The questionnaire (ask_user)
+
+Tell Darwin something that forces a real fork, e.g.:
+
+> I want the notes page to support sorting — you pick what matters, but
+> ask me anything that changes the product.
+
+- [ ] A decision card appears IN CHAT: clickable options, each with a
+      practical implication, plus a free-text field. Darwin's turn waits.
+- [ ] Click an option (or type a note) — Darwin continues in the same
+      turn, acts on the answer, and records it (record_specific chip).
+- [ ] Reload the page mid-decision: the card re-renders and still answers.
+- [ ] Let one time out (10 min) or triple-Esc: the card settles honestly
+      ("deferred"/"interrupted") and Darwin does NOT guess.
+
+## R3-2. The amendment gate (amend_lane)
+
+Spawn a worker on a narrow lane, then mid-task tell Darwin the task also
+needs one file outside it (or engineer the brief so the worker asks).
+
+- [ ] Darwin proposes the amendment via an accept/deny card naming the
+      globs and his reason — NOTHING changes until you click.
+- [ ] Accept: the drilldown shows the "LANE AMENDED" steer, the worker can
+      now edit the file, and the worker_brief record on /records carries
+      the approved-by note.
+- [ ] Deny one too: the lane stays unchanged and Darwin adjusts the plan.
+
+## R3-3. Hold, then release
+
+While a worker runs, click **Hold** in its drilldown (or ask Darwin to
+hold it).
+
+- [ ] The worker replies with exactly where it is; pill turns
+      `awaiting input`; the lane stays active (an overlapping spawn is
+      still refused).
+- [ ] Ask Darwin to continue it — an ordinary steer releases it. No stop,
+      no audit, no attention items.
+
+## R3-4. Steer acknowledgment
+
+Ask Darwin to steer a busy worker with a change of direction.
+
+- [ ] Darwin's steer chip shows the worker's REPLY (or an honest "no
+      response within the wait window"), and what he tells you reflects
+      the reply, not just "delivered".
+
+## R3-5. Loud denials
+
+Brief a worker to attempt WebSearch three times (a drill brief may say so
+explicitly).
+
+- [ ] The stream shows each denial; after the third, ONE `tool_denied`
+      attention row exists (`sqlite3 ~/.galapagos/state.db "SELECT kind,
+      title FROM attention_items WHERE kind='tool_denied'"`).
+
+---
+
 **All of round 2 passes →** flip the stamp in `docs/chunks/3.md` to
 COMPLETE. Every decision in the stamp is now user-ruled. Then delete
 `~/Dev/chunk3-drill` and its state rows if you want, and the branch merges
