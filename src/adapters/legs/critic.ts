@@ -150,10 +150,23 @@ export async function runCriticReview(input: {
   digestId: string;
 }): Promise<{ ran: boolean; error: string | null }> {
   const { db, config, project, worker } = input;
+  // The judged state goes in the PAYLOAD, before the run — a FAILED run
+  // records what it failed against, so the leg re-arms when the workspace
+  // or the evidence pool moves (coverage audit 2026-07-05).
+  let payloadKey = "unobservable";
+  try {
+    payloadKey = (await observeWorkspaceEvidence(worker.worktree_path)).key;
+  } catch {
+    // Key stays "unobservable"; the run below fails loudly on its own.
+  }
   const job = createJob(db, "critic", {
     workerId: worker.id,
     digestId: input.digestId,
     projectId: project.id,
+    evidenceKey: payloadKey,
+    runsKey: evidenceRunsKey(
+      latestRunsByKey(db, { projectId: project.id, workerId: worker.id }),
+    ),
   });
   startJob(db, job.id);
 
@@ -207,6 +220,7 @@ export async function runCriticReview(input: {
       agreedSpecifics,
       evidenceSummary,
       diffText,
+      changedFiles: changedPaths,
       referenceTests,
     });
 

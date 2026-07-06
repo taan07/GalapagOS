@@ -485,6 +485,92 @@ test("a new evidence run stales the critic verdict and re-arms the review (found
   );
 });
 
+test("a failed leg run re-arms on a new digest or a moved workspace (coverage audit: no permanent poisoning)", async () => {
+  const { db, workerId, worktree, monitor, legRuns } = await fixture();
+  setStatus(db, workerId, "idle");
+  const worker = getWorker(db, workerId);
+  assert.ok(worker);
+  createCompletionDigest(db, {
+    workerId,
+    narrative: "done",
+    beforeAfter: [],
+    claims: [],
+    touchedAreas: [],
+  });
+
+  // A FAILED watchdog job at the current workspace state (transient auth
+  // blip). Payload carries what it failed against.
+  const workspace = await observeWorkspaceEvidence(worktree);
+  const failedJob = createJob(db, "watchdog", {
+    workerId,
+    digestId: latestDigestForWorker(db, workerId)?.id,
+    projectId: worker.project_id,
+    evidenceKey: workspace.key,
+  });
+  startJob(db, failedJob.id);
+  db.prepare("UPDATE jobs SET status = 'failed', error = 'not logged in' WHERE id = ?").run(
+    failedJob.id,
+  );
+
+  await monitor.tick();
+  assert.equal(
+    legRuns.filter((entry) => entry.startsWith("watchdog")).length,
+    0,
+    "same state: the failure is honored, not self-retried",
+  );
+
+  // The workspace moves — the failure must not outlive what it judged.
+  writeFileSync(path.join(worktree, "src", "auth", "more.ts"), "// new work\n");
+  await monitor.tick();
+  await settleLegs();
+  assert.equal(
+    legRuns.filter((entry) => entry.startsWith("watchdog")).length,
+    1,
+    "moved workspace re-arms the failed leg",
+  );
+});
+
+test("a completion claiming only soft evidence still surfaces its missing required checks (coverage audit)", async () => {
+  const { db, workerId, worktree, monitor, triaged, clock } = await fixture();
+  setStatus(db, workerId, "idle");
+  const worker = getWorker(db, workerId);
+  assert.ok(worker);
+  createCompletionDigest(db, {
+    workerId,
+    narrative: "done, looks great",
+    beforeAfter: [],
+    claims: [{ text: "eyeballed it", evidence_kind: "manual", files: [] }],
+    touchedAreas: [],
+  });
+
+  await monitor.tick();
+  const items = listWorkerAttentionItems(db, workerId).filter((i) => i.kind === "check_failed");
+  assert.equal(items.length, 1, "the blocked-but-silent completion reaches the queue");
+  assert.equal(items[0]?.priority, "high");
+  assert.match(items[0]?.detail ?? "", /typecheck, test|test, typecheck/);
+  // …which is exactly what makes triage fire for it.
+  clock.now = new Date(clock.now.getTime() + 1000);
+  await monitor.tick();
+  assert.ok(triaged.length >= 1, "triage now has a reason to run the checks");
+
+  // Evidence arrives → the item resolves itself.
+  const workspace = await observeWorkspaceEvidence(worktree);
+  for (const key of ["typecheck", "test"] as const) {
+    createEvidenceRun(db, {
+      projectId: worker.project_id,
+      workerId,
+      checkKey: key,
+      status: "passed",
+      summary: "passed",
+      headSha: workspace.key,
+    });
+  }
+  await monitor.tick();
+  const after = listWorkerAttentionItems(db, workerId).filter((i) => i.kind === "check_failed");
+  assert.equal(after[0]?.status, "resolved");
+  assert.match(after[0]?.detail ?? "", /Every required check now passes/);
+});
+
 test("a critic rejection raises a high-priority integrity alert naming the blocker", async () => {
   const { db, workerId, monitor, legs } = await fixture();
   setStatus(db, workerId, "idle");

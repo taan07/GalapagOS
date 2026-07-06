@@ -121,6 +121,7 @@ const STOPPABLE: readonly WorkerView["status"][] = [
 function Drilldown({
   detail,
   confidence,
+  computedAt,
   now,
   stopping,
   stopNote,
@@ -128,6 +129,7 @@ function Drilldown({
 }: {
   detail: WorkerDetailView;
   confidence: WorkerConfidenceView | null;
+  computedAt: string | null;
   now: number;
   stopping: boolean;
   stopNote: string | null;
@@ -162,7 +164,11 @@ function Drilldown({
       {stopNote ? <div className="stop-note">{stopNote}</div> : null}
 
       {confidence ? (
-        <ConfidenceGauge report={confidence.report} label="worker confidence" />
+        <ConfidenceGauge
+          report={confidence.report}
+          label="worker confidence"
+          {...(computedAt ? { computedAt } : {})}
+        />
       ) : null}
 
       <div className="lane-contract">
@@ -559,6 +565,7 @@ export function WorkersBoard() {
               <Drilldown
                 detail={detailForSelection}
                 confidence={confidenceByWorker.get(detailForSelection.worker.id) ?? null}
+                computedAt={confidence?.computedAt ?? null}
                 now={now}
                 stopping={stopping}
                 stopNote={

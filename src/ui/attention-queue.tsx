@@ -16,6 +16,7 @@ const KIND_LABEL: Record<string, string> = {
   decision_needed: "decision needed",
   unstructured_completion: "unstructured completion",
   worker_failed: "worker failed",
+  integrity_alert: "integrity alert",
 };
 
 function QueueRow({

@@ -88,11 +88,45 @@ test("skips and assertion deletion scale from warn to alert by volume", () => {
 
 test("editing both code and its judging tests is a warn, tests alone are not", () => {
   assert.deepEqual(
-    ids([file("src/auth/login.ts", ["x"]), file("tests/login.test.ts", ["expect(1).toBe(1)"])]),
+    ids([
+      file("src/auth/login.ts", ["x"]),
+      file("tests/login.test.ts", ["expect(result).toBe(2)"]),
+    ]),
     ["warn:judge-tests-edited"],
   );
-  assert.deepEqual(ids([file("tests/login.test.ts", ["expect(1).toBe(1)"])]), []);
+  assert.deepEqual(ids([file("tests/login.test.ts", ["expect(result).toBe(2)"])]), []);
   assert.deepEqual(ids([file("src/auth/login.ts", ["const x = 1;"])]), []);
+});
+
+test("focus markers and junk assertions are caught (adversarial review C3/H4)", () => {
+  assert.deepEqual(ids([file("tests/a.test.ts", ["describe.only('x', () => {})"])]), [
+    "alert:tests-focused",
+  ]);
+  assert.deepEqual(ids([file("tests/a.test.ts", ["fit('y', () => {})"])]), [
+    "alert:tests-focused",
+  ]);
+  // Deleting a real assertion while adding literal-equals-itself junk: the
+  // net count stays flat, but the junk itself is now flagged.
+  assert.deepEqual(
+    ids([file("tests/a.test.ts", ["expect(true).toBe(true)"], ["expect(sum(2,2)).toBe(4)"])]),
+    ["warn:trivial-assertions"],
+  );
+});
+
+test("check-script indirection targets are machinery (adversarial review C2)", () => {
+  const changed = [file("scripts/run-tests.sh", ["exit 0"])];
+  assert.deepEqual(detectTripwires(changed), [], "unknown without context");
+  const findings = detectTripwires(changed, {
+    checkScriptTargets: ["scripts/run-tests.sh"],
+  });
+  assert.deepEqual(
+    findings.map((f) => `${f.severity}:${f.id}`),
+    ["alert:check-script-target-modified"],
+  );
+  // Makefile-style indirection is machinery outright.
+  assert.deepEqual(ids([file("Makefile", ["test:", "\ttrue"])]), [
+    "alert:check-machinery-modified",
+  ]);
 });
 
 test("test-path classification covers the common conventions", () => {
@@ -143,6 +177,32 @@ test("parseUnifiedDiff splits added/removed lines per file, handling renames and
   assert.equal(files[1]?.path, "new.ts");
   assert.deepEqual(files[1]?.addedLines, ["renamed content"]);
   assert.ok(files[2]?.addedLines.includes("accent"));
+});
+
+test("content lines starting ++/-- cannot hijack the file path (adversarial review M9)", () => {
+  // An ADDED line whose content begins "++ " renders as "+++ …" in the
+  // diff; inside a hunk it must stay content, not become a header that
+  // detaches the malicious hunk from conftest.py.
+  const diff = [
+    "diff --git a/conftest.py b/conftest.py",
+    "--- a/conftest.py",
+    "+++ b/conftest.py",
+    "@@ -1 +1,3 @@",
+    "+++ innocent-looking",
+    "+import sys",
+    "--- also content",
+    "-real_removed()",
+  ].join("\n");
+  const files = parseUnifiedDiff(diff);
+  assert.equal(files.length, 1);
+  assert.equal(files[0]?.path, "conftest.py");
+  assert.deepEqual(files[0]?.addedLines, ["++ innocent-looking", "import sys"]);
+  assert.deepEqual(files[0]?.removedLines, ["-- also content", "real_removed()"]);
+  // And the machinery detector therefore still fires on the real path.
+  assert.deepEqual(
+    detectTripwires(files).map((f) => f.id),
+    ["check-machinery-modified"],
+  );
 });
 
 test("the adapter sees committed, uncommitted, and untracked changes alike", async () => {

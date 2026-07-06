@@ -55,6 +55,37 @@ export async function collectChangedFileDiffs(
   return files;
 }
 
+/**
+ * Files the check scripts execute through: path-looking tokens in the
+ * worktree package.json's check script values (e.g. "bash scripts/tests.sh"
+ * → scripts/tests.sh). Editing an indirection target can fake any pass
+ * without touching package.json (adversarial review 2026-07-05, C2). One
+ * level deep only — a script calling a script stays a documented limit the
+ * critic and watchdog cover.
+ */
+export function extractCheckScriptTargets(worktreePath: string): string[] {
+  let scripts: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(
+      readFileSync(path.join(worktreePath, "package.json"), "utf8"),
+    ) as { scripts?: Record<string, unknown> };
+    scripts = parsed.scripts ?? {};
+  } catch {
+    return [];
+  }
+  const targets = new Set<string>();
+  for (const key of ["typecheck", "lint", "test", "build"]) {
+    const value = scripts[key];
+    if (typeof value !== "string") {
+      continue;
+    }
+    for (const token of value.match(/[A-Za-z0-9_@./-]+\.(?:sh|bash|[cm]?js|ts|py|rb|go|pl)\b/g) ?? []) {
+      targets.add(token.replace(/^\.\//, ""));
+    }
+  }
+  return Array.from(targets);
+}
+
 export type TripwireResult =
   | { available: true; tripwires: TripwireFinding[] }
   | { available: false; reason: string };
@@ -66,7 +97,12 @@ export async function runTripwires(
 ): Promise<TripwireResult> {
   try {
     const files = await collectChangedFileDiffs(worktreePath, baseSha);
-    return { available: true, tripwires: detectTripwires(files) };
+    return {
+      available: true,
+      tripwires: detectTripwires(files, {
+        checkScriptTargets: extractCheckScriptTargets(worktreePath),
+      }),
+    };
   } catch (error) {
     return {
       available: false,

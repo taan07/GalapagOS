@@ -20,7 +20,7 @@ import {
   type AttentionKind,
 } from "../adapters/db/repos/attention";
 import { listUnreviewedDigests, setDigestStatus } from "../adapters/db/repos/digests";
-import { listRecentJobsByKind } from "../adapters/db/repos/jobs";
+import { latestJobByPayload } from "../adapters/db/repos/jobs";
 import { getLane, laneGlobs, listActiveLanes, type LaneRow } from "../adapters/db/repos/lanes";
 import { listProjects, type ProjectRow } from "../adapters/db/repos/projects";
 import {
@@ -320,7 +320,12 @@ export function createMonitor(deps: MonitorDeps) {
               watchdogInput.verdict === "gaming"
                 ? "Watchdog: transcript shows the checks being gamed"
                 : "Watchdog: transcript is suspicious",
-            detail: watchdogInput.summary,
+            // The accusation travels WITH its proof — the verbatim quotes
+            // the no-quote-no-finding rule demanded at parse time.
+            detail: [
+              watchdogInput.summary,
+              ...watchdogInput.evidence.map((quote) => `> ${quote}`),
+            ].join("\n"),
             priority: watchdogInput.verdict === "gaming" ? "high" : "normal",
           })
         ) {
@@ -376,6 +381,42 @@ export function createMonitor(deps: MonitorDeps) {
             "Fresh evidence now supports every claim on the latest completion report (monitor).",
           );
           changed = true;
+        }
+      }
+
+      // A claimed completion whose REQUIRED checks are missing or failed is
+      // a blocked gauge nobody would otherwise be told about (coverage audit
+      // 2026-07-05: a worker claiming only manual/diff evidence raised no
+      // item, so triage never fired and the checks were never run).
+      const requiredGaps = evidence.input.checks.requiredKeys.filter((key) => {
+        const run = evidence.input.checks.runs.find((entry) => entry.key === key);
+        return !run || run.status === "failed" || !run.fresh;
+      });
+      const requiredTitle = "Completion claimed without its required checks";
+      if (requiredGaps.length > 0) {
+        if (
+          raise({
+            project,
+            workerId: worker.id,
+            kind: "check_failed",
+            title: requiredTitle,
+            detail: `Required check${requiredGaps.length === 1 ? "" : "s"} not freshly passing for this completion: ${requiredGaps.join(", ")}. Run them in the worker's worktree (run_checks) — the completion stays blocked until they pass.`,
+            priority: "high",
+          })
+        ) {
+          changed = true;
+        }
+      } else {
+        for (const item of listOpenWorkerAttentionByKind(db, worker.id, "check_failed")) {
+          if (item.title === requiredTitle) {
+            resolveAttentionItem(
+              db,
+              item.id,
+              "resolved",
+              "Every required check now passes fresh in the worker's worktree (monitor).",
+            );
+            changed = true;
+          }
         }
       }
 
@@ -441,20 +482,13 @@ export function createMonitor(deps: MonitorDeps) {
    * the run when known: items triage itself raised mid-run (ask_user) must
    * not retrigger the pass that created them. The accepted edge: a fact
    * arising during the seconds-long triage window rides along with the next
-   * genuinely new item instead of triggering its own pass.
+   * genuinely new item instead of triggering its own pass. SQL-filtered per
+   * project (coverage audit 2026-07-05) — a busy multi-project db must not
+   * scroll this project's cutoff out of a scan window.
    */
   const lastTriageCutoff = (projectId: string): string | null => {
-    for (const job of listRecentJobsByKind(db, "triage")) {
-      try {
-        const payload = JSON.parse(job.payload ?? "{}") as { projectId?: string };
-        if (payload.projectId === projectId) {
-          return job.finished_at ?? job.created_at;
-        }
-      } catch {
-        // Unparseable payload — not this project's.
-      }
-    }
-    return null;
+    const job = latestJobByPayload(db, "triage", "projectId", projectId);
+    return job ? (job.finished_at ?? job.created_at) : null;
   };
 
   const tickProject = async (project: ProjectRow): Promise<void> => {

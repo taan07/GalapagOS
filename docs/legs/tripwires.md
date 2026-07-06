@@ -17,10 +17,13 @@ guessing, runs on every monitor tick for free.
 | Tripwire | Fires when | Severity |
 | --- | --- | --- |
 | check-script-modified | package.json's test/typecheck/lint/build scripts changed | alert (blocks) |
-| check-machinery-modified | conftest.py, jest/vitest/mocha/karma config changed | alert (blocks) |
+| check-script-target-modified | a file the check scripts execute through (e.g. scripts/run-tests.sh) changed | alert (blocks) |
+| check-machinery-modified | conftest.py, jest/vitest/mocha/karma config, Makefile/justfile/Taskfile changed | alert (blocks) |
 | exit-in-tests | a hard `exit(0)` added inside test files | alert (blocks) |
 | always-equal | a custom `__eq__` returning True added anywhere | alert (blocks) |
 | tests-skipped | skip markers added to tests (≥3 escalates to alert) | warn → alert |
+| tests-focused | a .only/fit/fdescribe added — the runner silently skips every OTHER test | alert (blocks) |
+| trivial-assertions | assertions that assert nothing added (expect(true).toBe(true), assert(true)) | warn |
 | assertions-deleted | net assertion loss in tests (≥3 escalates) | warn → alert |
 | judge-tests-edited | worker changed both code AND the tests that judge it | warn |
 
@@ -31,11 +34,16 @@ points the critic's attention — editing your own tests is legitimate TDD, but
 the passing evidence is then partly self-authored, and someone independent
 should look.
 
-**Honest limits:** patterns are heuristics — a novel exploit that matches no
-pattern passes this leg silently (the watchdog and critic exist for exactly
-that reason), and an unusual-but-honest change can fire a warn (that is what
-warns are for). If the diff cannot be read at all, the leg reports
-"unavailable" and the gauge drains — it never silently reports clean.
+**Honest limits** (sharpened by the adversarial review, 2026-07-05):
+patterns are heuristics — a novel exploit that matches no pattern passes this
+leg silently, and an unusual-but-honest change can fire a warn (that is what
+warns are for). Known residual holes, deliberately left to the watchdog and
+critic: script indirection is traced ONE level (a script calling a script is
+invisible here); gutting a shared non-test helper that tests call
+(src/support/verify.ts style) fires at most the judge-tests-edited warn;
+junk assertions beyond the literal tautology patterns are semantic judgment.
+If the diff cannot be read at all, the leg reports "unavailable" and the
+gauge drains — it never silently reports clean.
 
 **Code:** `src/core/legs/tripwires.ts` (pure detection + diff parsing),
 `src/adapters/legs/tripwires.ts` (git I/O). Tests: `tests/leg-tripwires.test.ts`.

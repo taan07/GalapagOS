@@ -34,20 +34,31 @@ blockers — caps below strong at 70 until addressed), **reject** (any
 blocker: wrong behavior, faked/weakened verification, destructive change —
 caps at 40/blocked, high-priority `integrity_alert` naming the blocker).
 
-**Freshness:** verdicts are keyed to the workspace state. New commit or
-edit → the critique is stale → counts as "not yet reviewed" and the leg
-re-runs. An approval of last hour's code says nothing about this hour's.
+**Freshness:** verdicts are keyed to the workspace state AND the evidence
+pool. A new commit, an uncommitted edit (the key is content-aware — bytes,
+not line counts), or a new check run stales the critique → it counts as
+"not yet reviewed" and the leg re-runs. An approval of last hour's code — or
+of a "no evidence exists" state that evidence has since reached — says
+nothing about now. Failed runs likewise re-arm when the judged state moves.
 
 **Cost policy:** runs once per completion (and again when the workspace
 moves past a verdict) on `GALAPAGOS_CRITIC_MODEL` — default claude-haiku-4-5,
 raise it per-project for harder codebases. Failed runs are not auto-retried;
 they surface as "unavailable" and drain the gauge.
 
-**Honest limits:** a single-shot reviewer reading a bounded diff — very
-large diffs are truncated with an explicit marker (and told to say if that
-hides what it needs); it cannot execute code (the facts leg owns
-execution); and judge validity is task-dependent — the moments the user
-overrides a critic verdict are recalibration data, not noise.
+**Hardening from the adversarial review (2026-07-05):** the packet leads
+with the COMPLETE changed-file inventory (trustworthy even when content is
+truncated), truncation keeps head AND tail (content cannot be hidden by
+pushing it past a head-only cutoff), and a response with more than one
+verdict block is refused as ambiguous (a planted block in the diff must
+never win). A code-level guard on review_completion also holds the same
+bar: manager_reviewed is refused unless the required checks pass fresh —
+prose cannot talk any reviewer past the evidence.
+
+**Honest limits:** a single-shot reviewer reading a bounded diff — it
+cannot execute code (the facts leg owns execution); and judge validity is
+task-dependent — the moments the user overrides a critic verdict are
+recalibration data, not noise.
 
 **Code:** `src/core/legs/critic.ts` (rubric prompt + verdict parsing, pure),
 `src/adapters/legs/critic.ts` (blinded packet assembly, session, persistence

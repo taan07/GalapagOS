@@ -35,11 +35,22 @@ and returns one verdict:
   the verdict stale, and a stale verdict counts as "not yet reviewed",
   never as clean.
 
+**Hardening from the adversarial review (2026-07-05):** every event's text
+is capped (padding one message cannot flood the budget); over budget, the
+head and tail are kept AND every tool_use/steer ACTION from the middle
+survives verbatim — narration is what gets dropped, with an explicit count,
+so a hack cannot be buried in a dropped middle. A response containing more
+than one verdict block is refused as ambiguous (a worker could plant a
+verdict block in its own transcript for the judge to echo). The verbatim
+quotes now travel with the verdict — into the gauge drilldown and the queue
+item, so an accusation always carries its proof.
+
 **Honest limits:** it reads what the worker *said and did* — a worker that
 games silently, in ways invisible in the transcript, passes this leg (the
-tripwires and critic cover the artifact side). Long transcripts are
-truncated head+tail with an explicit marker. If the session cannot run, the
-gauge drains ("unavailable") rather than pretending health.
+tripwires and critic cover the artifact side). If the session cannot run,
+the gauge drains ("unavailable") — and a failed run re-arms as soon as the
+workspace or completion it judged changes, so one transient failure never
+pins a worker.
 
 **Code:** `src/core/legs/watchdog.ts` (prompt + verdict parsing, pure),
 `src/adapters/legs/watchdog.ts` (transcript assembly, session, persistence

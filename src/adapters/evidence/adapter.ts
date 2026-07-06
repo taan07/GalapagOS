@@ -202,6 +202,7 @@ function legInputFromJob<TResult extends { digestId: string; evidenceKey: string
   kind: "watchdog" | "critic",
   workerId: string,
   digestId: string,
+  workspaceKey: string | null,
   isFresh: (result: TResult) => boolean,
   toInput: (result: TResult, fresh: boolean) => WatchdogInput | CriticInput,
 ): WatchdogInput | CriticInput {
@@ -210,6 +211,24 @@ function legInputFromJob<TResult extends { digestId: string; evidenceKey: string
     return { status: "pending" };
   }
   if (job.status === "failed") {
+    // Not self-retried at the SAME state — but a failure must never outlive
+    // what it failed against (coverage audit 2026-07-05: one transient auth
+    // blip previously pinned the leg at "unavailable" for the worker's whole
+    // life). A new digest or a moved workspace re-arms the leg as pending.
+    try {
+      const payload = JSON.parse(job.payload ?? "{}") as {
+        digestId?: string;
+        evidenceKey?: string;
+      };
+      if (payload.digestId !== digestId) {
+        return { status: "pending" };
+      }
+      if (workspaceKey !== null && payload.evidenceKey !== workspaceKey) {
+        return { status: "pending" };
+      }
+    } catch {
+      return { status: "pending" }; // unattributable failure — re-arm
+    }
     return { status: "unavailable", reason: job.error ?? "the review run failed" };
   }
   if (job.status !== "done" || !job.result) {
@@ -327,6 +346,7 @@ export async function buildWorkerEvidence(
         "watchdog",
         worker.id,
         digest.id,
+        workspaceKey,
         (result) =>
           workspaceKey !== null &&
           result.evidenceKey === workspaceKey &&
@@ -336,6 +356,7 @@ export async function buildWorkerEvidence(
           verdict: result.verdict,
           fresh,
           summary: result.summary,
+          evidence: result.evidence,
         }),
       ) as WatchdogInput)
     : null;
@@ -345,6 +366,7 @@ export async function buildWorkerEvidence(
         "critic",
         worker.id,
         digest.id,
+        workspaceKey,
         (result) =>
           workspaceKey !== null &&
           result.evidenceKey === workspaceKey &&

@@ -458,6 +458,15 @@ test("an error result marks the worker failed and is never retried", async () =>
   await waitFor(() => getWorker(db, outcome.workerId)?.status === "failed", "worker failed");
   assert.equal(runtime.list(project.id).length, 1, "no fresh-session retry spawned");
 
+  // A mid-run death reaches the QUEUE, not just the gauge — one open
+  // worker_failed item carrying the worktree path (chunk 4 decision 6).
+  const failures = listWorkerAttentionItems(db, outcome.workerId).filter(
+    (item) => item.kind === "worker_failed",
+  );
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0]?.priority, "high");
+  assert.ok(failures[0]?.detail.includes(outcome.worktreePath), "detail names the worktree");
+
   // A failed worker cannot be steered back to life…
   const steered = runtime.steer(outcome.workerId, "keep going");
   assert.equal(steered.ok, false);

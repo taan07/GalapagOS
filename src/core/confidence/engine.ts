@@ -241,11 +241,16 @@ function scoreWatchdog(
     });
     return;
   }
+  // The proof travels with the accusation: the drilldown shows the verbatim
+  // quote the no-quote-no-finding rule demanded at parse time.
+  const quote = watchdog.verdict !== "clean" && watchdog.evidence[0]
+    ? ` — "${watchdog.evidence[0]}"`
+    : "";
   if (watchdog.verdict === "gaming") {
     caps.push({
       id: "watchdog.gaming",
       leg: "watchdog",
-      label: `The watchdog flagged the transcript for gaming the checks: ${watchdog.summary}`,
+      label: `The watchdog flagged the transcript for gaming the checks: ${watchdog.summary}${quote}`,
       capTo: WATCHDOG_GAMING_CAP,
       blocking: true,
       draining: false,
@@ -256,7 +261,7 @@ function scoreWatchdog(
     caps.push({
       id: "watchdog.suspicious",
       leg: "watchdog",
-      label: `The watchdog found the transcript suspicious: ${watchdog.summary}`,
+      label: `The watchdog found the transcript suspicious: ${watchdog.summary}${quote}`,
       capTo: WATCHDOG_SUSPICIOUS_CAP,
       blocking: false,
       draining: true,

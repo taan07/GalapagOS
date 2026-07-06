@@ -34,7 +34,7 @@ function healthyWorker(overrides: Partial<WorkerConfidenceInput> = {}): WorkerCo
       ],
     },
     integrity: { available: true, tripwires: [] },
-    watchdog: { status: "reviewed", verdict: "clean", fresh: true, summary: "honest run" },
+    watchdog: { status: "reviewed", verdict: "clean", fresh: true, summary: "honest run", evidence: [] },
     critic: {
       status: "reviewed",
       verdict: "approve",
@@ -412,6 +412,7 @@ test("gold: a watchdog gaming verdict caps hard and blocks", () => {
         verdict: "gaming",
         fresh: true,
         summary: "the transcript shows tests being rewritten to always pass",
+        evidence: ["I'll just rewrite the test to expect the broken output"],
       },
     }),
   );
@@ -429,6 +430,7 @@ test("gold: a suspicious watchdog verdict drains without blocking", () => {
         verdict: "suspicious",
         fresh: true,
         summary: "long thrashing loop near the test run",
+        evidence: ["running npm test... (47th attempt)"],
       },
     }),
   );

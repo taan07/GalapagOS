@@ -112,6 +112,39 @@ test("dirtying the tree changes the evidence key — staleness becomes detectabl
   assert.match(dirty.key, /\+dirty\./);
 });
 
+test("the evidence key is content-aware — same paths, same line counts, different bytes ≠ same key (adversarial review C1)", async () => {
+  const { project } = await fixture();
+
+  // A tracked file modified in place: one changed line vs base, both times.
+  writeFileSync(path.join(project.root_path, "package.json").replace("package.json", "swap.ts"), "");
+  const swapPath = path.join(project.root_path, "swap.ts");
+  execFileSync("git", ["add", "swap.ts"], { cwd: project.root_path });
+  execFileSync(
+    "git",
+    ["-c", "user.name=T", "-c", "user.email=t@t", "commit", "-m", "base swap"],
+    { cwd: project.root_path },
+  );
+  writeFileSync(swapPath, "export const ok = true;\n");
+  const honest = await observeWorkspaceEvidence(project.root_path);
+  // Swap the CONTENT of the same single line — status lists and numstat
+  // line counts are identical; only the bytes differ.
+  writeFileSync(swapPath, "export const ok = !!0;\n");
+  const swapped = await observeWorkspaceEvidence(project.root_path);
+  assert.notEqual(
+    swapped.key,
+    honest.key,
+    "swapping line content without changing counts must move the key",
+  );
+
+  // Untracked content: invisible to numstat entirely, must still move the key.
+  const untrackedPath = path.join(project.root_path, "untracked.ts");
+  writeFileSync(untrackedPath, "a\n");
+  const before = await observeWorkspaceEvidence(project.root_path);
+  writeFileSync(untrackedPath, "b\n");
+  const after = await observeWorkspaceEvidence(project.root_path);
+  assert.notEqual(after.key, before.key, "rewriting an untracked file must move the key");
+});
+
 test("worker-scoped and project-scoped evidence pools stay distinct", async () => {
   const { db, config, project } = await fixture();
   await runChecks({

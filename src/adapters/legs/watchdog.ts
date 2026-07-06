@@ -57,10 +57,21 @@ export async function runWatchdogReview(input: {
   digestId: string;
 }): Promise<{ ran: boolean; error: string | null }> {
   const { db, config, worker } = input;
+  // The state being judged goes in the PAYLOAD, before the run — so even a
+  // FAILED run records what it failed against, and the evidence adapter can
+  // re-arm the leg when that state moves (coverage audit 2026-07-05: a
+  // transient failure must not pin the leg at "unavailable" forever).
+  let payloadKey = "unobservable";
+  try {
+    payloadKey = (await observeWorkspaceEvidence(worker.worktree_path)).key;
+  } catch {
+    // Key stays "unobservable"; the run below will fail loudly on its own.
+  }
   const job = createJob(db, "watchdog", {
     workerId: worker.id,
     digestId: input.digestId,
     projectId: worker.project_id,
+    evidenceKey: payloadKey,
   });
   startJob(db, job.id);
 

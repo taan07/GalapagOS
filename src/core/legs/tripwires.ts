@@ -29,6 +29,11 @@ const CHECK_MACHINERY_PATTERNS: RegExp[] = [
   /(^|\/)\.mocharc(\.[a-z]+)?$/,
   /(^|\/)ava\.config\.[cm]?js$/,
   /(^|\/)karma\.conf(ig)?\.[cm]?js$/,
+  // Command indirection (adversarial review 2026-07-05, C2): checks often
+  // run through build tools whose edit can fake any pass.
+  /(^|\/)Makefile$/,
+  /(^|\/)justfile$/i,
+  /(^|\/)Taskfile\.ya?ml$/,
 ];
 
 const TEST_FILE_PATTERNS: RegExp[] = [
@@ -41,9 +46,21 @@ const TEST_FILE_PATTERNS: RegExp[] = [
 
 const SKIP_MARKER = /\b(it|test|describe|xit|xdescribe)\.skip\s*\(|\bx(it|describe|test)\s*\(|@unittest\.skip|pytest\.mark\.skip|@pytest\.mark\.skip|\bt\.Skip\s*\(|raise\s+(unittest\.)?SkipTest/;
 
+// Focus markers make the runner execute ONLY the focused test and silently
+// skip the rest of the suite — a pass that asserts almost nothing
+// (adversarial review 2026-07-05, C3).
+const FOCUS_MARKER = /\b(it|test|describe)\s*\.\s*only\s*\(|\bf(it|describe)\s*\(/;
+
 const HARD_EXIT = /\b(process\.exit|sys\.exit|os\._exit)\s*\(\s*0?\s*\)/;
 
 const ASSERTION = /\bassert\b|\bexpect\s*\(|\.should\b|assert(Equal|True|False|In|Raises)/;
+
+// Assertions that assert nothing: literal-equals-itself, assert(true), and
+// friends. Used to spot deleted-real/added-junk masking (adversarial review
+// 2026-07-05, H4) — semantic gutting beyond these patterns is the critic's
+// and watchdog's job, stated in the leg doc.
+const TRIVIAL_ASSERTION =
+  /expect\s*\(\s*(true|false|\d+|'[^']*'|"[^"]*")\s*\)\s*\.\s*(?:to(?:Be|Equal|StrictEqual)|toBe)\s*\(\s*\1\s*\)|\bassert\s*\(\s*(?:true|1)\s*\)|\bassert\s+True\b|\bassertTrue\s*\(\s*(?:true|True)\s*\)/;
 
 export function isTestPath(path: string): boolean {
   return TEST_FILE_PATTERNS.some((pattern) => pattern.test(path));
@@ -62,12 +79,25 @@ function touchesCheckScripts(file: ChangedFileDiff): boolean {
   return [...file.addedLines, ...file.removedLines].some((line) => scriptKey.test(line));
 }
 
+export type TripwireContext = {
+  /**
+   * Files the check scripts execute through (extracted from the worktree's
+   * package.json script values by the adapter) — editing an indirection
+   * target can fake any pass without touching package.json itself
+   * (adversarial review 2026-07-05, C2).
+   */
+  checkScriptTargets?: string[];
+};
+
 /**
  * Run every tripwire over the changed-file diffs. Findings are facts about
  * the change set, not accusations — an "alert" blocks until a human or the
  * critic clears it; a "warn" lowers and points the critic's attention.
  */
-export function detectTripwires(files: ChangedFileDiff[]): TripwireFinding[] {
+export function detectTripwires(
+  files: ChangedFileDiff[],
+  context: TripwireContext = {},
+): TripwireFinding[] {
   const findings: TripwireFinding[] = [];
 
   const scriptTampered = files.filter(touchesCheckScripts);
@@ -78,6 +108,20 @@ export function detectTripwires(files: ChangedFileDiff[]): TripwireFinding[] {
       label:
         "The package.json scripts that RUN the checks were modified — a rewritten test script can fake any pass",
       paths: scriptTampered.map((file) => file.path),
+    });
+  }
+
+  const targets = new Set(
+    (context.checkScriptTargets ?? []).map((target) => target.replace(/^\.\//, "")),
+  );
+  const targetTampered = files.filter((file) => targets.has(file.path));
+  if (targetTampered.length > 0) {
+    findings.push({
+      id: "check-script-target-modified",
+      severity: "alert",
+      label:
+        "A file the check scripts execute through was modified — an early exit in the runner script can fake any pass",
+      paths: targetTampered.map((file) => file.path),
     });
   }
 
@@ -138,6 +182,35 @@ export function detectTripwires(files: ChangedFileDiff[]): TripwireFinding[] {
     });
   }
 
+  // One focus marker silences the whole rest of the suite — always an alert.
+  const focused = files.filter(
+    (file) => isTestPath(file.path) && file.addedLines.some((line) => FOCUS_MARKER.test(line)),
+  );
+  if (focused.length > 0) {
+    findings.push({
+      id: "tests-focused",
+      severity: "alert",
+      label:
+        "A .only/f-focus marker was added to tests — the runner executes only the focused test and silently skips the entire rest of the suite",
+      paths: focused.map((file) => file.path),
+    });
+  }
+
+  const trivialAdds = files.filter(
+    (file) =>
+      isTestPath(file.path) &&
+      file.addedLines.some((line) => TRIVIAL_ASSERTION.test(line)),
+  );
+  if (trivialAdds.length > 0) {
+    findings.push({
+      id: "trivial-assertions",
+      severity: "warn",
+      label:
+        "Assertions that assert nothing (literal-equals-itself, assert(true)) were added to tests — junk assertions can mask deleted real ones",
+      paths: trivialAdds.map((file) => file.path),
+    });
+  }
+
   const assertionLoss = files
     .map((file) => {
       if (!isTestPath(file.path)) {
@@ -180,10 +253,17 @@ export function detectTripwires(files: ChangedFileDiff[]): TripwireFinding[] {
  * processing, exported for direct testing. Handles renames and deletions by
  * preferring the b/ path and falling back to a/; strips git's C-style quotes
  * around non-ASCII paths (the pattern set is ASCII, so matching survives).
+ *
+ * Header lines (`--- `/`+++ `) are honored only OUTSIDE hunks (adversarial
+ * review 2026-07-05, M9): inside a hunk, an added content line beginning
+ * "++ " renders as "+++ …" and previously hijacked the current file path,
+ * detaching a malicious hunk from its real file. `@@` opens a hunk;
+ * `diff --git` closes it.
  */
 export function parseUnifiedDiff(diffText: string): ChangedFileDiff[] {
   const files: ChangedFileDiff[] = [];
   let current: ChangedFileDiff | null = null;
+  let inHunk = false;
 
   const cleanPath = (raw: string): string => {
     let path = raw.trim();
@@ -196,9 +276,14 @@ export function parseUnifiedDiff(diffText: string): ChangedFileDiff[] {
   for (const line of diffText.split("\n")) {
     if (line.startsWith("diff --git ")) {
       current = null;
+      inHunk = false;
       continue;
     }
-    if (line.startsWith("--- ")) {
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk && line.startsWith("--- ")) {
       const source = line.slice(4);
       if (!current && source !== "/dev/null") {
         current = { path: cleanPath(source), addedLines: [], removedLines: [] };
@@ -206,7 +291,7 @@ export function parseUnifiedDiff(diffText: string): ChangedFileDiff[] {
       }
       continue;
     }
-    if (line.startsWith("+++ ")) {
+    if (!inHunk && line.startsWith("+++ ")) {
       const target = line.slice(4);
       if (target !== "/dev/null") {
         const path = cleanPath(target);
@@ -219,7 +304,7 @@ export function parseUnifiedDiff(diffText: string): ChangedFileDiff[] {
       }
       continue;
     }
-    if (!current) {
+    if (!current || !inHunk) {
       continue;
     }
     if (line.startsWith("+")) {

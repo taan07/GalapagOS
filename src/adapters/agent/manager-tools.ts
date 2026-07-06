@@ -11,7 +11,8 @@ import {
   resolveAttentionItem,
 } from "../db/repos/attention";
 import { latestDigestForWorker, setDigestStatus } from "../db/repos/digests";
-import { laneGlobs } from "../db/repos/lanes";
+import { buildWorkerEvidence } from "../evidence/adapter";
+import { getLane, laneGlobs } from "../db/repos/lanes";
 import type { ProjectRow } from "../db/repos/projects";
 import { getWorker } from "../db/repos/workers";
 import { runChecks, renderRunChecksResult } from "../checks/run-checks";
@@ -623,6 +624,27 @@ export function createManagerToolServer(context: ManagerToolContext) {
             return text(
               `Worker ${worker_id} has no completion digest — there is nothing to review, and it is NOT done.`,
             );
+          }
+          if (verdict === "manager_reviewed") {
+            // Code-level guard (adversarial review 2026-07-05, M10): a
+            // persuasive narrative must not be able to talk a reviewer into
+            // vouching without evidence. manager_reviewed demands fresh
+            // passing required checks — the same bar auto-review holds.
+            const evidence = await buildWorkerEvidence(bridge.db, {
+              worker,
+              lane: getLane(bridge.db, worker.lane_id) ?? null,
+              staleWorkerSeconds: bridge.config.staleWorkerSeconds,
+            });
+            const gaps = evidence.input.checks.requiredKeys.filter((key) => {
+              const run = evidence.input.checks.runs.find((entry) => entry.key === key);
+              return !run || run.status === "failed" || !run.fresh;
+            });
+            if (gaps.length > 0) {
+              emit("review_completion", `refused: required checks not fresh`, gaps.join(", "));
+              return text(
+                `Refused: required check${gaps.length === 1 ? "" : "s"} not freshly passing in the worker's worktree: ${gaps.join(", ")}. Run run_checks(worker_id) first — a verdict without evidence is exactly what Galapagos exists to prevent. (escalated verdicts need no evidence.)`,
+              );
+            }
           }
           setDigestStatus(bridge.db, digest.id, verdict);
           emit("review_completion", `${verdict}: ${oneLine(digest.narrative, 80)}`, note);

@@ -141,6 +141,9 @@ export type WatchdogInput =
       verdict: "clean" | "suspicious" | "gaming";
       fresh: boolean;
       summary: string;
+      /** Verbatim transcript quotes backing the verdict — the proof travels
+       * with the accusation (coverage audit 2026-07-05: write-only quotes). */
+      evidence: string[];
     };
 
 export type CriticFindingInput = {
