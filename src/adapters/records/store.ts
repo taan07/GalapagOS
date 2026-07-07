@@ -22,6 +22,7 @@ import {
   WRITTEN_BY,
   type GlpType,
 } from "../../core/records/schema";
+import { oneLine } from "../../core/text";
 
 export const RECORDS_DIR = "docs/galapagos";
 
@@ -90,10 +91,6 @@ function shortId(): string {
   return randomBytes(4).toString("hex");
 }
 
-function summarizeOneLine(value: string, max = 200): string {
-  const oneLine = value.replace(/\s+/g, " ").trim();
-  return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}…`;
-}
 
 export class RecordsStore {
   readonly projectRoot: string;
@@ -166,7 +163,7 @@ export class RecordsStore {
     const data: Frontmatter = {
       id,
       glp_type: input.type,
-      title: summarizeOneLine(input.title),
+      title: oneLine(input.title),
       status,
       project: this.projectSlug,
       created_at: createdAt,

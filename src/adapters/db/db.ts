@@ -14,8 +14,18 @@ export function openDb(stateDir: string, options: { readonly?: boolean } = {}): 
   db.pragma("foreign_keys = ON");
   if (!options.readonly) {
     db.exec(SCHEMA_SQL);
+    // Additive migrations: CREATE IF NOT EXISTS cannot grow an existing
+    // table, so columns added after a table shipped are patched in here.
+    ensureColumn(db, "workers", "resumed_from", "TEXT");
   }
   return db;
+}
+
+function ensureColumn(db: GalapagosDb, table: string, column: string, type: string): void {
+  const columns = db.pragma(`table_info(${table})`) as { name: string }[];
+  if (!columns.some((existing) => existing.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
 }
 
 export function nowIso(): string {

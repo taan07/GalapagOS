@@ -4,7 +4,9 @@
 // type, title, status, date, body — every field source-attributed, no
 // editing UI. Reading happens against the committed files via /api/records.
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ProjectView, RecordView } from "./types";
+import type { RecordView } from "./types";
+import { useProjectSelection } from "./use-project-selection";
+import { localDateTime } from "./time";
 
 function Field(props: { label: string; value: string; source: string }) {
   return (
@@ -31,12 +33,12 @@ function RecordCard({ record }: { record: RecordView }) {
         <Field label="id" value={record.id} source={record.fieldSources.id ?? ""} />
         <Field
           label="created"
-          value={record.createdAt || "(missing)"}
+          value={record.createdAt ? localDateTime(record.createdAt) : "(missing)"}
           source={record.fieldSources.createdAt ?? ""}
         />
         <Field
           label="updated"
-          value={record.updatedAt || "(missing)"}
+          value={record.updatedAt ? localDateTime(record.updatedAt) : "(missing)"}
           source={record.fieldSources.updatedAt ?? ""}
         />
         <Field
@@ -73,29 +75,10 @@ function RecordCard({ record }: { record: RecordView }) {
 }
 
 export function RecordsBrowser() {
-  const [projects, setProjects] = useState<ProjectView[] | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const { projects, selectedId, setSelectedId } = useProjectSelection();
   const [records, setRecords] = useState<RecordView[] | null>(null);
   const [typeFilter, setTypeFilter] = useState<string>("all");
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    void (async () => {
-      const response = await fetch("/api/projects", { cache: "no-store" });
-      const payload = (await response.json()) as { projects: ProjectView[] };
-      setProjects(payload.projects);
-      const fromQuery = new URLSearchParams(window.location.search).get("projectId");
-      const exists = (id: string | null) =>
-        id !== null && payload.projects.some((project) => project.id === id);
-      setSelectedId(
-        exists(fromQuery)
-          ? fromQuery
-          : exists(localStorage.getItem("galapagos.lastProjectId"))
-            ? localStorage.getItem("galapagos.lastProjectId")
-            : (payload.projects[0]?.id ?? null),
-      );
-    })();
-  }, []);
 
   const refresh = useCallback(async (projectId: string) => {
     setError(null);
@@ -134,6 +117,12 @@ export function RecordsBrowser() {
         </div>
         <a className="nav-link" href="/">
           ← Darwin
+        </a>
+        <a
+          className="nav-link"
+          href={selectedId ? `/workers?projectId=${encodeURIComponent(selectedId)}` : "/workers"}
+        >
+          Workers
         </a>
         <div className="picker">
           {projects && projects.length > 0 ? (

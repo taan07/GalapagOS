@@ -23,17 +23,27 @@ import {
   getTurn,
   updateTurnContent,
 } from "../adapters/db/repos/manager";
+import { createDecisionBroker } from "../adapters/agent/decisions";
+import { sweepPendingDecisionTurns } from "../adapters/db/repos/manager";
+import { createWorkerRuntime } from "../adapters/agent/worker-runtime";
 import { commitRecords } from "../adapters/git/mutating-runner";
 import { ingestVaultSpecifics } from "../adapters/records/ingest";
 import { createRecordsStore } from "../adapters/records/store";
 import { chooseFolder, revealFolder } from "../adapters/system/dialogs";
 
 const db = openDb(config.stateDir);
-// The only module-level state: live SSE clients, per-project busy flags, and
-// the in-flight turn kill switches. Everything durable lives in SQLite.
+// The only module-level state: live SSE clients, per-project busy flags, the
+// in-flight turn kill switches, and the worker runtime's live session
+// handles. Everything durable lives in SQLite as it lands.
 const busyProjects = new Set<string>();
 const eventClients = new Set<http.ServerResponse>();
 const activeTurnControllers = new Map<string, AbortController>();
+const workers = createWorkerRuntime({
+  db,
+  config,
+  broadcast: (event) => broadcast(event),
+});
+const decisions = createDecisionBroker();
 
 const execFileAsync = promisify(execFile);
 
@@ -176,6 +186,8 @@ async function handleManagerMessage(
       userText: text,
       emit,
       abortController: turnController,
+      workers,
+      decisions,
     });
 
     // Post-turn distillation runs while the stream (and the busy flag) is
@@ -351,6 +363,126 @@ async function handleCreateProject(
   }
 }
 
+function asStringArray(value: unknown): string[] | undefined {
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? (value as string[])
+    : undefined;
+}
+
+async function handleSpawnWorker(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const body = await readBody(req);
+  const projectId = asString(body.projectId);
+  const laneName = asString(body.laneName);
+  const allowedGlobs = asStringArray(body.allowedGlobs);
+  const briefTitle = asString(body.briefTitle);
+  const brief = asString(body.brief);
+  if (!projectId || !laneName || !allowedGlobs || !briefTitle || !brief) {
+    sendJson(res, 400, {
+      error: "projectId, laneName, allowedGlobs, briefTitle, and brief are required.",
+    });
+    return;
+  }
+  const project = getProject(db, projectId);
+  if (!project) {
+    sendJson(res, 404, { error: `Unknown project: ${projectId}` });
+    return;
+  }
+  // A present-but-invalid forbiddenGlobs must be an error, not a silently
+  // dropped constraint — the caller asked for a narrower lane than they get.
+  const forbiddenGlobs = asStringArray(body.forbiddenGlobs);
+  if (body.forbiddenGlobs !== undefined && !forbiddenGlobs) {
+    sendJson(res, 400, { error: "forbiddenGlobs must be an array of strings when provided." });
+    return;
+  }
+  const model = asString(body.model);
+  const outcome = await workers.spawn({
+    project,
+    laneName,
+    allowedGlobs,
+    ...(forbiddenGlobs ? { forbiddenGlobs } : {}),
+    briefTitle,
+    brief,
+    ...(model ? { model } : {}),
+  });
+  if (!outcome.ok) {
+    sendJson(res, 409, { error: outcome.reason });
+    return;
+  }
+  sendJson(res, 201, { worker: outcome });
+}
+
+async function handleSteerWorker(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  workerId: string,
+): Promise<void> {
+  const body = await readBody(req);
+  const message = asString(body.message);
+  if (!message) {
+    sendJson(res, 400, { error: "message is required." });
+    return;
+  }
+  const outcome = await workers.steer(workerId, message, { awaitResponse: false });
+  if (!outcome.ok) {
+    sendJson(res, 409, { error: outcome.reason });
+    return;
+  }
+  sendJson(res, 200, { ok: true });
+}
+
+async function handleHoldWorker(res: http.ServerResponse, workerId: string): Promise<void> {
+  const outcome = await workers.hold(workerId, "the user, via the workers page");
+  if (!outcome.ok) {
+    sendJson(res, 409, { error: outcome.reason });
+    return;
+  }
+  sendJson(res, 200, { ok: true, response: outcome.response });
+}
+
+/**
+ * The UI's answer to a chat decision (ask_user / amend_lane gate). The busy
+ * flag deliberately does NOT block this route — the pending decision IS the
+ * busy turn waiting on the user.
+ */
+async function handleDecisionAnswer(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const body = await readBody(req);
+  const decisionId = asString(body.decisionId);
+  if (!decisionId) {
+    sendJson(res, 400, { error: "decisionId is required." });
+    return;
+  }
+  const selections = asStringArray(body.selections) ?? [];
+  const custom = typeof body.custom === "string" ? body.custom : "";
+  if (!decisions.answer(decisionId, { selections, custom })) {
+    sendJson(res, 409, {
+      error: "That decision is no longer pending — it was answered, timed out, or belongs to an ended turn.",
+    });
+    return;
+  }
+  sendJson(res, 200, { ok: true });
+}
+
+async function handleStopWorker(res: http.ServerResponse, workerId: string): Promise<void> {
+  const outcome = await workers.stop(workerId, "the user, via the workers page");
+  if (!outcome.ok) {
+    sendJson(res, 409, { error: outcome.reason });
+    return;
+  }
+  sendJson(res, 200, {
+    ok: true,
+    status: outcome.status,
+    violations: outcome.violations,
+    hasDigest: outcome.hasDigest,
+    auditError: outcome.auditError,
+  });
+}
+
 async function handleChooseFolder(res: http.ServerResponse): Promise<void> {
   try {
     const result = await chooseFolder(config.devRoot);
@@ -421,6 +553,40 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
+  if (route === "POST /workers") {
+    void handleSpawnWorker(req, res).catch((error) => {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    });
+    return;
+  }
+  if (route === "POST /manager/decision") {
+    void handleDecisionAnswer(req, res).catch((error) => {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    });
+    return;
+  }
+  const workerAction = /^\/workers\/([^/]+)\/(steer|stop|hold)$/.exec(url.pathname);
+  if (req.method === "POST" && workerAction) {
+    const [, workerId, action] = workerAction;
+    if (workerId && action === "steer") {
+      void handleSteerWorker(req, res, workerId).catch((error) => {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+      });
+      return;
+    }
+    if (workerId && action === "stop") {
+      void handleStopWorker(res, workerId).catch((error) => {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+      });
+      return;
+    }
+    if (workerId && action === "hold") {
+      void handleHoldWorker(res, workerId).catch((error) => {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+      });
+      return;
+    }
+  }
   if (route === "GET /events") {
     startSse(res);
     eventClients.add(res);
@@ -433,15 +599,38 @@ const server = http.createServer((req, res) => {
   sendJson(res, 404, { error: `No route: ${route}` });
 });
 
-server.listen(config.daemonPort, "127.0.0.1", () => {
-  void (async () => {
-    await resolveCodeIdentity();
+void (async () => {
+  // Workers whose rows say "live" after a restart are orphans — their
+  // sessions died with the old process. Reconcile BEFORE accepting requests:
+  // otherwise a status check in the gap reports a dead worker as running and
+  // a spawn is refused by a corpse's still-active lane. Guarded — boot must
+  // survive a reconcile failure (and still run vault ingestion after it).
+  const staleDecisions = sweepPendingDecisionTurns(db);
+  if (staleDecisions > 0) {
+    console.log(`[decisions] expired ${staleDecisions} pending decision${staleDecisions === 1 ? "" : "s"} from before the restart`);
+  }
+  try {
+    const orphans = await workers.reconcileOrphans();
+    if (orphans > 0) {
+      console.log(`[workers] reconciled ${orphans} orphaned worker${orphans === 1 ? "" : "s"} after restart`);
+    }
+  } catch (error) {
+    console.error(
+      `[workers] orphan reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  await resolveCodeIdentity();
+  server.listen(config.daemonPort, "127.0.0.1", () => {
     console.log(
       `galapagos daemon listening on http://127.0.0.1:${config.daemonPort} (rev: ${codeIdentity.revision} on ${codeIdentity.branch}, state: ${config.stateDir}, model: ${config.managerModel})`,
     );
-    // Idempotent per-project vault ingestion on every start (chunk 2 brief).
-    for (const project of listProjects(db)) {
-      await ingestProjectVault(project);
-    }
-  })();
-});
+    // Idempotent per-project vault ingestion on every start (chunk 2 brief);
+    // ingestProjectVault never rejects (fully guarded internally).
+    void (async () => {
+      for (const project of listProjects(db)) {
+        await ingestProjectVault(project);
+      }
+    })();
+  });
+})();

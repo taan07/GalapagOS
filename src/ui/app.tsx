@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   ChatItem,
+  DecisionView,
   ManagerStreamEvent,
   ProjectView,
   RebriefView,
@@ -32,12 +33,29 @@ function turnsToChatItems(turns: TurnView[]): ChatItem[] {
         return [];
       }
     }
-    // System turns carry structured payloads (re-briefs, notes) since Chunk 2;
-    // plain text stays a note for backward compatibility.
+    // System turns carry structured payloads (re-briefs, notes, decisions)
+    // since Chunk 2; plain text stays a note for backward compatibility.
     try {
       const payload = JSON.parse(turn.content) as
         | { kind: "rebrief"; reason: string; preamble: string | null; clearedAt: string | null }
+        | ({ kind: "decision" } & DecisionView)
         | { kind: "note"; text: string };
+      if (payload.kind === "decision") {
+        return [
+          {
+            kind: "decision",
+            decision: {
+              decisionId: payload.decisionId,
+              question: payload.question,
+              options: payload.options,
+              multiSelect: payload.multiSelect,
+              status: payload.status,
+              selections: payload.selections,
+              custom: payload.custom,
+            },
+          },
+        ];
+      }
       if (payload.kind === "rebrief") {
         return [
           {
@@ -207,6 +225,38 @@ export function App() {
               ]);
             } else if (event.type === "interrupted") {
               setItems((current) => [...current, { kind: "note", text: event.message }]);
+            } else if (event.type === "decision_request") {
+              setItems((current) => [
+                ...current,
+                {
+                  kind: "decision",
+                  decision: {
+                    decisionId: event.decisionId,
+                    question: event.question,
+                    options: event.options,
+                    multiSelect: event.multiSelect,
+                    status: "pending",
+                    selections: [],
+                    custom: "",
+                  },
+                },
+              ]);
+            } else if (event.type === "decision_settled") {
+              setItems((current) =>
+                current.map((item) =>
+                  item.kind === "decision" && item.decision.decisionId === event.decisionId
+                    ? {
+                        ...item,
+                        decision: {
+                          ...item.decision,
+                          status: event.status,
+                          selections: event.selections,
+                          custom: event.custom,
+                        },
+                      }
+                    : item,
+                ),
+              );
             } else if (event.type === "distilled") {
               // Silent when nothing durable happened; visible when memory
               // changed or when a records commit had to be skipped.
@@ -306,6 +356,26 @@ export function App() {
     [selectedId, working, sendNow],
   );
 
+  // Answer a chat decision: the daemon resolves Darwin's waiting tool call;
+  // the decision_settled event on the open stream stamps the final state.
+  const handleAnswerDecision = useCallback(
+    async (decisionId: string, selections: string[], custom: string) => {
+      const response = await fetch("/api/manager/decision", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decisionId, selections, custom }),
+      });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => ({}))) as { error?: string };
+        setItems((current) => [
+          ...current,
+          { kind: "note", text: payload.error ?? `Answering failed (${response.status}).` },
+        ]);
+      }
+    },
+    [],
+  );
+
   const handleClearRebrief = useCallback(
     async (rebrief: RebriefView) => {
       if (!selectedId || !rebrief.turnId) {
@@ -352,9 +422,14 @@ export function App() {
           GALAPAGOS <span>/ Darwin</span>
         </div>
         {selected ? (
-          <a className="nav-link" href={`/records?projectId=${encodeURIComponent(selected.id)}`}>
-            Records
-          </a>
+          <>
+            <a className="nav-link" href={`/workers?projectId=${encodeURIComponent(selected.id)}`}>
+              Workers
+            </a>
+            <a className="nav-link" href={`/records?projectId=${encodeURIComponent(selected.id)}`}>
+              Records
+            </a>
+          </>
         ) : null}
         {projects.length > 0 ? (
           <ProjectPicker
@@ -392,6 +467,7 @@ export function App() {
             projectName={selected?.name ?? ""}
             onSend={handleSend}
             onClearRebrief={handleClearRebrief}
+            onAnswerDecision={handleAnswerDecision}
           />
           <SpecificsPanel specifics={specifics} />
         </main>

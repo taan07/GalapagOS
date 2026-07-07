@@ -2,15 +2,37 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { GLP_TYPES, type GlpType } from "../../core/records/schema";
 import type { Frontmatter } from "../../core/records/frontmatter";
+import { oneLine } from "../../core/text";
+import { laneGlobs } from "../db/repos/lanes";
+import type { ProjectRow } from "../db/repos/projects";
+import { describeOutcome, type DecisionOption, type DecisionOutcome } from "./decisions";
 import { observeGitRepository, recentLog } from "../git/runner";
 import { createRecordsStore, type RecordDoc } from "../records/store";
 import { recordAgreedSpecific } from "../records/write-through";
 import { listAgreedSpecifics } from "../vault/specifics";
+import type { WorkerRuntime, WorkerStatusView } from "./worker-runtime";
 
 export type ManagerToolContext = {
   projectRoot: string;
   projectSlug: string;
   vaultPath: string;
+  /**
+   * Worker control (chunk 3). Present only when the caller owns live worker
+   * sessions — the daemon's manager turns. Absent for distillation forks,
+   * whose tool surface is records-only.
+   */
+  workers?: WorkerRuntime;
+  project?: ProjectRow;
+  /**
+   * The chat decision channel (user-confirmed 2026-07-05): put a decision to
+   * the user as clickable options and wait. Absent outside live manager
+   * turns; tools that need approval degrade to an honest unavailable text.
+   */
+  askUser?: (
+    question: string,
+    options: DecisionOption[],
+    multiSelect: boolean,
+  ) => Promise<DecisionOutcome>;
   onToolEvent?: (event: { tool: string; summary: string; detail: string }) => void;
 };
 
@@ -75,11 +97,66 @@ function renderFullRecord(doc: RecordDoc): string {
   return lines.join("\n");
 }
 
+function summarizeEventPayload(payload: Record<string, unknown>): string {
+  if (typeof payload.text === "string") {
+    return payload.text;
+  }
+  if (typeof payload.tool === "string") {
+    return `${payload.tool} ${JSON.stringify(payload.input ?? {})}`;
+  }
+  if (typeof payload.message === "string") {
+    return payload.message;
+  }
+  if (typeof payload.subtype === "string") {
+    return payload.subtype;
+  }
+  return JSON.stringify(payload);
+}
+
+function renderWorkerStatus(view: WorkerStatusView): string {
+  const { worker, lane, recentEvents, eventsTotal, digest, attention } = view;
+  const globs = lane ? laneGlobs(lane) : null;
+  const lines = [
+    `worker ${worker.id} [${worker.status}] on lane "${lane?.name ?? "(lane missing)"}"`,
+    `branch ${worker.branch} in ${worker.worktree_path} (base ${lane?.base_sha.slice(0, 8) ?? "?"})`,
+    globs
+      ? `lane globs — allowed: ${globs.allowedGlobs.join(", ")}; forbidden: ${globs.forbiddenGlobs.join(", ") || "(none)"}`
+      : "",
+    `last activity: ${worker.last_message_at ?? "(none yet)"}${worker.last_summary ? ` — ${worker.last_summary}` : ""}`,
+    digest
+      ? `completion digest (${digest.status}): ${digest.narrative}`
+      : "no completion digest — NOT done, whatever the transcript claims",
+  ].filter(Boolean);
+
+  const openAttention = attention.filter((item) => item.status === "open");
+  if (openAttention.length > 0) {
+    lines.push(
+      "open attention:",
+      ...openAttention.map((item) => `  - [${item.priority}] ${item.kind}: ${item.title}`),
+    );
+  }
+
+  if (recentEvents.length > 0) {
+    lines.push(
+      `recent events (${eventsTotal} total, showing last ${recentEvents.length}):`,
+      ...recentEvents.map((event) => {
+        const payload = JSON.parse(event.payload) as Record<string, unknown>;
+        return `  ${event.created_at.slice(11, 19)} ${event.kind}: ${oneLine(summarizeEventPayload(payload), 160)}`;
+      }),
+    );
+  }
+  return lines.join("\n");
+}
+
 export function createManagerToolServer(context: ManagerToolContext) {
   const emit = (toolName: string, summary: string, detail: string) => {
     context.onToolEvent?.({ tool: toolName, summary, detail });
   };
   const store = createRecordsStore(context.projectRoot, context.projectSlug);
+  const requireWorkers = (): { workers: WorkerRuntime; project: ProjectRow } | null =>
+    context.workers && context.project
+      ? { workers: context.workers, project: context.project }
+      : null;
 
   return createSdkMcpServer({
     name: "galapagos",
@@ -240,6 +317,341 @@ export function createManagerToolServer(context: ManagerToolContext) {
             emit("update_record", `update rejected for ${id}`, message);
             return text(`Update rejected: ${message}`);
           }
+        },
+      ),
+      tool(
+        "spawn_worker",
+        "Spawn ONE worker on a scoped task in its own git worktree, bound to a lane (exclusive allowed/forbidden file globs). The spawn is refused if the lane's allowed globs overlap any active lane — lanes are exclusive. Write the brief like a real hand-off: goal, constraints, how to verify; the worker sees only the brief and its worktree, none of this conversation. A worker_brief record is written and committed automatically.",
+        {
+          lane_name: z.string().describe("Short lane name, e.g. 'auth ui'"),
+          allowed_globs: z
+            .array(z.string())
+            .describe("Files the worker may change, e.g. ['src/auth/**']"),
+          forbidden_globs: z.array(z.string()).optional(),
+          brief_title: z.string(),
+          brief: z.string().describe("The full task brief — the worker's first message"),
+          model: z.string().optional().describe("Override the default worker model"),
+        },
+        async (input) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const outcome = await bridge.workers.spawn({
+            project: bridge.project,
+            laneName: input.lane_name,
+            allowedGlobs: input.allowed_globs,
+            ...(input.forbidden_globs ? { forbiddenGlobs: input.forbidden_globs } : {}),
+            briefTitle: input.brief_title,
+            brief: input.brief,
+            ...(input.model ? { model: input.model } : {}),
+          });
+          if (!outcome.ok) {
+            emit("spawn_worker", `spawn rejected: ${input.lane_name}`, outcome.reason);
+            return text(`Spawn rejected: ${outcome.reason}`);
+          }
+          const detail = [
+            `worker ${outcome.workerId}`,
+            `lane "${input.lane_name}" — allowed: ${input.allowed_globs.join(", ")}`,
+            `worktree ${outcome.worktreePath} on ${outcome.branch} (base ${outcome.baseSha.slice(0, 8)})`,
+            `brief record ${outcome.briefRecordId}`,
+            ...(outcome.briefCommitNote ? [outcome.briefCommitNote] : []),
+          ].join("\n");
+          emit("spawn_worker", `spawned worker on lane "${input.lane_name}"`, detail);
+          return text(
+            `Spawned worker ${outcome.workerId} on lane "${input.lane_name}".\n${detail}\nIt is working now — check on it with worker_status.`,
+          );
+        },
+      ),
+      tool(
+        "resume_worker",
+        "Continue a STOPPED (or failed) worker's task: a fresh session in the SAME worktree and branch, lane re-activated, briefed from the original worker_brief record plus the worktree's current git state and your continuation note. This is the ONLY way to continue stopped work — never reuse its lane name for a new spawn.",
+        {
+          id: z.string().describe("The stopped worker's id"),
+          note: z
+            .string()
+            .optional()
+            .describe("Continuation instruction — what to focus on or change"),
+        },
+        async ({ id, note }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const outcome = await bridge.workers.resume({
+            project: bridge.project,
+            workerId: id,
+            ...(note ? { note } : {}),
+          });
+          if (!outcome.ok) {
+            emit("resume_worker", `resume rejected for ${id.slice(0, 8)}`, outcome.reason);
+            return text(`Resume rejected: ${outcome.reason}`);
+          }
+          const detail = [
+            `new worker ${outcome.workerId} (continues ${id})`,
+            `same worktree ${outcome.worktreePath} on ${outcome.branch}`,
+            `lane "${outcome.laneSlug}" re-activated`,
+          ].join("\n");
+          emit("resume_worker", `resumed work as worker ${outcome.workerId.slice(0, 8)}`, detail);
+          return text(
+            `Resumed. ${detail}\nThe new session was briefed with the original brief plus the worktree's real state${note ? " and your note" : ""}. Check on it with worker_status.`,
+          );
+        },
+      ),
+      tool(
+        "steer_worker",
+        "Inject a message into a running worker mid-task: course corrections, answers to its questions, added context. The worker treats it as part of the same task. By default this waits briefly for the worker's next reply so you can confirm the steer was understood — check the reply before telling the user it landed.",
+        {
+          id: z.string(),
+          message: z.string(),
+          await_response: z
+            .boolean()
+            .optional()
+            .describe("Wait up to ~60s for the worker's reply (default true)"),
+        },
+        async ({ id, message, await_response }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const outcome = await bridge.workers.steer(id, message, {
+            awaitResponse: await_response ?? true,
+          });
+          if (!outcome.ok) {
+            emit("steer_worker", `steer failed for ${id}`, outcome.reason);
+            return text(`Steer failed: ${outcome.reason}`);
+          }
+          if (outcome.response !== null) {
+            emit("steer_worker", `steered worker ${id.slice(0, 8)} — it replied`, `${message}\n\n↳ ${outcome.response}`);
+            return text(`Message delivered. The worker's reply: ${outcome.response}`);
+          }
+          emit("steer_worker", `steered worker ${id.slice(0, 8)}`, message);
+          return text(
+            await_response === false
+              ? `Message delivered to worker ${id}.`
+              : `Message delivered to worker ${id} — no reply within the wait window yet. Check worker_status shortly; do not assume how the steer was taken.`,
+          );
+        },
+      ),
+      tool(
+        "hold_worker",
+        "Pause a live worker WITHOUT stopping it: sends a hold instruction — the worker states exactly where it is and waits. The lane stays active and the session stays live; release it later with steer_worker ('continue'). Use this when the user wants to think or redirect without losing the session.",
+        { id: z.string() },
+        async ({ id }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const outcome = await bridge.workers.hold(id, "Darwin");
+          if (!outcome.ok) {
+            emit("hold_worker", `hold failed for ${id}`, outcome.reason);
+            return text(`Hold failed: ${outcome.reason}`);
+          }
+          emit(
+            "hold_worker",
+            `held worker ${id.slice(0, 8)}`,
+            outcome.response ?? "(no acknowledgment yet)",
+          );
+          return text(
+            outcome.response !== null
+              ? `Worker held. Its position: ${outcome.response}`
+              : "Hold delivered — the worker has not acknowledged within the wait window; check worker_status shortly.",
+          );
+        },
+      ),
+      tool(
+        "amend_lane",
+        "Widen a LIVE worker's lane mid-flight (add allowed globs) — for the moment a nearly-done task legitimately needs one file outside its lane. The amendment passes the same exclusivity gate a spawn does, and THE USER MUST APPROVE it first: this tool asks them in chat and waits. State a concrete reason; it is shown to the user verbatim.",
+        {
+          id: z.string().describe("The live worker's id"),
+          add_globs: z.array(z.string()).describe("Globs to ADD to the allowed set"),
+          reason: z.string().describe("Why the task needs this, in user terms"),
+        },
+        async ({ id, add_globs, reason }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          if (!context.askUser) {
+            return text(
+              "Lane amendments require the user's approval, and no decision channel is available in this context.",
+            );
+          }
+          const status = bridge.workers.status(id);
+          if (!status) {
+            return text(`No worker with id ${id}.`);
+          }
+          const laneName = status.lane?.name ?? "(unknown lane)";
+          const decision = await context.askUser(
+            `Darwin wants to widen worker lane "${laneName}" to also allow: ${add_globs.join(", ")}. Reason: ${reason}`,
+            [
+              {
+                label: "Allow the amendment",
+                implication: `The worker may now also change files matching ${add_globs.join(", ")} — the change is recorded and audited like everything else.`,
+              },
+              {
+                label: "Deny",
+                implication: "The lane stays as declared; the worker must finish without those files (or be stopped and re-scoped).",
+              },
+            ],
+            false,
+          );
+          if (decision.status !== "answered") {
+            emit("amend_lane", `amendment ${decision.status} for ${laneName}`, reason);
+            return text(
+              decision.status === "timeout"
+                ? "The user did not answer — the lane is UNCHANGED. Treat the amendment as deferred; do not retry without new cause."
+                : "The turn was interrupted before the user answered — the lane is UNCHANGED.",
+            );
+          }
+          const approved = decision.answer.selections.includes("Allow the amendment");
+          if (!approved) {
+            emit("amend_lane", `user denied widening ${laneName}`, decision.answer.custom || reason);
+            return text(
+              `The user DENIED the amendment${decision.answer.custom ? ` — their note: ${decision.answer.custom}` : ""}. The lane is unchanged; adjust the plan accordingly.`,
+            );
+          }
+          const outcome = await bridge.workers.applyLaneAmendment({
+            project: bridge.project,
+            workerId: id,
+            addGlobs: add_globs,
+            reason,
+            approvedBy: "the user (in chat)",
+          });
+          if (!outcome.ok) {
+            emit("amend_lane", `amendment failed for ${laneName}`, outcome.reason);
+            return text(`The user approved, but the amendment failed: ${outcome.reason}`);
+          }
+          emit(
+            "amend_lane",
+            `lane "${laneName}" widened (user-approved)`,
+            `now allows: ${outcome.allowedGlobs.join(", ")}\nreason: ${reason}`,
+          );
+          return text(
+            `Amendment applied with the user's approval. Lane "${laneName}" now allows: ${outcome.allowedGlobs.join(", ")}. The worker has been told.${decision.answer.custom ? ` User note: ${decision.answer.custom}` : ""}`,
+          );
+        },
+      ),
+      tool(
+        "ask_user",
+        "Put a REAL decision to the user as clickable options in the chat, and wait for the answer. Use for decisions that change what gets built or how — never for things you can decide at your altitude, and never re-ask what records already answer. Word each option practically and give its implication in product terms; the user always gets a free-text field too. Your turn pauses until they answer (or a 10-minute timeout).",
+        {
+          question: z.string().describe("The decision, phrased concretely"),
+          options: z
+            .array(
+              z.object({
+                label: z.string().describe("Short choice text (1-6 words)"),
+                implication: z
+                  .string()
+                  .describe("What choosing this means in practice, in product terms"),
+              }),
+            )
+            .max(6)
+            .optional()
+            .describe("2-6 choices; omit for a pure free-text question"),
+          multi_select: z
+            .boolean()
+            .optional()
+            .describe("Allow choosing several options (default false)"),
+        },
+        async ({ question, options, multi_select }) => {
+          if (!context.askUser) {
+            return text("The decision channel is not available in this context — ask in plain chat text instead.");
+          }
+          const decision = await context.askUser(question, options ?? [], multi_select ?? false);
+          emit(
+            "ask_user",
+            decision.status === "answered" ? "the user decided" : `question ${decision.status}`,
+            `${question}\n↳ ${describeOutcome(decision)}`,
+          );
+          return text(describeOutcome(decision));
+        },
+      ),
+      tool(
+        "stop_worker",
+        "Stop a worker: ends its session, audits every change in its worktree against the lane (out-of-lane files raise a high-priority lane_violation), retires the lane, and checks for a structured completion report. The worktree and branch survive for review.",
+        { id: z.string() },
+        async ({ id }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const outcome = await bridge.workers.stop(id, "Darwin");
+          if (!outcome.ok) {
+            emit("stop_worker", `stop failed for ${id}`, outcome.reason);
+            return text(`Stop failed: ${outcome.reason}`);
+          }
+          const lines = [
+            `Worker ${id} is ${outcome.status}; its lane is retired and its worktree survives for review.`,
+            outcome.auditError
+              ? `LANE AUDIT COULD NOT RUN: ${outcome.auditError} (raised as an attention item).`
+              : outcome.violations.length > 0
+                ? `LANE VIOLATIONS (${outcome.violations.length}, raised as a high-priority attention item):\n${outcome.violations.map((entry) => `  - ${entry.path} (${entry.reason})`).join("\n")}`
+                : "Lane audit clean — every change matches the lane.",
+            outcome.hasDigest
+              ? "A structured completion report was parsed for this worker."
+              : "No structured completion report was ever parsed — the worker is NOT done (raised as an attention item).",
+          ];
+          emit("stop_worker", `stopped worker ${id.slice(0, 8)}`, lines.join("\n"));
+          return text(lines.join("\n"));
+        },
+      ),
+      tool(
+        "list_workers",
+        "List every worker for this project with lane, status, and liveness.",
+        {},
+        async () => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const entries = bridge.workers.list(bridge.project.id);
+          emit(
+            "list_workers",
+            `listed ${entries.length} worker${entries.length === 1 ? "" : "s"}`,
+            entries
+              .map(
+                ({ worker, lane }) =>
+                  `- ${worker.id} [${worker.status}] lane "${lane?.name ?? "?"}"`,
+              )
+              .join("\n") || "(none)",
+          );
+          if (entries.length === 0) {
+            return text("No workers exist for this project yet.");
+          }
+          return text(
+            entries
+              .map(({ worker, lane }) =>
+                [
+                  `${worker.id} [${worker.status}] lane "${lane?.name ?? "(missing)"}"`,
+                  `  last activity: ${worker.last_message_at ?? "(none yet)"}${worker.last_summary ? ` — ${worker.last_summary}` : ""}`,
+                ].join("\n"),
+              )
+              .join("\n"),
+          );
+        },
+      ),
+      tool(
+        "worker_status",
+        "Full status of one worker: lane contract, liveness, completion digest (or its honest absence), open attention items, and the most recent events.",
+        { id: z.string() },
+        async ({ id }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const view = bridge.workers.status(id);
+          if (!view) {
+            emit("worker_status", `no worker ${id}`, "");
+            return text(`No worker with id ${id}. Use list_workers to see what exists.`);
+          }
+          const rendered = renderWorkerStatus(view);
+          emit(
+            "worker_status",
+            `checked worker ${id.slice(0, 8)} [${view.worker.status}]`,
+            rendered,
+          );
+          return text(rendered);
         },
       ),
     ],

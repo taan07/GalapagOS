@@ -39,11 +39,23 @@ export type RebriefView = {
   cleared: boolean;
 };
 
+/** A decision Darwin put to the user in chat (ask_user / amend_lane gate). */
+export type DecisionView = {
+  decisionId: string;
+  question: string;
+  options: { label: string; implication: string }[];
+  multiSelect: boolean;
+  status: "pending" | "answered" | "timeout" | "interrupted" | "expired";
+  selections: string[];
+  custom: string;
+};
+
 export type ChatItem =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string }
   | { kind: "chip"; chip: ToolChip }
   | { kind: "rebrief"; rebrief: RebriefView }
+  | { kind: "decision"; decision: DecisionView }
   | { kind: "note"; text: string };
 
 export type ManagerStreamEvent =
@@ -54,6 +66,21 @@ export type ManagerStreamEvent =
   | { type: "turn_complete"; resultText: string; sdkSessionId: string | null }
   | { type: "interrupted"; message: string }
   | {
+      type: "decision_request";
+      turnId: string;
+      decisionId: string;
+      question: string;
+      options: { label: string; implication: string }[];
+      multiSelect: boolean;
+    }
+  | {
+      type: "decision_settled";
+      decisionId: string;
+      status: "answered" | "timeout" | "interrupted";
+      selections: string[];
+      custom: string;
+    }
+  | {
       type: "distilled";
       recordsWritten: number;
       committed: boolean;
@@ -61,6 +88,78 @@ export type ManagerStreamEvent =
       error?: string;
     }
   | { type: "turn_error"; message: string };
+
+/** One worker row as served by /api/workers — lane joined, liveness raw. */
+export type WorkerView = {
+  id: string;
+  status: "spawning" | "running" | "awaiting_input" | "idle" | "stopped" | "failed";
+  laneName: string | null;
+  allowedGlobs: string[];
+  forbiddenGlobs: string[];
+  baseSha: string | null;
+  branch: string;
+  worktreePath: string;
+  lastMessageAt: string | null;
+  lastSummary: string | null;
+  createdAt: string;
+  hasDigest: boolean;
+  openAttentionCount: number;
+  /** Predecessor worker id when this session continues stopped work. */
+  resumedFrom: string | null;
+};
+
+export type WorkerEventView = {
+  id: string;
+  kind: "assistant" | "tool_use" | "tool_result" | "result" | "error" | "steer";
+  payload: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type DigestView = {
+  narrative: string;
+  beforeAfter: { before: string; after: string }[];
+  claims: { text: string; evidence_kind: string; files: string[] }[];
+  touchedAreas: string[];
+  status: string;
+  createdAt: string;
+};
+
+export type AttentionView = {
+  id: string;
+  kind: string;
+  title: string;
+  detail: string;
+  priority: "high" | "normal";
+  status: string;
+  createdAt: string;
+};
+
+export type WorkerDetailView = {
+  worker: WorkerView;
+  events: WorkerEventView[];
+  digest: DigestView | null;
+  attention: AttentionView[];
+};
+
+/**
+ * Live events from the daemon's GET /events stream (via /api/events). The
+ * stream carries other event types too; parse to this union and let the
+ * type guards fall through — a catch-all variant would kill narrowing.
+ */
+export type DaemonStreamEvent =
+  | {
+      type: "worker_event";
+      projectId: string;
+      workerId: string;
+      event: { id: string; kind: WorkerEventView["kind"]; payload: Record<string, unknown>; createdAt: string };
+    }
+  | {
+      type: "worker_status";
+      projectId: string;
+      workerId: string;
+      status: WorkerView["status"];
+      lastSummary: string | null;
+    };
 
 /** One durable record as served by /api/records — every field attributed. */
 export type RecordView = {
