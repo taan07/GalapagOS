@@ -97,9 +97,11 @@ override everything, including this handoff. Then implement
 
 - Chunk 2 is COMPLETE (all live drills passed) and MERGED to main at
   b40e22e; its branch is deleted. Chunk-2-surface fixes now land on main.
-- Chunk 3 (`claude/chunk-3-workers-lanes-vl5mh8`) is REBASED directly onto
-  main (merge-base == main's tip) and BUILT, awaiting the user's live
-  drills. Chunk-3 fixes land on that branch; rebase your stack after.
+- Chunk 3 is MERGED to main (2026-07-05, user's direction; round-1 drills
+  passed, rounds 2-3 run against main). Chunk-3-surface fixes now land on
+  MAIN. Rebase your stack onto origin/main — it contains everything: the
+  drill fixes, resume_worker, the decision channel, gated amend_lane,
+  hold, steer-ack, loud denials, and the contract amendments.
 - Post-rebase additions on the chunk-3 branch beyond the original build:
   triple-Esc turn interrupt, distill restraint (unaccepted proposals →
   open_question), daemon identity (rev/branch in startup line + /health),
