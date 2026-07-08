@@ -20,6 +20,22 @@ export type GalapagosConfig = {
   workerModel: string;
   /** Reasoning effort for worker sessions (user-confirmed: high). */
   workerEffort: WorkerEffort;
+  /**
+   * Model for event-driven triage sessions. Triage is judgment over a small
+   * attention batch, not implementation — it runs cheap by default and the
+   * user can raise it.
+   */
+  triageModel: string;
+  /** Model for the transcript watchdog leg — reading, not implementing. */
+  watchdogModel: string;
+  /** Model for the blinded critic leg — the user can raise it for harder projects. */
+  criticModel: string;
+  /** Monitor loop cadence. The tick makes zero LLM calls at any interval. */
+  monitorIntervalMs: number;
+  /** A running worker silent beyond this raises stale_worker attention. */
+  staleWorkerSeconds: number;
+  /** Hard wall for one check command — a hung test run must not wedge run_checks. */
+  checkTimeoutMs: number;
   daemonPort: number;
   /** Where new projects are created and where folder browsing starts. */
   devRoot: string;
@@ -38,6 +54,17 @@ function expandHome(value: string): string {
   }
   if (value.startsWith("~/")) {
     return path.join(os.homedir(), value.slice(2));
+  }
+  return value;
+}
+
+function parsePositiveInt(name: string, raw: string | undefined, fallback: number): number {
+  if (raw === undefined) {
+    return fallback;
+  }
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`Invalid ${name}: ${raw} — expected a positive integer.`);
   }
   return value;
 }
@@ -79,6 +106,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GalapagosConfi
     // Workers: Opus 4.8 at high effort (user-confirmed 2026-07-05).
     workerModel: env.GALAPAGOS_WORKER_MODEL ?? "claude-opus-4-8",
     workerEffort: parseWorkerEffort(env.GALAPAGOS_WORKER_EFFORT),
+    triageModel: env.GALAPAGOS_TRIAGE_MODEL ?? "claude-haiku-4-5",
+    watchdogModel: env.GALAPAGOS_WATCHDOG_MODEL ?? "claude-haiku-4-5",
+    criticModel: env.GALAPAGOS_CRITIC_MODEL ?? "claude-haiku-4-5",
+    monitorIntervalMs: parsePositiveInt(
+      "GALAPAGOS_MONITOR_INTERVAL_MS",
+      env.GALAPAGOS_MONITOR_INTERVAL_MS,
+      30_000,
+    ),
+    staleWorkerSeconds: parsePositiveInt(
+      "GALAPAGOS_STALE_WORKER_SECONDS",
+      env.GALAPAGOS_STALE_WORKER_SECONDS,
+      300,
+    ),
+    checkTimeoutMs: parsePositiveInt(
+      "GALAPAGOS_CHECK_TIMEOUT_MS",
+      env.GALAPAGOS_CHECK_TIMEOUT_MS,
+      600_000,
+    ),
     daemonPort,
     devRoot: path.resolve(expandHome(env.GALAPAGOS_DEV_ROOT ?? "~/Dev")),
     claudeBinPath,

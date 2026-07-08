@@ -2,16 +2,21 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  AttentionView,
   ChatItem,
+  DaemonStreamEvent,
   DecisionView,
   ManagerStreamEvent,
+  ProjectConfidenceView,
   ProjectView,
   RebriefView,
   SpecificView,
   ToolChip,
   TurnView,
 } from "./types";
+import { AttentionQueue } from "./attention-queue";
 import { Chat } from "./chat";
+import { ConfidenceGauge } from "./confidence";
 import { AddProjectForm, ProjectPicker } from "./project-picker";
 import { SpecificsPanel } from "./specifics-panel";
 
@@ -84,11 +89,15 @@ export function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [items, setItems] = useState<ChatItem[]>([]);
   const [specifics, setSpecifics] = useState<SpecificView[]>([]);
+  const [attention, setAttention] = useState<AttentionView[] | null>(null);
+  const [confidence, setConfidence] = useState<ProjectConfidenceView | null>(null);
   const [working, setWorking] = useState(false);
   const [queued, setQueued] = useState<string[]>([]);
   const [daemonDown, setDaemonDown] = useState(false);
   const [showAddProject, setShowAddProject] = useState(false);
   const queueRef = useRef<string[]>([]);
+  const selectedIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selectedId;
 
   const selected = projects?.find((project) => project.id === selectedId) ?? null;
 
@@ -127,6 +136,25 @@ export function App() {
     }
   }, []);
 
+  const refreshAttention = useCallback(async (projectId: string) => {
+    const response = await fetch(`/api/attention?projectId=${encodeURIComponent(projectId)}`, {
+      cache: "no-store",
+    });
+    if (response.ok) {
+      const payload = (await response.json()) as { items: AttentionView[] };
+      setAttention(payload.items);
+    }
+  }, []);
+
+  const refreshConfidence = useCallback(async (projectId: string) => {
+    const response = await fetch(`/api/confidence?projectId=${encodeURIComponent(projectId)}`, {
+      cache: "no-store",
+    });
+    if (response.ok) {
+      setConfidence((await response.json()) as ProjectConfidenceView);
+    }
+  }, []);
+
   const checkDaemon = useCallback(async () => {
     try {
       const response = await fetch("/api/daemon-health", { cache: "no-store" });
@@ -150,6 +178,8 @@ export function App() {
     setItems([]);
     setQueued([]);
     queueRef.current = [];
+    setAttention(null);
+    setConfidence(null);
     void (async () => {
       const response = await fetch(
         `/api/manager/history?projectId=${encodeURIComponent(selectedId)}`,
@@ -160,8 +190,44 @@ export function App() {
         setItems(turnsToChatItems(payload.turns));
       }
       await refreshSpecifics(selectedId);
+      await refreshAttention(selectedId);
+      await refreshConfidence(selectedId);
     })();
-  }, [selectedId, refreshSpecifics]);
+  }, [selectedId, refreshSpecifics, refreshAttention, refreshConfidence]);
+
+  // Live updates from the daemon: the monitor's tick keeps the gauge honest
+  // (evidence freshness moves without any user action), attention changes
+  // re-pull the queue, and triage's escalated questions land in the chat.
+  useEffect(() => {
+    const source = new EventSource("/api/events");
+    source.onmessage = (message) => {
+      let event: DaemonStreamEvent;
+      try {
+        event = JSON.parse(message.data as string) as DaemonStreamEvent;
+      } catch {
+        return;
+      }
+      const projectId = selectedIdRef.current;
+      if (!projectId || !("projectId" in event) || event.projectId !== projectId) {
+        return;
+      }
+      if (event.type === "attention_changed") {
+        void refreshAttention(projectId);
+        void refreshConfidence(projectId);
+      } else if (event.type === "monitor_tick" || event.type === "digest_reviewed") {
+        void refreshConfidence(projectId);
+      } else if (event.type === "manager_note") {
+        const text = event.text;
+        setItems((current) =>
+          current.some((item) => item.kind === "note" && item.text === text)
+            ? current
+            : [...current, { kind: "note", text }],
+        );
+        void refreshAttention(projectId);
+      }
+    };
+    return () => source.close();
+  }, [refreshAttention, refreshConfidence]);
 
   const sendNow = useCallback(
     async (projectId: string, text: string): Promise<void> => {
@@ -469,7 +535,27 @@ export function App() {
             onClearRebrief={handleClearRebrief}
             onAnswerDecision={handleAnswerDecision}
           />
-          <SpecificsPanel specifics={specifics} />
+          <div className="side-stack">
+            {confidence ? (
+              <ConfidenceGauge
+                report={confidence.project}
+                label="project confidence"
+                computedAt={confidence.computedAt}
+              />
+            ) : (
+              <p className="empty-note">Confidence not computed yet.</p>
+            )}
+            <AttentionQueue
+              items={attention}
+              onChanged={() => {
+                if (selectedIdRef.current) {
+                  void refreshAttention(selectedIdRef.current);
+                  void refreshConfidence(selectedIdRef.current);
+                }
+              }}
+            />
+            <SpecificsPanel specifics={specifics} />
+          </div>
         </main>
       )}
     </div>

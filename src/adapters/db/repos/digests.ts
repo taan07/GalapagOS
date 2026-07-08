@@ -54,3 +54,32 @@ export function latestDigestForWorker(
     .prepare("SELECT * FROM completion_digests WHERE worker_id = ? ORDER BY rowid DESC LIMIT 1")
     .get(workerId) as CompletionDigestRow | undefined;
 }
+
+export function setDigestStatus(
+  db: GalapagosDb,
+  id: string,
+  status: CompletionDigestStatus,
+): void {
+  db.prepare("UPDATE completion_digests SET status = ? WHERE id = ?").run(status, id);
+}
+
+/**
+ * Digests still awaiting review (status 'parsed') for a project, but only
+ * each worker's LATEST — a steered worker's superseded digests are history,
+ * not review work.
+ */
+export function listUnreviewedDigests(
+  db: GalapagosDb,
+  projectId: string,
+): CompletionDigestRow[] {
+  return db
+    .prepare(
+      `SELECT d.* FROM completion_digests d
+       JOIN workers w ON w.id = d.worker_id
+       WHERE w.project_id = ?
+         AND d.status = 'parsed'
+         AND d.rowid = (SELECT MAX(rowid) FROM completion_digests WHERE worker_id = d.worker_id)
+       ORDER BY d.rowid`,
+    )
+    .all(projectId) as CompletionDigestRow[];
+}

@@ -1,7 +1,8 @@
 // Architecture §3 schema, built up chunk by chunk in the same idempotent
 // CREATE IF NOT EXISTS style. Chunk 1: projects, manager_sessions,
 // manager_turns, jobs. Chunk 3: lanes, workers, worker_events,
-// completion_digests, attention_items. Still to come: evidence_runs.
+// completion_digests, attention_items. Chunk 4: evidence_runs — the schema
+// is complete against architecture §3.
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
@@ -93,6 +94,9 @@ CREATE TABLE IF NOT EXISTS completion_digests (
 );
 CREATE INDEX IF NOT EXISTS idx_completion_digests_worker ON completion_digests(worker_id);
 
+-- kind: lane_violation | stale_worker | question_for_user | unsupported_claim |
+--       check_failed | decision_needed | unstructured_completion | worker_failed |
+--       integrity_alert
 CREATE TABLE IF NOT EXISTS attention_items (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
@@ -107,6 +111,20 @@ CREATE TABLE IF NOT EXISTS attention_items (
   resolved_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_attention_items_project ON attention_items(project_id, status);
+
+CREATE TABLE IF NOT EXISTS evidence_runs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  worker_id TEXT REFERENCES workers(id),
+  check_key TEXT NOT NULL CHECK (check_key IN ('typecheck', 'lint', 'test', 'build')),
+  status TEXT NOT NULL CHECK (status IN ('passed', 'failed')),
+  summary TEXT NOT NULL,
+  log_path TEXT,
+  head_sha TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_runs_scope
+  ON evidence_runs(project_id, worker_id, check_key);
 
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,

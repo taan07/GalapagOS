@@ -3,8 +3,19 @@ import { z } from "zod";
 import { GLP_TYPES, type GlpType } from "../../core/records/schema";
 import type { Frontmatter } from "../../core/records/frontmatter";
 import { oneLine } from "../../core/text";
-import { laneGlobs } from "../db/repos/lanes";
+import type { GalapagosConfig } from "../../config";
+import type { GalapagosDb } from "../db/db";
+import {
+  getAttentionItem,
+  listOpenAttentionItems,
+  resolveAttentionItem,
+} from "../db/repos/attention";
+import { latestDigestForWorker, setDigestStatus } from "../db/repos/digests";
+import { buildWorkerEvidence } from "../evidence/adapter";
+import { getLane, laneGlobs } from "../db/repos/lanes";
 import type { ProjectRow } from "../db/repos/projects";
+import { getWorker } from "../db/repos/workers";
+import { runChecks, renderRunChecksResult } from "../checks/run-checks";
 import { describeOutcome, type DecisionOption, type DecisionOutcome } from "./decisions";
 import { observeGitRepository, recentLog } from "../git/runner";
 import { createRecordsStore, type RecordDoc } from "../records/store";
@@ -24,15 +35,28 @@ export type ManagerToolContext = {
   workers?: WorkerRuntime;
   project?: ProjectRow;
   /**
+   * Evidence and attention surface (chunk 4): run_checks, list_attention,
+   * resolve_attention, review_completion need the central db. Present for
+   * daemon-owned manager and triage sessions; absent for distill forks.
+   */
+  db?: GalapagosDb;
+  config?: GalapagosConfig;
+  /**
    * The chat decision channel (user-confirmed 2026-07-05): put a decision to
-   * the user as clickable options and wait. Absent outside live manager
-   * turns; tools that need approval degrade to an honest unavailable text.
+   * the user as clickable options and WAIT. Wired for live manager turns
+   * only — a triage session must never block on the user.
    */
   askUser?: (
     question: string,
     options: DecisionOption[],
     multiSelect: boolean,
   ) => Promise<DecisionOutcome>;
+  /**
+   * Fire-and-forget escalation (chunk 4 triage): the question lands as a
+   * system note in Darwin's chat AND a high-priority queue item; answers
+   * flow back through Darwin. Wired only for triage sessions.
+   */
+  escalateToUser?: (question: string, context: string) => { attentionId: string };
   onToolEvent?: (event: { tool: string; summary: string; detail: string }) => void;
 };
 
@@ -156,6 +180,14 @@ export function createManagerToolServer(context: ManagerToolContext) {
   const requireWorkers = (): { workers: WorkerRuntime; project: ProjectRow } | null =>
     context.workers && context.project
       ? { workers: context.workers, project: context.project }
+      : null;
+  const requireEvidence = (): {
+    db: GalapagosDb;
+    config: GalapagosConfig;
+    project: ProjectRow;
+  } | null =>
+    context.db && context.config && context.project
+      ? { db: context.db, config: context.config, project: context.project }
       : null;
 
   return createSdkMcpServer({
@@ -534,7 +566,7 @@ export function createManagerToolServer(context: ManagerToolContext) {
       ),
       tool(
         "ask_user",
-        "Put a REAL decision to the user as clickable options in the chat, and wait for the answer. Use for decisions that change what gets built or how — never for things you can decide at your altitude, and never re-ask what records already answer. Word each option practically and give its implication in product terms; the user always gets a free-text field too. Your turn pauses until they answer (or a 10-minute timeout).",
+        "Put a REAL decision to the user. In a live chat turn this renders clickable options and WAITS for the answer (10-minute timeout; the user always gets a free-text field). In a triage session it instead lands the question in the user's chat AND on the attention queue without waiting — include your recommendation in `context`. Use only for decisions that change what gets built or how; never re-ask what records already answer.",
         {
           question: z.string().describe("The decision, phrased concretely"),
           options: z
@@ -553,18 +585,35 @@ export function createManagerToolServer(context: ManagerToolContext) {
             .boolean()
             .optional()
             .describe("Allow choosing several options (default false)"),
+          context: z
+            .string()
+            .optional()
+            .describe(
+              "Triage escalations: why this needs the user, what you checked, your recommendation",
+            ),
         },
-        async ({ question, options, multi_select }) => {
-          if (!context.askUser) {
-            return text("The decision channel is not available in this context — ask in plain chat text instead.");
+        async ({ question, options, multi_select, context: questionContext }) => {
+          if (context.askUser) {
+            const decision = await context.askUser(question, options ?? [], multi_select ?? false);
+            emit(
+              "ask_user",
+              decision.status === "answered" ? "the user decided" : `question ${decision.status}`,
+              `${question}\n↳ ${describeOutcome(decision)}`,
+            );
+            return text(describeOutcome(decision));
           }
-          const decision = await context.askUser(question, options ?? [], multi_select ?? false);
-          emit(
-            "ask_user",
-            decision.status === "answered" ? "the user decided" : `question ${decision.status}`,
-            `${question}\n↳ ${describeOutcome(decision)}`,
+          if (context.escalateToUser) {
+            // Triage never blocks on the user: fire-and-forget into chat +
+            // queue; the answer arrives through Darwin.
+            const { attentionId } = context.escalateToUser(question, questionContext ?? "");
+            emit("ask_user", `escalated to user: ${oneLine(question, 80)}`, questionContext ?? "");
+            return text(
+              `Question delivered to the user (attention item ${attentionId}). Do not wait for the answer — it will arrive through Darwin.`,
+            );
+          }
+          return text(
+            "The decision channel is not available in this context — ask in plain chat text instead.",
           );
-          return text(describeOutcome(decision));
         },
       ),
       tool(
@@ -652,6 +701,169 @@ export function createManagerToolServer(context: ManagerToolContext) {
             rendered,
           );
           return text(rendered);
+        },
+      ),
+      tool(
+        "run_checks",
+        "Run the project's configured checks (typecheck, lint, test, build — auto-detected from package.json scripts) and record the results as evidence keyed to the exact workspace state. Pass worker_id to run them in that worker's worktree — the ONLY way to verify a worker's claims; project-level runs say nothing about a diverged worktree. Omit keys to run everything configured.",
+        {
+          worker_id: z.string().optional(),
+          keys: z
+            .array(z.enum(["typecheck", "lint", "test", "build"]))
+            .optional()
+            .describe("Which checks to run; omitted = every configured one"),
+        },
+        async ({ worker_id, keys }) => {
+          const bridge = requireEvidence();
+          if (!bridge) {
+            return text("Check running is not available in this context.");
+          }
+          let cwd = bridge.project.root_path;
+          let workerId: string | null = null;
+          if (worker_id) {
+            const worker = getWorker(bridge.db, worker_id);
+            if (!worker || worker.project_id !== bridge.project.id) {
+              emit("run_checks", `no worker ${worker_id}`, "");
+              return text(`No worker with id ${worker_id} in this project.`);
+            }
+            cwd = worker.worktree_path;
+            workerId = worker.id;
+          }
+          try {
+            const result = await runChecks({
+              db: bridge.db,
+              config: bridge.config,
+              projectId: bridge.project.id,
+              projectSlug: bridge.project.slug,
+              cwd,
+              workerId,
+              ...(keys ? { keys } : {}),
+            });
+            const rendered = renderRunChecksResult(result);
+            const failed = result.outcomes.filter((outcome) => outcome.status === "failed");
+            emit(
+              "run_checks",
+              failed.length > 0
+                ? `checks: ${failed.map((outcome) => outcome.key).join(", ")} FAILED`
+                : `checks passed (${result.outcomes.length})`,
+              rendered,
+            );
+            return text(rendered);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            emit("run_checks", "checks could not run", message);
+            return text(`Checks could not run: ${message}`);
+          }
+        },
+      ),
+      tool(
+        "list_attention",
+        "List this project's OPEN attention items — the exception queue. Consult it before summarizing project state; an open item is a fact the user has not been shielded from yet.",
+        {},
+        async () => {
+          const bridge = requireEvidence();
+          if (!bridge) {
+            return text("The attention queue is not available in this context.");
+          }
+          const items = listOpenAttentionItems(bridge.db, bridge.project.id);
+          emit(
+            "list_attention",
+            `${items.length} open attention item${items.length === 1 ? "" : "s"}`,
+            items.map((item) => `- [${item.priority}] ${item.kind}: ${item.title}`).join("\n") ||
+              "(none)",
+          );
+          if (items.length === 0) {
+            return text("The attention queue is empty — nothing needs anyone right now.");
+          }
+          return text(
+            items
+              .map((item) =>
+                [
+                  `${item.id} [${item.priority}] ${item.kind}: ${item.title}`,
+                  item.worker_id ? `  worker: ${item.worker_id}` : "",
+                  `  ${oneLine(item.detail, 300)}`,
+                  `  raised: ${item.created_at}`,
+                ]
+                  .filter(Boolean)
+                  .join("\n"),
+              )
+              .join("\n"),
+          );
+        },
+      ),
+      tool(
+        "resolve_attention",
+        "Close ONE attention item with the reason it no longer needs anyone: 'resolved' when the underlying fact was handled (evidence run, worker steered, answer relayed), 'dismissed' when it was noise. Never close an item you have not actually addressed — the queue is trust, not chores.",
+        {
+          id: z.string(),
+          resolution: z.enum(["resolved", "dismissed"]),
+          note: z.string().describe("What was done about it — recorded on the item"),
+        },
+        async ({ id, resolution, note }) => {
+          const bridge = requireEvidence();
+          if (!bridge) {
+            return text("Attention resolution is not available in this context.");
+          }
+          const item = getAttentionItem(bridge.db, id);
+          if (!item || item.project_id !== bridge.project.id) {
+            emit("resolve_attention", `no item ${id}`, "");
+            return text(`No attention item with id ${id} in this project.`);
+          }
+          if (item.status !== "open") {
+            return text(`Attention item ${id} is already ${item.status}.`);
+          }
+          resolveAttentionItem(bridge.db, id, resolution, note);
+          emit("resolve_attention", `${resolution}: ${item.title}`, note);
+          return text(`Attention item "${item.title}" is now ${resolution}.`);
+        },
+      ),
+      tool(
+        "review_completion",
+        "Record your review verdict on a worker's latest completion digest: 'manager_reviewed' when claims, lane audit, and evidence hold together; 'escalated' when the user must see it (contradiction, failure, direction call). Verify with run_checks and worker_status BEFORE reviewing — a verdict without evidence is exactly what Galapagos exists to prevent.",
+        {
+          worker_id: z.string(),
+          verdict: z.enum(["manager_reviewed", "escalated"]),
+          note: z.string().describe("The one-line reason for the verdict"),
+        },
+        async ({ worker_id, verdict, note }) => {
+          const bridge = requireEvidence();
+          if (!bridge) {
+            return text("Completion review is not available in this context.");
+          }
+          const worker = getWorker(bridge.db, worker_id);
+          if (!worker || worker.project_id !== bridge.project.id) {
+            return text(`No worker with id ${worker_id} in this project.`);
+          }
+          const digest = latestDigestForWorker(bridge.db, worker_id);
+          if (!digest) {
+            return text(
+              `Worker ${worker_id} has no completion digest — there is nothing to review, and it is NOT done.`,
+            );
+          }
+          if (verdict === "manager_reviewed") {
+            // Code-level guard (adversarial review 2026-07-05, M10): a
+            // persuasive narrative must not be able to talk a reviewer into
+            // vouching without evidence. manager_reviewed demands fresh
+            // passing required checks — the same bar auto-review holds.
+            const evidence = await buildWorkerEvidence(bridge.db, {
+              worker,
+              lane: getLane(bridge.db, worker.lane_id) ?? null,
+              staleWorkerSeconds: bridge.config.staleWorkerSeconds,
+            });
+            const gaps = evidence.input.checks.requiredKeys.filter((key) => {
+              const run = evidence.input.checks.runs.find((entry) => entry.key === key);
+              return !run || run.status === "failed" || !run.fresh;
+            });
+            if (gaps.length > 0) {
+              emit("review_completion", `refused: required checks not fresh`, gaps.join(", "));
+              return text(
+                `Refused: required check${gaps.length === 1 ? "" : "s"} not freshly passing in the worker's worktree: ${gaps.join(", ")}. Run run_checks(worker_id) first — a verdict without evidence is exactly what Galapagos exists to prevent. (escalated verdicts need no evidence.)`,
+              );
+            }
+          }
+          setDigestStatus(bridge.db, digest.id, verdict);
+          emit("review_completion", `${verdict}: ${oneLine(digest.narrative, 80)}`, note);
+          return text(`Completion digest for worker ${worker_id} marked ${verdict}.`);
         },
       ),
     ],

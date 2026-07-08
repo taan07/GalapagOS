@@ -26,10 +26,15 @@ import {
 import { createDecisionBroker } from "../adapters/agent/decisions";
 import { sweepPendingDecisionTurns } from "../adapters/db/repos/manager";
 import { createWorkerRuntime } from "../adapters/agent/worker-runtime";
+import { runTriageJob } from "../adapters/agent/triage";
+import { runWatchdogReview } from "../adapters/legs/watchdog";
+import { runCriticReview } from "../adapters/legs/critic";
+import { getAttentionItem, resolveAttentionItem } from "../adapters/db/repos/attention";
 import { commitRecords } from "../adapters/git/mutating-runner";
 import { ingestVaultSpecifics } from "../adapters/records/ingest";
 import { createRecordsStore } from "../adapters/records/store";
 import { chooseFolder, revealFolder } from "../adapters/system/dialogs";
+import { createMonitor } from "./monitor";
 
 const db = openDb(config.stateDir);
 // The only module-level state: live SSE clients, per-project busy flags, the
@@ -44,6 +49,41 @@ const workers = createWorkerRuntime({
   broadcast: (event) => broadcast(event),
 });
 const decisions = createDecisionBroker();
+// The monitor tick makes zero LLM calls; triage is the event-driven session
+// it triggers only when new open attention items exist (architecture §7).
+const monitor = createMonitor({
+  db,
+  config,
+  broadcast: (event) => broadcast(event),
+  // The judgment legs (user-confirmed 2026-07-05): watchdog reads the
+  // transcript, the critic judges the diff against the brief — both on
+  // fresh single-shot sessions, both persisted as jobs rows.
+  runWatchdog: ({ worker, lane, digestId }) =>
+    runWatchdogReview({ db, config, worker, lane, digestId }),
+  runCritic: ({ worker, lane, digestId }) => {
+    const project = getProject(db, worker.project_id);
+    if (!project) {
+      return Promise.resolve({ ran: false, error: `unknown project ${worker.project_id}` });
+    }
+    return runCriticReview({ db, config, project, worker, lane, digestId });
+  },
+  runTriage: async (project) => {
+    const outcome = await runTriageJob({
+      db,
+      config,
+      project,
+      workers,
+      broadcast: (event) => broadcast(event),
+    });
+    if (outcome.error) {
+      console.error(`[triage] ${project.slug}: ${outcome.error}`);
+    } else if (outcome.ran) {
+      console.log(
+        `[triage] ${project.slug}: worked ${outcome.itemsInBatch} item${outcome.itemsInBatch === 1 ? "" : "s"} (${outcome.actions.length} action${outcome.actions.length === 1 ? "" : "s"})`,
+      );
+    }
+  },
+});
 
 const execFileAsync = promisify(execFile);
 
@@ -483,6 +523,36 @@ async function handleStopWorker(res: http.ServerResponse, workerId: string): Pro
   });
 }
 
+/**
+ * The queue UI's resolve/dismiss action — a write, so it goes through the
+ * daemon like every other command.
+ */
+async function handleResolveAttention(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  itemId: string,
+): Promise<void> {
+  const body = await readBody(req);
+  const resolution = asString(body.resolution);
+  if (resolution !== "resolved" && resolution !== "dismissed") {
+    sendJson(res, 400, { error: 'resolution must be "resolved" or "dismissed".' });
+    return;
+  }
+  const item = getAttentionItem(db, itemId);
+  if (!item) {
+    sendJson(res, 404, { error: `Unknown attention item: ${itemId}` });
+    return;
+  }
+  if (item.status !== "open") {
+    sendJson(res, 409, { error: `Attention item is already ${item.status}.` });
+    return;
+  }
+  const note = asString(body.note);
+  resolveAttentionItem(db, itemId, resolution, note ?? `${resolution} by the user from the queue`);
+  broadcast({ type: "attention_changed", projectId: item.project_id });
+  sendJson(res, 200, { ok: true });
+}
+
 async function handleChooseFolder(res: http.ServerResponse): Promise<void> {
   try {
     const result = await chooseFolder(config.devRoot);
@@ -559,6 +629,13 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
+  const attentionAction = /^\/attention\/([^/]+)\/resolve$/.exec(url.pathname);
+  if (req.method === "POST" && attentionAction?.[1]) {
+    void handleResolveAttention(req, res, attentionAction[1]).catch((error) => {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    });
+    return;
+  }
   if (route === "POST /manager/decision") {
     void handleDecisionAnswer(req, res).catch((error) => {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
@@ -621,6 +698,7 @@ void (async () => {
   }
 
   await resolveCodeIdentity();
+  monitor.start();
   server.listen(config.daemonPort, "127.0.0.1", () => {
     console.log(
       `galapagos daemon listening on http://127.0.0.1:${config.daemonPort} (rev: ${codeIdentity.revision} on ${codeIdentity.branch}, state: ${config.stateDir}, model: ${config.managerModel})`,
