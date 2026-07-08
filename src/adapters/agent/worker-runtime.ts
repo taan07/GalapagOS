@@ -7,6 +7,7 @@ import { existsSync } from "node:fs";
 import type { GalapagosConfig } from "../../config";
 import { checkLane, findLaneOverlap, type LaneContract } from "../../core/lanes/lane-check";
 import { parseCompletionReport } from "../../core/digests/completion";
+import { artifactExcludePathspecs, isArtifactPath } from "../../core/git/artifact-dirs";
 import { parseStatusPorcelain } from "../../core/git/parsers";
 import { oneLine } from "../../core/text";
 import type { GalapagosDb } from "../db/db";
@@ -129,6 +130,13 @@ type LiveEntry = {
   contract: LaneContract;
   /** One-shot waiters for the worker's next visible reply (steer-with-ack). */
   replyWaiters: ((summary: string) => void)[];
+  /**
+   * The last out-of-lane violation set already acted on (sorted path:reason
+   * key), so the post-Bash guard fires exactly once per distinct stray — not
+   * on every subsequent Bash while the same files sit out of lane. Empty
+   * string means "clean"; a set that later clears re-arms the guard.
+   */
+  lastViolationKey: string;
 };
 
 /**
@@ -137,25 +145,32 @@ type LiveEntry = {
  * reads use -z (NUL-delimited, no C-style quoting — a path like café.ts must
  * reach the globs verbatim, not as an escaped string no glob matches), and
  * the porcelain output goes through the tested core parser.
+ *
+ * Build output and installed dependencies are never work and never a review
+ * surface: they are excluded at the git layer (pathspec, so the trees are not
+ * even walked) and again by segment (nested copies), so a target repo that
+ * forgot to .gitignore node_modules/dist does not flood the audit with
+ * generated files (observed live 2026-07-08).
  */
 export async function collectAuditFiles(worktreePath: string, baseSha: string): Promise<string[]> {
   const runner = new LocalGitCommandRunner();
+  const excludes = artifactExcludePathspecs();
   const [diffOutput, porcelainOutput] = await Promise.all([
-    runner.runGit(["diff", "--name-only", "-z", `${baseSha}...HEAD`], worktreePath),
+    runner.runGit(["diff", "--name-only", "-z", `${baseSha}...HEAD`, "--", ".", ...excludes], worktreePath),
     // -uall lists untracked FILES: the default collapses a new directory to
     // "dir/", which globs can neither honestly clear nor blame.
-    runner.runGit(["status", "--porcelain=v1", "-z", "-uall"], worktreePath),
+    runner.runGit(["status", "--porcelain=v1", "-z", "-uall", "--", ".", ...excludes], worktreePath),
   ]);
 
   const files = new Set<string>();
   for (const token of diffOutput.split("\0")) {
-    if (token) {
+    if (token && !isArtifactPath(token)) {
       files.add(token);
     }
   }
   const status = parseStatusPorcelain(porcelainOutput);
   for (const entry of [...status.stagedFiles, ...status.dirtyFiles, ...status.untrackedFiles]) {
-    if (entry.path) {
+    if (entry.path && !isArtifactPath(entry.path)) {
       files.add(entry.path);
     }
   }
@@ -164,11 +179,25 @@ export async function collectAuditFiles(worktreePath: string, baseSha: string): 
 
 export type WorkerRuntime = ReturnType<typeof createWorkerRuntime>;
 
+export type LaneViolationNotice = {
+  projectId: string;
+  workerId: string;
+  laneName: string;
+  violations: { path: string; reason: string }[];
+};
+
 export function createWorkerRuntime(deps: {
   db: GalapagosDb;
   config: GalapagosConfig;
   sessionFactory?: WorkerSessionFactory;
   broadcast?: (event: WorkerBroadcast) => void;
+  /**
+   * Fired the instant a live worker is caught writing outside its lane (after
+   * build/dependency output is excluded). The worker has already been frozen
+   * and a lane_violation attention item raised; this hands the stray to Darwin
+   * so HE course-corrects — steer it back, amend the lane, or stop it.
+   */
+  onLaneViolation?: (notice: LaneViolationNotice) => void;
 }) {
   const { db, config } = deps;
   const sessionFactory = deps.sessionFactory ?? spawnWorkerSession;
@@ -258,6 +287,108 @@ export function createWorkerRuntime(deps: {
   const setStatus = (worker: { id: string; project_id: string }, status: WorkerStatus) => {
     setWorkerStatus(db, worker.id, status);
     broadcastStatus(worker);
+  };
+
+  const buildHoldMessage = (heldBy: string): string =>
+    `HOLD (requested by ${heldBy}): pause now. Do not start anything new and do not write further changes. Reply with ONE short message stating exactly where you are and what remains, then wait for further instructions. Do not emit a completion block.`;
+
+  /**
+   * Freeze a live worker in place: enqueue the canned hold instruction and
+   * record it. Does NOT await the worker's reply — safe to call from inside
+   * the event loop (awaiting a reply there would deadlock, since the reply is
+   * a later event the same loop must drain). The public hold() adds the wait.
+   */
+  const sendHold = (worker: WorkerRow, entry: LiveEntry, heldBy: string): boolean => {
+    const holdMessage = buildHoldMessage(heldBy);
+    try {
+      entry.session.send(holdMessage);
+    } catch {
+      return false;
+    }
+    persistEvent(worker, "steer", { text: holdMessage, hold: true, heldBy });
+    return true;
+  };
+
+  // Workers whose most recent tool_use was Bash (the one lane-guard bypass —
+  // Edit/Write/MultiEdit are gated in real time by canUseTool). We audit the
+  // worktree the instant that Bash's result lands.
+  const bashPending = new Set<string>();
+
+  /**
+   * Event-driven lane guard for the Bash bypass. Runs the artifact-filtered
+   * detective audit right after a Bash result. On a NEW genuine out-of-lane
+   * set (debounced against the last one acted on): freeze the worker, raise a
+   * high-priority lane_violation item, and hand the stray to Darwin via
+   * onLaneViolation. Never throws — the monitor tick remains a backstop.
+   */
+  const checkLaneAfterMutation = async (workerId: string): Promise<void> => {
+    try {
+      const entry = live.get(workerId);
+      if (!entry || entry.stopRequested) {
+        return;
+      }
+      const worker = getWorker(db, workerId);
+      if (!worker || worker.status === "failed" || worker.status === "stopped") {
+        return;
+      }
+      const lane = getLane(db, worker.lane_id);
+      if (!lane || lane.status !== "active") {
+        return;
+      }
+      const files = await collectAuditFiles(worker.worktree_path, lane.base_sha);
+      const violations = checkLane(files, laneGlobs(lane));
+      if (violations.length === 0) {
+        entry.lastViolationKey = "";
+        return;
+      }
+      const key = violations
+        .map((v) => `${v.path}:${v.reason}`)
+        .sort()
+        .join("|");
+      if (key === entry.lastViolationKey) {
+        return;
+      }
+      entry.lastViolationKey = key;
+
+      // 1. Freeze immediately (reversible — Darwin releases it by steering).
+      sendHold(worker, entry, "the lane guard");
+
+      // 2. Raise the fact, deduped against an identical open item.
+      const title = `Out-of-lane changes in lane "${lane.name}"`;
+      const detail = violations.map((v) => `${v.path} (${v.reason})`).join("\n");
+      if (
+        !openAttentionItemExists(db, {
+          projectId: worker.project_id,
+          workerId: worker.id,
+          kind: "lane_violation",
+          title,
+          detail,
+        })
+      ) {
+        createAttentionItem(db, {
+          projectId: worker.project_id,
+          workerId: worker.id,
+          kind: "lane_violation",
+          title,
+          detail,
+          priority: "high",
+        });
+      }
+
+      // 3. Wake Darwin to course-correct the frozen worker.
+      deps.onLaneViolation?.({
+        projectId: worker.project_id,
+        workerId: worker.id,
+        laneName: lane.name,
+        violations: violations.map((v) => ({ path: v.path, reason: v.reason })),
+      });
+    } catch (error) {
+      // A guard that cannot run must not crash the worker's event loop; the
+      // 30s monitor audit still covers this worker.
+      console.error(
+        `[workers] lane guard failed for ${workerId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   };
 
   /**
@@ -373,6 +504,11 @@ export function createWorkerRuntime(deps: {
                 ? `${rawInput.slice(0, 4000)}… (${rawInput.length} chars total — see the worktree for the real content)`
                 : event.payload.input,
           });
+          if (event.payload.tool === "Bash") {
+            // Bash is the one mutator the real-time canUseTool gate can't see;
+            // audit the worktree once its result lands.
+            bashPending.add(workerId);
+          }
           break;
         }
         case "tool_result":
@@ -380,6 +516,9 @@ export function createWorkerRuntime(deps: {
             content: oneLine(event.payload.content, 4000),
             isError: event.payload.isError,
           });
+          if (bashPending.delete(workerId)) {
+            await checkLaneAfterMutation(workerId);
+          }
           break;
         case "result":
           if (event.payload.isError && live.get(workerId)?.stopRequested) {
@@ -702,7 +841,14 @@ export function createWorkerRuntime(deps: {
         );
       }
       const loopDone = consumeSession(worker.id, session);
-      live.set(worker.id, { session, loopDone, stopRequested: false, contract, replyWaiters: [] });
+      live.set(worker.id, {
+        session,
+        loopDone,
+        stopRequested: false,
+        contract,
+        replyWaiters: [],
+        lastViolationKey: "",
+      });
 
       return {
         ok: true,
@@ -868,7 +1014,14 @@ required.`;
         };
       }
       const loopDone = consumeSession(worker.id, session);
-      live.set(worker.id, { session, loopDone, stopRequested: false, contract, replyWaiters: [] });
+      live.set(worker.id, {
+        session,
+        loopDone,
+        stopRequested: false,
+        contract,
+        replyWaiters: [],
+        lastViolationKey: "",
+      });
 
       return {
         ok: true,
@@ -951,13 +1104,9 @@ required.`;
           reason: `Worker ${workerId} is ${worker.status} — there is no live session to hold.`,
         };
       }
-      const holdMessage = `HOLD (requested by ${heldBy}): pause now. Do not start anything new and do not write further changes. Reply with ONE short message stating exactly where you are and what remains, then wait for further instructions. Do not emit a completion block.`;
-      try {
-        entry.session.send(holdMessage);
-      } catch (error) {
-        return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+      if (!sendHold(worker, entry, heldBy)) {
+        return { ok: false, reason: `Worker ${workerId}'s session could not be held.` };
       }
-      persistEvent(worker, "steer", { text: holdMessage, hold: true, heldBy });
       const response = await awaitReply(entry, 60_000);
       return { ok: true, response };
     },

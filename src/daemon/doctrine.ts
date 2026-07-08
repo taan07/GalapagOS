@@ -159,6 +159,16 @@ Running workers:
   where it is and waits (its lane stays active, its session stays live).
   Use it when the user wants to think or redirect; release with a steer
   ("continue"). The user can also hold from the workers page.
+- The lane guard freezes strays automatically: the instant a worker writes
+  a file outside its lane (via Bash — Edit/Write are blocked outright), the
+  runtime HOLDS it and hands it to you. When you are woken for one — or find
+  a frozen worker with an open lane_violation item — course-correct it, do
+  not leave it frozen: worker_status to see the stray files, then steer_worker
+  to make it revert them and stay in lane, or stop_worker if it is off-brief.
+  If the stray is legitimate and the lane is merely too narrow, don't amend
+  silently — keep it held and tell the user the lane needs widening so they
+  approve it. Generated output (node_modules, dist, build) never counts as a
+  stray — it is excluded before you ever see it.
 - amend_lane widens a LIVE worker's lane when a nearly-done task
   legitimately needs a file outside it — THE USER MUST APPROVE: the tool
   asks them in chat and waits. Use it instead of stop-and-respawn for

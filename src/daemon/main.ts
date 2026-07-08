@@ -25,7 +25,10 @@ import {
 } from "../adapters/db/repos/manager";
 import { createDecisionBroker } from "../adapters/agent/decisions";
 import { sweepPendingDecisionTurns } from "../adapters/db/repos/manager";
-import { createWorkerRuntime } from "../adapters/agent/worker-runtime";
+import {
+  createWorkerRuntime,
+  type LaneViolationNotice,
+} from "../adapters/agent/worker-runtime";
 import { runTriageJob } from "../adapters/agent/triage";
 import { runWatchdogReview } from "../adapters/legs/watchdog";
 import { runCriticReview } from "../adapters/legs/critic";
@@ -43,10 +46,20 @@ const db = openDb(config.stateDir);
 const busyProjects = new Set<string>();
 const eventClients = new Set<http.ServerResponse>();
 const activeTurnControllers = new Map<string, AbortController>();
+// A lane violation that arrives while Darwin is mid-turn: the worker is
+// already frozen, so we hold the latest stray here and wake Darwin the instant
+// the turn lock frees — never forking his session (main.ts:234 invariant).
+const pendingLaneWakes = new Map<string, LaneViolationNotice>();
 const workers = createWorkerRuntime({
   db,
   config,
   broadcast: (event) => broadcast(event),
+  // A worker caught writing outside its lane is frozen by the runtime; here we
+  // wake Darwin to course-correct it (fire-and-forget — never block the
+  // worker's event loop on a manager turn).
+  onLaneViolation: (notice) => {
+    void wakeManagerForLaneViolation(notice);
+  },
 });
 const decisions = createDecisionBroker();
 // The monitor tick makes zero LLM calls; triage is the event-driven session
@@ -265,6 +278,95 @@ async function handleManagerMessage(
     activeTurnControllers.delete(projectId);
     busyProjects.delete(projectId);
     res.end();
+    // A worker may have strayed and frozen while this turn ran — handle it now
+    // that Darwin is free.
+    drainPendingLaneWake(projectId);
+  }
+}
+
+/**
+ * Wake Darwin to course-correct a worker that stepped outside its lane and was
+ * frozen by the runtime. The freeze already stopped the bleeding, so if a user
+ * turn is in flight we do NOT fork the session — we hold the stray and drain it
+ * when the lock frees. Otherwise we run an autonomous manager turn seeded with
+ * the violation. Fire-and-forget; never throws.
+ */
+async function wakeManagerForLaneViolation(notice: LaneViolationNotice): Promise<void> {
+  const project = getProject(db, notice.projectId);
+  if (!project) {
+    return;
+  }
+  const fileList = notice.violations.map((v) => `${v.path} (${v.reason})`).join(", ");
+  const noteText = `A worker in lane "${notice.laneName}" stepped outside its lane and was frozen automatically — Darwin is course-correcting.`;
+  const seed =
+    `SYSTEM — automatic lane guard.\n\n` +
+    `Worker ${notice.workerId} (lane "${notice.laneName}") wrote outside its allowed globs and has been FROZEN (held) automatically. Out-of-lane changes: ${fileList}.\n\n` +
+    `The worker is paused and will not write further. Course-correct it now:\n` +
+    `1. Call worker_status ${notice.workerId} to see its lane contract, recent events, and the stray files. Also check list_attention for any OTHER frozen workers.\n` +
+    `2. Then decide and act:\n` +
+    `   - Stray by mistake: steer_worker to tell it to revert those exact files and stay strictly within its lane, then continue.\n` +
+    `   - Off-brief or unsalvageable: stop_worker.\n` +
+    `   - The stray is legitimate and the lane is simply too narrow: do NOT amend the lane on your own here — steer the worker to keep holding, and tell the user in your reply that the lane needs widening for ${fileList} so they can approve it in conversation.\n` +
+    `Do not leave the worker frozen without a decision.`;
+
+  if (busyProjects.has(project.id)) {
+    // Latest stray wins; the durable lane_violation attention items already
+    // record every one. Handled when the current turn's finally drains it.
+    pendingLaneWakes.set(project.id, notice);
+    broadcast({ type: "manager_note", projectId: project.id, text: noteText });
+    broadcast({ type: "attention_changed", projectId: project.id });
+    return;
+  }
+
+  busyProjects.add(project.id);
+  broadcast({ type: "manager_note", projectId: project.id, text: noteText });
+  try {
+    const turnController = new AbortController();
+    activeTurnControllers.set(project.id, turnController);
+    const outcome = await runManagerTurn({
+      db,
+      config,
+      project,
+      userText: seed,
+      emit: (event) => {
+        if (event.type === "turn_complete" || event.type === "turn_error") {
+          broadcast({ ...event, projectId: project.id });
+        }
+      },
+      abortController: turnController,
+      workers,
+      decisions,
+    });
+    if (outcome.completed || outcome.interrupted) {
+      const distillController = new AbortController();
+      activeTurnControllers.set(project.id, distillController);
+      await runDistillJob({
+        db,
+        config,
+        project,
+        sessionId: outcome.sessionId,
+        sdkSessionId: outcome.sdkSessionId,
+        abortController: distillController,
+      });
+    }
+  } catch (error) {
+    console.error(
+      `[lane-guard] autonomous course-correction failed for ${project.slug}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    activeTurnControllers.delete(project.id);
+    busyProjects.delete(project.id);
+    // Another worker may have strayed during this turn — drain it.
+    drainPendingLaneWake(project.id);
+  }
+}
+
+/** Wake Darwin for a stray that queued while the project was busy, if any. */
+function drainPendingLaneWake(projectId: string): void {
+  const pending = pendingLaneWakes.get(projectId);
+  if (pending) {
+    pendingLaneWakes.delete(projectId);
+    void wakeManagerForLaneViolation(pending);
   }
 }
 
