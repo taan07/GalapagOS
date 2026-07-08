@@ -6,12 +6,11 @@
 Chunk 5 — Clarity view + completion digests (finished work becomes
 absorbable in seconds)
 
-Repo: ~/Dev/galapagos (github.com/taan07/GalapagOS). Chunk 2 is MERGED to
-main. Chunks 3 AND 4 live stacked on
-claude/chunk-4-monitoring-confidence-mud9n3 (which contains the chunk-3
-branch's history) — check what has merged before branching: create your
-branch from main if both merged, otherwise stack on the highest unmerged
-chunk branch. Never commit Chunk 5 code to earlier chunks' branches.
+Repo: ~/Dev/galapagos (github.com/taan07/GalapagOS). Chunks 2, 3 AND 4
+are MERGED to main (chunk 4 merge: d59f640; it also integrated the chunk-3
+drill work — decision channel, lane amendments, hold/resume,
+tool_denied). Branch chunk 5 from main. Never commit Chunk 5 code to
+earlier chunks' branches.
 Start by reading docs/handoffs/chunk-5.md (your handoff), then
 docs/vision.md and docs/architecture.md — the binding contracts that
 override everything else, including this prompt. Then implement
@@ -43,7 +42,7 @@ file, and doc per leg (docs/legs/), every signal naming its leg, and a
 completion nobody independent reviewed is never strong or auto-reviewed;
 evidence_runs are keyed to `<sha>` or `<sha>+dirty.<fingerprint>` so ANY
 change makes evidence stale; the attention queue UI with resolve/dismiss
-lives on /, gauges on / and /workers. 178/178 tests green via npm test.
+lives on /, gauges on / and /workers. 201/201 tests green via npm test.
 
 Chunk 5 in one line: the pure clarity view-model (every displayed field
 carries source attribution — source, sourceLabel, sourceRecords —
@@ -128,14 +127,18 @@ separate instruments:
   confident-sounding prose as input. The coupling flows through records
   and evidence — never through vibes.
 
-## Branch state — read this before writing code (updated 2026-07-05)
+## Branch state — read this before writing code (updated 2026-07-05, post-merge)
 
-- Chunk 2 COMPLETE and merged to main (b40e22e).
-- Chunk 3 (`claude/chunk-3-workers-lanes-vl5mh8`) BUILT, awaiting drills.
-- Chunk 4 (`claude/chunk-4-monitoring-confidence-mud9n3`) BUILT on top of
-  the chunk-3 branch, awaiting drills (runbook:
-  docs/chunks/4-verification.md). Chunk-4 fixes land there.
-- 178 tests green at handoff. Keep them green before every commit.
+- Chunks 2, 3 and 4 are all MERGED to main (chunk 4 merge: d59f640).
+  Chunk 3's live-drill additions (chat decision channel, lane amendments
+  with user approval, hold/resume workers, steer-with-ack, tool_denied
+  attention) were integrated into chunk 4 before the merge — both feature
+  sets are live together on main.
+- Chunk 4's own live drills are still PENDING
+  (docs/chunks/4-verification.md); its stamp stays BUILT until they pass.
+  Chunk-4 drill fixes now land on main.
+- Chunk 5 branches from main.
+- 201 tests green at handoff. Keep them green before every commit.
 
 ## What Chunk 4 added (concrete map)
 
