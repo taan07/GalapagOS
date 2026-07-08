@@ -123,6 +123,12 @@ type LiveEntry = {
   loopDone: Promise<void>;
   stopRequested: boolean;
   /**
+   * One-shot: a hold interrupted the in-flight turn on purpose. The aborted
+   * turn surfaces as an error RESULT from the SDK — expected debris of the
+   * brake, not a worker failure. Cleared by the next result event.
+   */
+  preemptRequested: boolean;
+  /**
    * The live lane contract — the SAME object the session's canUseTool closes
    * over, so a user-approved lane amendment takes effect on the next write.
    */
@@ -200,11 +206,18 @@ export function createWorkerRuntime(deps: {
 
   const drainReplyWaiters = (workerId: string, summary: string) => {
     const entry = live.get(workerId);
-    if (entry && entry.replyWaiters.length > 0) {
-      const waiters = entry.replyWaiters.splice(0);
-      for (const waiter of waiters) {
-        waiter(summary);
-      }
+    if (!entry || entry.replyWaiters.length === 0) {
+      return;
+    }
+    if (entry.preemptRequested) {
+      // A hold just braked this worker: anything arriving before the aborted
+      // turn's debris clears the flag is the DYING turn's tail narration —
+      // never hand that to a waiter as if it answered the hold.
+      return;
+    }
+    const waiters = entry.replyWaiters.splice(0);
+    for (const waiter of waiters) {
+      waiter(summary);
     }
   };
 
@@ -381,12 +394,25 @@ export function createWorkerRuntime(deps: {
             isError: event.payload.isError,
           });
           break;
-        case "result":
-          if (event.payload.isError && live.get(workerId)?.stopRequested) {
+        case "result": {
+          const liveEntry = live.get(workerId);
+          if (event.payload.isError && liveEntry?.stopRequested) {
             // Interrupting an in-flight turn surfaces as an error RESULT from
             // the SDK. A requested stop is not a failure: persist nothing here
             // — finalizeStop writes the honest "stopped by …" marker.
             break;
+          }
+          if (event.payload.isError && liveEntry?.preemptRequested) {
+            // Same debris, different brake: a hold aborted this turn so the
+            // pause message would land NOW instead of after minutes of queued
+            // work. The session lives on; the next turn is the hold reply.
+            liveEntry.preemptRequested = false;
+            break;
+          }
+          if (liveEntry) {
+            // A turn that ended on its own consumed nothing — never let a
+            // stale preempt flag swallow a FUTURE real failure.
+            liveEntry.preemptRequested = false;
           }
           persistEvent(worker, "result", event.payload);
           if (event.payload.isError) {
@@ -412,6 +438,7 @@ export function createWorkerRuntime(deps: {
             );
           }
           break;
+        }
         case "error": {
           const entry = live.get(workerId);
           if (entry?.stopRequested) {
@@ -702,7 +729,7 @@ export function createWorkerRuntime(deps: {
         );
       }
       const loopDone = consumeSession(worker.id, session);
-      live.set(worker.id, { session, loopDone, stopRequested: false, contract, replyWaiters: [] });
+      live.set(worker.id, { session, loopDone, stopRequested: false, preemptRequested: false, contract, replyWaiters: [] });
 
       return {
         ok: true,
@@ -868,7 +895,7 @@ required.`;
         };
       }
       const loopDone = consumeSession(worker.id, session);
-      live.set(worker.id, { session, loopDone, stopRequested: false, contract, replyWaiters: [] });
+      live.set(worker.id, { session, loopDone, stopRequested: false, preemptRequested: false, contract, replyWaiters: [] });
 
       return {
         ok: true,
@@ -951,10 +978,22 @@ required.`;
           reason: `Worker ${workerId} is ${worker.status} — there is no live session to hold.`,
         };
       }
-      const holdMessage = `HOLD (requested by ${heldBy}): pause now. Do not start anything new and do not write further changes. Reply with ONE short message stating exactly where you are and what remains, then wait for further instructions. Do not emit a completion block.`;
+      const holdMessage = `HOLD (requested by ${heldBy}): pause now. Your in-flight work was interrupted on purpose. Do not start anything new and do not write further changes. Reply with ONE short message stating exactly where you are and what remains, then wait for further instructions. Do not emit a completion block.`;
       try {
+        // A brake, not a queue entry: on a BUSY worker, abort the in-flight
+        // turn first so the pause lands NOW — a queued hold behind a long
+        // turn is no hold at all. preemptRequested keeps the aborted turn's
+        // error result from reading as a worker failure AND gates the reply
+        // waiters, so awaitReply below resolves on the actual pause
+        // acknowledgment, never on the dying turn's tail narration. A worker
+        // idle between turns needs no brake — its queue is read immediately.
+        if (worker.status === "running") {
+          entry.preemptRequested = true;
+          await entry.session.interrupt();
+        }
         entry.session.send(holdMessage);
       } catch (error) {
+        entry.preemptRequested = false;
         return { ok: false, reason: error instanceof Error ? error.message : String(error) };
       }
       persistEvent(worker, "steer", { text: holdMessage, hold: true, heldBy });

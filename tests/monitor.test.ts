@@ -58,6 +58,7 @@ function inertSession(): WorkerSession {
       },
     },
     send() {},
+    async interrupt() {},
     async stop() {},
   };
 }

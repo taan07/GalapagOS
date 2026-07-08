@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { commitRecords } from "../src/adapters/git/mutating-runner";
+import { commitRecords, mergeBranch } from "../src/adapters/git/mutating-runner";
 
 function fixtureRepo(): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), "glp-commit-"));
@@ -83,4 +83,65 @@ test("skips with a reason instead of throwing on git failure", async () => {
   const result = await commitRecords(noRepo, "galapagos(records): no repo");
   assert.equal(result.status, "skipped");
   assert.ok((result as { reason: string }).reason.length > 0);
+});
+
+function commitOn(repo: string, branch: string, file: string, contents: string): void {
+  const git = (args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8" });
+  git(["checkout", "-b", branch]);
+  writeFileSync(path.join(repo, file), contents);
+  git(["add", "-A"]);
+  git(["commit", "-m", `work on ${branch}`]);
+  git(["checkout", "main"]);
+}
+
+test("merges a worker branch into the current checkout as a merge commit", async () => {
+  const repo = fixtureRepo();
+  commitOn(repo, "galapagos/worker/feature", "feature.txt", "worker work\n");
+
+  const result = await mergeBranch({
+    projectRoot: repo,
+    branch: "galapagos/worker/feature",
+    message: "galapagos: merge worker lane \"feature\"",
+  });
+
+  assert.equal(result.status, "merged");
+  assert.equal((result as { into: string }).into, "main");
+  const log = execFileSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf8" });
+  assert.match(log, /merge worker lane/);
+  const files = execFileSync("git", ["ls-files"], { cwd: repo, encoding: "utf8" });
+  assert.match(files, /feature\.txt/);
+});
+
+test("aborts and restores the checkout when the merge conflicts", async () => {
+  const repo = fixtureRepo();
+  const git = (args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8" });
+  // Both branches touch README.md differently → a real conflict.
+  commitOn(repo, "galapagos/worker/conflict", "README.md", "worker version\n");
+  writeFileSync(path.join(repo, "README.md"), "main version\n");
+  git(["commit", "-am", "diverge on main"]);
+  const headBefore = git(["rev-parse", "HEAD"]).trim();
+
+  const result = await mergeBranch({
+    projectRoot: repo,
+    branch: "galapagos/worker/conflict",
+    message: "galapagos: merge conflict lane",
+  });
+
+  assert.equal(result.status, "conflict");
+  assert.deepEqual((result as { files: string[] }).files, ["README.md"]);
+  // The checkout is exactly as it was — HEAD unmoved, no merge in progress.
+  assert.equal(git(["rev-parse", "HEAD"]).trim(), headBefore);
+  const statusOut = git(["status", "--porcelain"]);
+  assert.equal(statusOut.trim(), "");
+});
+
+test("fails cleanly when the branch does not exist", async () => {
+  const repo = fixtureRepo();
+  const result = await mergeBranch({
+    projectRoot: repo,
+    branch: "galapagos/worker/nope",
+    message: "galapagos: merge missing",
+  });
+  assert.equal(result.status, "failed");
+  assert.match((result as { reason: string }).reason, /does not exist/);
 });

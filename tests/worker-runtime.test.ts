@@ -41,6 +41,7 @@ function fixtureRepo(): string {
 function fakeSession() {
   const pending: WorkerStreamEvent[] = [];
   const sent: string[] = [];
+  let interrupts = 0;
   let ended = false;
   let wake: (() => void) | null = null;
   const notify = () => {
@@ -68,6 +69,9 @@ function fakeSession() {
     send(text: string) {
       sent.push(text);
     },
+    async interrupt() {
+      interrupts += 1;
+    },
     async stop() {
       ended = true;
       notify();
@@ -76,6 +80,7 @@ function fakeSession() {
   return {
     session,
     sent,
+    interruptCount: () => interrupts,
     emit(event: WorkerStreamEvent) {
       pending.push(event);
       notify();
@@ -770,6 +775,75 @@ test("hold sends the pause instruction and reports the worker's position", async
 
   const deadHold = await runtime.hold("nope", "Darwin");
   assert.equal(deadHold.ok, false);
+});
+
+test("hold preempts a busy worker: turn aborted, debris suppressed, ack is the pause reply", async () => {
+  const { db, project, runtime, sessions } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  const fake = sessions[0];
+  assert.ok(fake);
+  fake.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "running", "running");
+
+  const pending = runtime.hold(outcome.workerId, "the user, via the workers page");
+  await waitFor(() => fake.sent.some((text) => text.startsWith("HOLD")), "hold delivered");
+  assert.equal(fake.interruptCount(), 1, "a busy worker is braked, not queued behind");
+
+  // The dying turn's tail narration must never read as the hold ack.
+  fake.emit({ kind: "assistant", payload: { text: "Now wiring Venus end to end." } });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  // The aborted turn's debris: an error RESULT — expected, not a failure.
+  fake.emit({
+    kind: "result",
+    payload: { subtype: "error_during_execution", isError: true, resultText: null },
+  });
+  fake.emit({ kind: "assistant", payload: { text: "Paused. At step 3 of 5; commits clean." } });
+
+  const held = await pending;
+  assert.ok(held.ok);
+  if (held.ok) {
+    assert.equal(held.response, "Paused. At step 3 of 5; commits clean.");
+  }
+  assert.notEqual(getWorker(db, outcome.workerId)?.status, "failed", "a hold is never a failure");
+  const persistedResults = listWorkerEvents(db, outcome.workerId)
+    .filter((event) => event.kind === "result")
+    .map((event) => JSON.parse(event.payload) as { isError?: boolean });
+  assert.ok(
+    persistedResults.every((payload) => payload.isError !== true),
+    "the preempted turn's error result is debris, never persisted",
+  );
+});
+
+test("hold on a worker idle between turns does not interrupt anything", async () => {
+  const { db, project, runtime, sessions } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  const fake = sessions[0];
+  assert.ok(fake);
+  fake.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  // A block-less turn end parks the worker awaiting its manager.
+  fake.emit({
+    kind: "result",
+    payload: { subtype: "success", isError: false, resultText: "Which color scheme?" },
+  });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "awaiting_input", "parked");
+
+  const pending = runtime.hold(outcome.workerId, "Darwin");
+  await waitFor(() => fake.sent.some((text) => text.startsWith("HOLD")), "hold delivered");
+  assert.equal(fake.interruptCount(), 0, "nothing in flight — nothing to brake");
+  fake.emit({ kind: "assistant", payload: { text: "Still parked; nothing started." } });
+  const held = await pending;
+  assert.ok(held.ok);
+  if (held.ok) {
+    assert.equal(held.response, "Still parked; nothing started.");
+  }
 });
 
 test("a user-approved lane amendment widens the live contract, the row, and the record", async () => {

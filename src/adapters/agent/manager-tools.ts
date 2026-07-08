@@ -18,6 +18,7 @@ import { getWorker } from "../db/repos/workers";
 import { runChecks, renderRunChecksResult } from "../checks/run-checks";
 import { describeOutcome, type DecisionOption, type DecisionOutcome } from "./decisions";
 import { observeGitRepository, recentLog } from "../git/runner";
+import { mergeBranch } from "../git/mutating-runner";
 import { createRecordsStore, type RecordDoc } from "../records/store";
 import { recordAgreedSpecific } from "../records/write-through";
 import { listAgreedSpecifics } from "../vault/specifics";
@@ -561,6 +562,94 @@ export function createManagerToolServer(context: ManagerToolContext) {
           );
           return text(
             `Amendment applied with the user's approval. Lane "${laneName}" now allows: ${outcome.allowedGlobs.join(", ")}. The worker has been told.${decision.answer.custom ? ` User note: ${decision.answer.custom}` : ""}`,
+          );
+        },
+      ),
+      tool(
+        "merge_worker",
+        "Merge a worker's branch into the project's current checkout — ONLY ever at the user's say-so. If the USER explicitly told you to merge in their message, pass user_instructed=true and it merges straight away. If YOU are proposing the merge, pass user_instructed=false and it puts a one-click Merge/Not-yet confirmation to the user and waits. Set user_instructed=true ONLY when the user's own words this turn asked for the merge; when in doubt, false. On conflict the merge is aborted and the checkout restored untouched — you report the conflicting files and hand it back. The worktree and branch are left intact.",
+        {
+          id: z.string().describe("The worker whose branch to merge"),
+          user_instructed: z
+            .boolean()
+            .describe(
+              "True ONLY if the user explicitly asked for this merge in their message; false when you are the one proposing it (triggers a one-click confirmation).",
+            ),
+        },
+        async ({ id, user_instructed }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const status = bridge.workers.status(id);
+          if (!status) {
+            emit("merge_worker", `no worker ${id}`, "");
+            return text(`No worker with id ${id}. Use list_workers to see what exists.`);
+          }
+          const branch = status.worker.branch;
+          const laneName = status.lane?.name ?? "(unknown lane)";
+
+          // Darwin-initiated merges need the user's one click; user-instructed
+          // ones do not (they asked). This is the whole gate — the capability
+          // exists, but it never fires on Darwin's own initiative.
+          if (!user_instructed) {
+            if (!context.askUser) {
+              return text(
+                "A merge you propose needs the user's confirmation, and no decision channel is available in this context.",
+              );
+            }
+            const decision = await context.askUser(
+              `Darwin suggests merging worker lane "${laneName}" (branch ${branch}) into the current checkout.`,
+              [
+                {
+                  label: "Merge into main",
+                  implication: `Branch ${branch} lands in the project's checkout as a merge commit. The worktree and branch stay for reference.`,
+                },
+                {
+                  label: "Not yet",
+                  implication: "Nothing is merged; the branch stays where it is until you say so.",
+                },
+              ],
+              false,
+            );
+            if (decision.status !== "answered") {
+              emit("merge_worker", `merge ${decision.status} for ${branch}`, laneName);
+              return text(
+                decision.status === "timeout"
+                  ? "The user did not answer — NOTHING was merged. Treat it as deferred; do not retry without new cause."
+                  : "The turn was interrupted before the user answered — NOTHING was merged.",
+              );
+            }
+            if (!decision.answer.selections.includes("Merge into main")) {
+              emit("merge_worker", `user declined merging ${branch}`, decision.answer.custom || laneName);
+              return text(
+                `The user chose NOT to merge${decision.answer.custom ? ` — their note: ${decision.answer.custom}` : ""}. Branch ${branch} is untouched.`,
+              );
+            }
+          }
+
+          const result = await mergeBranch({
+            projectRoot: context.projectRoot,
+            branch,
+            message: `galapagos: merge worker lane "${laneName}" (${branch})`,
+          });
+          if (result.status === "conflict") {
+            emit("merge_worker", `merge conflict: ${branch}`, result.files.join("\n"));
+            return text(
+              `Merge hit conflicts in ${result.files.length} file${result.files.length === 1 ? "" : "s"} and was aborted — your checkout is exactly as it was. Conflicting: ${result.files.join(", ")}. Resolve these by hand (or steer/resume the worker to rebase), then try again.`,
+            );
+          }
+          if (result.status === "failed") {
+            emit("merge_worker", `merge failed: ${branch}`, result.reason);
+            return text(`Merge did not run: ${result.reason}. Nothing was merged.`);
+          }
+          emit(
+            "merge_worker",
+            `merged ${branch} → ${result.into}`,
+            `${user_instructed ? "user-instructed" : "user-approved"} merge commit ${result.sha.slice(0, 8)}`,
+          );
+          return text(
+            `Merged branch ${branch} into ${result.into} (merge commit ${result.sha.slice(0, 8)}). The worktree and branch remain for reference.`,
           );
         },
       ),

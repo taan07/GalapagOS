@@ -4,6 +4,12 @@
 // Chunk 3 extends it exactly as far as `worktree add`/`worktree remove` for
 // worker worktrees under <stateDir>/worktrees/<project-slug>/<lane-slug>/ —
 // NEVER inside the target repo. Tags arrive with the bloodline chunk.
+//
+// mergeBranch is the one operation that mutates the target repo's tree (not
+// just docs/galapagos/): landing a worker branch into the main checkout. It
+// exists only behind the user's explicit say-so (see merge_worker / the
+// manager doctrine) and self-heals on conflict — it aborts and restores the
+// checkout rather than leaving the repo mid-merge.
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
@@ -70,6 +76,71 @@ export async function commitRecords(
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     return { status: "skipped", reason };
+  }
+}
+
+export type MergeResult =
+  | { status: "merged"; sha: string; into: string }
+  | { status: "conflict"; files: string[]; into: string }
+  | { status: "failed"; reason: string };
+
+/**
+ * Merge a worker branch into the target repo's current checkout. Always a
+ * merge commit (--no-ff) so every landing is one visible, revertable node in
+ * history. On conflict the merge is aborted and the working tree restored —
+ * the user's repo is never left mid-merge — and the conflicting files come
+ * back for the user to resolve by hand. The worktree and branch are left
+ * intact; merging integrates commits, it does not retire the worker.
+ */
+export async function mergeBranch(input: {
+  projectRoot: string;
+  branch: string;
+  message: string;
+}): Promise<MergeResult> {
+  try {
+    const operation = inProgressOperation(input.projectRoot);
+    if (operation) {
+      return { status: "failed", reason: `the target repo has a ${operation} — resolve it first` };
+    }
+    try {
+      await git(input.projectRoot, ["rev-parse", "--verify", `refs/heads/${input.branch}`]);
+    } catch {
+      return { status: "failed", reason: `branch "${input.branch}" does not exist in the target repo` };
+    }
+    const head = (await git(input.projectRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
+    const into = head === "HEAD" ? "(detached HEAD)" : head;
+
+    try {
+      await git(input.projectRoot, ["merge", "--no-ff", "-m", input.message, input.branch]);
+    } catch (error) {
+      // A merge now in progress means real conflicts — abort so the user's
+      // checkout is exactly as it was, and hand back the conflicting paths.
+      if (inProgressOperation(input.projectRoot) === "merge in progress") {
+        const conflicted = await git(input.projectRoot, [
+          "diff",
+          "--name-only",
+          "--diff-filter=U",
+        ]).catch(() => "");
+        const files = conflicted
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean);
+        await git(input.projectRoot, ["merge", "--abort"]).catch(() => {});
+        return { status: "conflict", files, into };
+      }
+      // Refused before starting (e.g. local changes would be overwritten):
+      // git's stderr is the actionable message — surface it verbatim.
+      const stderr = (error as { stderr?: string }).stderr;
+      return {
+        status: "failed",
+        reason: (stderr && stderr.trim()) || (error instanceof Error ? error.message : String(error)),
+      };
+    }
+
+    const sha = (await git(input.projectRoot, ["rev-parse", "HEAD"])).trim();
+    return { status: "merged", sha, into };
+  } catch (error) {
+    return { status: "failed", reason: error instanceof Error ? error.message : String(error) };
   }
 }
 

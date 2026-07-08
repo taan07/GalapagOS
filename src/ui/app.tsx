@@ -21,6 +21,9 @@ import { AddProjectForm, ProjectPicker } from "./project-picker";
 import { SpecificsPanel } from "./specifics-panel";
 
 const LAST_PROJECT_KEY = "galapagos.lastProjectId";
+// The fallback model when Fable's usage limit is reached (see the "change to
+// Opus" action on a limit-reached turn error).
+const OPUS_MODEL = "claude-opus-4-8";
 
 function turnsToChatItems(turns: TurnView[]): ChatItem[] {
   return turns.flatMap((turn): ChatItem[] => {
@@ -230,14 +233,26 @@ export function App() {
   }, [refreshAttention, refreshConfidence]);
 
   const sendNow = useCallback(
-    async (projectId: string, text: string): Promise<void> => {
+    async (
+      projectId: string,
+      text: string,
+      options?: { model?: string; echoUser?: boolean },
+    ): Promise<void> => {
       setWorking(true);
-      setItems((current) => [...current, { kind: "user", text }]);
+      // The Opus retry doesn't re-echo the user bubble — the failed message is
+      // already on screen above the limit note.
+      if (options?.echoUser !== false) {
+        setItems((current) => [...current, { kind: "user", text }]);
+      }
       try {
         const response = await fetch("/api/manager/message", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ projectId, text }),
+          body: JSON.stringify({
+            projectId,
+            text,
+            ...(options?.model ? { model: options.model } : {}),
+          }),
         });
 
         if (!response.ok || !response.body) {
@@ -269,7 +284,12 @@ export function App() {
               continue;
             }
             const event = JSON.parse(dataLine.slice(6)) as ManagerStreamEvent;
-            if (event.type === "assistant_text") {
+            if (event.type === "turn_complete") {
+              // The turn is over — unlock the input NOW. The stream stays
+              // open only to deliver the post-turn distillation note; the
+              // daemon accepts the next message the moment this event fires.
+              setWorking(false);
+            } else if (event.type === "assistant_text") {
               setItems((current) => [...current, { kind: "assistant", text: event.text }]);
             } else if (event.type === "tool_use") {
               setItems((current) => [...current, { kind: "chip", chip: event }]);
@@ -346,10 +366,25 @@ export function App() {
               }
               void refreshSpecifics(projectId);
             } else if (event.type === "turn_error") {
-              setItems((current) => [
-                ...current,
-                { kind: "note", text: `Turn failed: ${event.message}` },
-              ]);
+              // A usage limit on Fable is recoverable: offer the Opus switch
+              // instead of a dead error note. Once Darwin is already on Opus,
+              // there's nothing to switch to — fall back to a plain note.
+              if (event.limitReached && event.model && event.model !== OPUS_MODEL) {
+                setItems((current) => [
+                  ...current,
+                  {
+                    kind: "limit",
+                    message: event.message,
+                    failedText: text,
+                    model: event.model as string,
+                  },
+                ]);
+              } else {
+                setItems((current) => [
+                  ...current,
+                  { kind: "note", text: `Turn failed: ${event.message}` },
+                ]);
+              }
             }
           }
         }
@@ -406,6 +441,19 @@ export function App() {
       void sendNow(selectedId, next);
     }
   }, [working, selectedId, sendNow]);
+
+  // "Change to Opus": switch this project's manager model and re-send the
+  // message that hit Fable's limit. The daemon remembers the switch, so every
+  // later turn stays on Opus until it restarts.
+  const handleSwitchToOpus = useCallback(
+    (failedText: string) => {
+      if (!selectedId) {
+        return;
+      }
+      void sendNow(selectedId, failedText, { model: OPUS_MODEL, echoUser: false });
+    },
+    [selectedId, sendNow],
+  );
 
   const handleSend = useCallback(
     (text: string) => {
@@ -534,6 +582,7 @@ export function App() {
             onSend={handleSend}
             onClearRebrief={handleClearRebrief}
             onAnswerDecision={handleAnswerDecision}
+            onSwitchToOpus={handleSwitchToOpus}
           />
           <div className="side-stack">
             {confidence ? (

@@ -108,6 +108,59 @@ function DecisionPrompt({
   );
 }
 
+/** A friendly model name for the limit note; the raw id is the fallback. */
+function modelLabel(model: string): string {
+  if (/fable/i.test(model)) {
+    return "Fable";
+  }
+  if (/opus/i.test(model)) {
+    return "Opus";
+  }
+  return model;
+}
+
+/**
+ * A usage-limit failure: Darwin couldn't answer on Fable. One click switches
+ * the project to Opus and re-sends the message. Local state so the button
+ * settles the moment it's used (the retry streams into the chat above).
+ */
+function LimitNote({
+  message,
+  model,
+  disabled,
+  onSwitch,
+}: {
+  message: string;
+  model: string;
+  disabled: boolean;
+  onSwitch: () => void;
+}) {
+  const [switched, setSwitched] = useState(false);
+  return (
+    <div className="msg system-note limit-note">
+      <div className="limit-headline">
+        Darwin hit the {modelLabel(model)} usage limit and couldn&apos;t finish this turn.
+      </div>
+      <div className="limit-detail">{message}</div>
+      {switched ? (
+        <div className="limit-switched">Switched to Opus — re-sending your message…</div>
+      ) : (
+        <button
+          className="limit-switch"
+          disabled={disabled}
+          onClick={() => {
+            setSwitched(true);
+            onSwitch();
+          }}
+          title="Switch this project's manager to Opus and retry. Later turns stay on Opus until the daemon restarts."
+        >
+          Change to Opus &amp; retry
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function Chat({
   items,
   working,
@@ -117,6 +170,7 @@ export function Chat({
   onSend,
   onClearRebrief,
   onAnswerDecision,
+  onSwitchToOpus,
 }: {
   items: ChatItem[];
   working: boolean;
@@ -126,6 +180,7 @@ export function Chat({
   onSend: (text: string) => void;
   onClearRebrief: (rebrief: RebriefView) => void;
   onAnswerDecision: (decisionId: string, selections: string[], custom: string) => void;
+  onSwitchToOpus: (failedText: string) => void;
 }) {
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -220,6 +275,17 @@ export function Chat({
                 onAnswer={(selections, custom) =>
                   onAnswerDecision(item.decision.decisionId, selections, custom)
                 }
+              />
+            );
+          }
+          if (item.kind === "limit") {
+            return (
+              <LimitNote
+                key={index}
+                message={item.message}
+                model={item.model}
+                disabled={disabled || working}
+                onSwitch={() => onSwitchToOpus(item.failedText)}
               />
             );
           }
