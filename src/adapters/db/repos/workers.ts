@@ -33,6 +33,8 @@ export type WorkerRow = {
   last_heartbeat_at: string | null;
   last_message_at: string | null;
   last_summary: string | null;
+  /** Predecessor worker id when this session continues stopped work. */
+  resumed_from: string | null;
   created_at: string;
 };
 
@@ -60,6 +62,7 @@ export function createWorker(
     worktreePath: string;
     branch: string;
     briefRecordId?: string | null;
+    resumedFrom?: string | null;
   },
 ): WorkerRow {
   const row: WorkerRow = {
@@ -74,15 +77,16 @@ export function createWorker(
     last_heartbeat_at: null,
     last_message_at: null,
     last_summary: null,
+    resumed_from: input.resumedFrom ?? null,
     created_at: nowIso(),
   };
   db.prepare(
     `INSERT INTO workers (id, project_id, lane_id, sdk_session_id, worktree_path, branch,
                           brief_record_id, status, last_heartbeat_at, last_message_at,
-                          last_summary, created_at)
+                          last_summary, resumed_from, created_at)
      VALUES (@id, @project_id, @lane_id, @sdk_session_id, @worktree_path, @branch,
              @brief_record_id, @status, @last_heartbeat_at, @last_message_at,
-             @last_summary, @created_at)`,
+             @last_summary, @resumed_from, @created_at)`,
   ).run(row);
   return row;
 }

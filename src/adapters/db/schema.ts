@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS workers (
   last_heartbeat_at TEXT,
   last_message_at TEXT,
   last_summary TEXT,
+  resumed_from TEXT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_workers_project ON workers(project_id, status);

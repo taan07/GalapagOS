@@ -11,6 +11,7 @@ import {
   latestSdkSessionId,
   listTurns,
   markSessionResumed,
+  updateTurnContent,
   updateTurnSdkSessionId,
   type ManagerTurnRow,
 } from "../db/repos/manager";
@@ -18,6 +19,7 @@ import type { ProjectRow } from "../db/repos/projects";
 import { buildManagerDoctrine } from "../../daemon/doctrine";
 import { createRecordsStore, type RecordDoc, type RecordsStore } from "../records/store";
 import { createManagerToolServer } from "./manager-tools";
+import type { DecisionBroker, DecisionOption, DecisionOutcome } from "./decisions";
 import { baseQueryOptions } from "./spawn";
 import type { WorkerRuntime } from "./worker-runtime";
 
@@ -35,7 +37,34 @@ export type ManagerTurnEvent =
     }
   | { type: "turn_complete"; resultText: string; sdkSessionId: string | null }
   | { type: "interrupted"; message: string }
+  | {
+      type: "decision_request";
+      turnId: string;
+      decisionId: string;
+      question: string;
+      options: DecisionOption[];
+      multiSelect: boolean;
+    }
+  | {
+      type: "decision_settled";
+      decisionId: string;
+      status: "answered" | "timeout" | "interrupted";
+      selections: string[];
+      custom: string;
+    }
   | { type: "turn_error"; message: string };
+
+/** Persisted payload of a system decision turn (manager_turns.content). */
+export type DecisionTurnPayload = {
+  kind: "decision";
+  decisionId: string;
+  question: string;
+  options: DecisionOption[];
+  multiSelect: boolean;
+  status: "pending" | "answered" | "timeout" | "interrupted" | "expired";
+  selections: string[];
+  custom: string;
+};
 
 /** Persisted payload of a system re-brief turn (manager_turns.content). */
 export type RebriefTurnPayload = {
@@ -65,14 +94,18 @@ const MANAGER_ALLOWED_TOOLS = [
   "mcp__galapagos__write_record",
   "mcp__galapagos__update_record",
   "mcp__galapagos__spawn_worker",
+  "mcp__galapagos__resume_worker",
   "mcp__galapagos__steer_worker",
+  "mcp__galapagos__hold_worker",
   "mcp__galapagos__stop_worker",
+  "mcp__galapagos__amend_lane",
   "mcp__galapagos__list_workers",
   "mcp__galapagos__worker_status",
   "mcp__galapagos__run_checks",
   "mcp__galapagos__list_attention",
   "mcp__galapagos__resolve_attention",
   "mcp__galapagos__review_completion",
+  "mcp__galapagos__ask_user",
   "Read",
   "Glob",
   "Grep",
@@ -124,6 +157,8 @@ export async function runManagerTurn(input: {
   abortController?: AbortController;
   /** The daemon's live worker runtime; absent in contexts without workers. */
   workers?: WorkerRuntime;
+  /** The daemon's decision broker — chat accept/deny and questionnaires. */
+  decisions?: DecisionBroker;
 }): Promise<ManagerTurnOutcome> {
   const { db, config, project, userText, emit } = input;
   const store = createRecordsStore(project.root_path, project.slug);
@@ -148,6 +183,64 @@ export async function runManagerTurn(input: {
   let resultWasError = false;
   let completed = false;
 
+  /**
+   * The chat decision channel: persist the question as a system turn (so it
+   * survives reloads), stream it as clickable options, wait for the user via
+   * the broker, stamp the settled state back into the turn. Darwin's turn
+   * holds while the user decides; timeout and interrupt resolve honestly.
+   */
+  const askUser =
+    input.decisions !== undefined
+      ? async (question: string, options: DecisionOption[], multiSelect: boolean) => {
+          const broker = input.decisions as DecisionBroker;
+          const { request, outcome } = broker.ask({
+            question,
+            options,
+            multiSelect,
+            ...(input.abortController ? { signal: input.abortController.signal } : {}),
+          });
+          const payload: DecisionTurnPayload = {
+            kind: "decision",
+            decisionId: request.id,
+            question,
+            options,
+            multiSelect,
+            status: "pending",
+            selections: [],
+            custom: "",
+          };
+          const turn = appendTurn(db, {
+            sessionId: session.id,
+            role: "system",
+            content: JSON.stringify(payload),
+          });
+          emit({
+            type: "decision_request",
+            turnId: turn.id,
+            decisionId: request.id,
+            question,
+            options,
+            multiSelect,
+          });
+          const settled: DecisionOutcome = await outcome;
+          const settledPayload: DecisionTurnPayload = {
+            ...payload,
+            status: settled.status,
+            selections: settled.status === "answered" ? settled.answer.selections : [],
+            custom: settled.status === "answered" ? settled.answer.custom : "",
+          };
+          updateTurnContent(db, turn.id, JSON.stringify(settledPayload));
+          emit({
+            type: "decision_settled",
+            decisionId: request.id,
+            status: settled.status,
+            selections: settledPayload.selections,
+            custom: settledPayload.custom,
+          });
+          return settled;
+        }
+      : undefined;
+
   const toolServer = createManagerToolServer({
     projectRoot: project.root_path,
     projectSlug: project.slug,
@@ -158,6 +251,8 @@ export async function runManagerTurn(input: {
     config,
     project,
     ...(input.workers ? { workers: input.workers } : {}),
+    // The chat decision channel (chunk 3 drills): clickable options, waits.
+    ...(askUser ? { askUser } : {}),
     onToolEvent: (event) => {
       const turn = appendTurn(db, {
         sessionId: session.id,

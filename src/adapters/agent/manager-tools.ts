@@ -16,6 +16,7 @@ import { getLane, laneGlobs } from "../db/repos/lanes";
 import type { ProjectRow } from "../db/repos/projects";
 import { getWorker } from "../db/repos/workers";
 import { runChecks, renderRunChecksResult } from "../checks/run-checks";
+import { describeOutcome, type DecisionOption, type DecisionOutcome } from "./decisions";
 import { observeGitRepository, recentLog } from "../git/runner";
 import { createRecordsStore, type RecordDoc } from "../records/store";
 import { recordAgreedSpecific } from "../records/write-through";
@@ -41,10 +42,21 @@ export type ManagerToolContext = {
   db?: GalapagosDb;
   config?: GalapagosConfig;
   /**
-   * Deliver a question to the user's chat surface. Wired only for triage
-   * sessions — Darwin's main session talks to the user directly.
+   * The chat decision channel (user-confirmed 2026-07-05): put a decision to
+   * the user as clickable options and WAIT. Wired for live manager turns
+   * only — a triage session must never block on the user.
    */
-  askUser?: (question: string, context: string) => { attentionId: string };
+  askUser?: (
+    question: string,
+    options: DecisionOption[],
+    multiSelect: boolean,
+  ) => Promise<DecisionOutcome>;
+  /**
+   * Fire-and-forget escalation (chunk 4 triage): the question lands as a
+   * system note in Darwin's chat AND a high-priority queue item; answers
+   * flow back through Darwin. Wired only for triage sessions.
+   */
+  escalateToUser?: (question: string, context: string) => { attentionId: string };
   onToolEvent?: (event: { tool: string; summary: string; detail: string }) => void;
 };
 
@@ -384,21 +396,224 @@ export function createManagerToolServer(context: ManagerToolContext) {
         },
       ),
       tool(
-        "steer_worker",
-        "Inject a message into a running worker mid-task: course corrections, answers to its questions, added context. The worker treats it as part of the same task.",
-        { id: z.string(), message: z.string() },
-        async ({ id, message }) => {
+        "resume_worker",
+        "Continue a STOPPED (or failed) worker's task: a fresh session in the SAME worktree and branch, lane re-activated, briefed from the original worker_brief record plus the worktree's current git state and your continuation note. This is the ONLY way to continue stopped work — never reuse its lane name for a new spawn.",
+        {
+          id: z.string().describe("The stopped worker's id"),
+          note: z
+            .string()
+            .optional()
+            .describe("Continuation instruction — what to focus on or change"),
+        },
+        async ({ id, note }) => {
           const bridge = requireWorkers();
           if (!bridge) {
             return text("Worker control is not available in this context.");
           }
-          const outcome = bridge.workers.steer(id, message);
+          const outcome = await bridge.workers.resume({
+            project: bridge.project,
+            workerId: id,
+            ...(note ? { note } : {}),
+          });
+          if (!outcome.ok) {
+            emit("resume_worker", `resume rejected for ${id.slice(0, 8)}`, outcome.reason);
+            return text(`Resume rejected: ${outcome.reason}`);
+          }
+          const detail = [
+            `new worker ${outcome.workerId} (continues ${id})`,
+            `same worktree ${outcome.worktreePath} on ${outcome.branch}`,
+            `lane "${outcome.laneSlug}" re-activated`,
+          ].join("\n");
+          emit("resume_worker", `resumed work as worker ${outcome.workerId.slice(0, 8)}`, detail);
+          return text(
+            `Resumed. ${detail}\nThe new session was briefed with the original brief plus the worktree's real state${note ? " and your note" : ""}. Check on it with worker_status.`,
+          );
+        },
+      ),
+      tool(
+        "steer_worker",
+        "Inject a message into a running worker mid-task: course corrections, answers to its questions, added context. The worker treats it as part of the same task. By default this waits briefly for the worker's next reply so you can confirm the steer was understood — check the reply before telling the user it landed.",
+        {
+          id: z.string(),
+          message: z.string(),
+          await_response: z
+            .boolean()
+            .optional()
+            .describe("Wait up to ~60s for the worker's reply (default true)"),
+        },
+        async ({ id, message, await_response }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const outcome = await bridge.workers.steer(id, message, {
+            awaitResponse: await_response ?? true,
+          });
           if (!outcome.ok) {
             emit("steer_worker", `steer failed for ${id}`, outcome.reason);
             return text(`Steer failed: ${outcome.reason}`);
           }
+          if (outcome.response !== null) {
+            emit("steer_worker", `steered worker ${id.slice(0, 8)} — it replied`, `${message}\n\n↳ ${outcome.response}`);
+            return text(`Message delivered. The worker's reply: ${outcome.response}`);
+          }
           emit("steer_worker", `steered worker ${id.slice(0, 8)}`, message);
-          return text(`Message delivered to worker ${id}.`);
+          return text(
+            await_response === false
+              ? `Message delivered to worker ${id}.`
+              : `Message delivered to worker ${id} — no reply within the wait window yet. Check worker_status shortly; do not assume how the steer was taken.`,
+          );
+        },
+      ),
+      tool(
+        "hold_worker",
+        "Pause a live worker WITHOUT stopping it: sends a hold instruction — the worker states exactly where it is and waits. The lane stays active and the session stays live; release it later with steer_worker ('continue'). Use this when the user wants to think or redirect without losing the session.",
+        { id: z.string() },
+        async ({ id }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          const outcome = await bridge.workers.hold(id, "Darwin");
+          if (!outcome.ok) {
+            emit("hold_worker", `hold failed for ${id}`, outcome.reason);
+            return text(`Hold failed: ${outcome.reason}`);
+          }
+          emit(
+            "hold_worker",
+            `held worker ${id.slice(0, 8)}`,
+            outcome.response ?? "(no acknowledgment yet)",
+          );
+          return text(
+            outcome.response !== null
+              ? `Worker held. Its position: ${outcome.response}`
+              : "Hold delivered — the worker has not acknowledged within the wait window; check worker_status shortly.",
+          );
+        },
+      ),
+      tool(
+        "amend_lane",
+        "Widen a LIVE worker's lane mid-flight (add allowed globs) — for the moment a nearly-done task legitimately needs one file outside its lane. The amendment passes the same exclusivity gate a spawn does, and THE USER MUST APPROVE it first: this tool asks them in chat and waits. State a concrete reason; it is shown to the user verbatim.",
+        {
+          id: z.string().describe("The live worker's id"),
+          add_globs: z.array(z.string()).describe("Globs to ADD to the allowed set"),
+          reason: z.string().describe("Why the task needs this, in user terms"),
+        },
+        async ({ id, add_globs, reason }) => {
+          const bridge = requireWorkers();
+          if (!bridge) {
+            return text("Worker control is not available in this context.");
+          }
+          if (!context.askUser) {
+            return text(
+              "Lane amendments require the user's approval, and no decision channel is available in this context.",
+            );
+          }
+          const status = bridge.workers.status(id);
+          if (!status) {
+            return text(`No worker with id ${id}.`);
+          }
+          const laneName = status.lane?.name ?? "(unknown lane)";
+          const decision = await context.askUser(
+            `Darwin wants to widen worker lane "${laneName}" to also allow: ${add_globs.join(", ")}. Reason: ${reason}`,
+            [
+              {
+                label: "Allow the amendment",
+                implication: `The worker may now also change files matching ${add_globs.join(", ")} — the change is recorded and audited like everything else.`,
+              },
+              {
+                label: "Deny",
+                implication: "The lane stays as declared; the worker must finish without those files (or be stopped and re-scoped).",
+              },
+            ],
+            false,
+          );
+          if (decision.status !== "answered") {
+            emit("amend_lane", `amendment ${decision.status} for ${laneName}`, reason);
+            return text(
+              decision.status === "timeout"
+                ? "The user did not answer — the lane is UNCHANGED. Treat the amendment as deferred; do not retry without new cause."
+                : "The turn was interrupted before the user answered — the lane is UNCHANGED.",
+            );
+          }
+          const approved = decision.answer.selections.includes("Allow the amendment");
+          if (!approved) {
+            emit("amend_lane", `user denied widening ${laneName}`, decision.answer.custom || reason);
+            return text(
+              `The user DENIED the amendment${decision.answer.custom ? ` — their note: ${decision.answer.custom}` : ""}. The lane is unchanged; adjust the plan accordingly.`,
+            );
+          }
+          const outcome = await bridge.workers.applyLaneAmendment({
+            project: bridge.project,
+            workerId: id,
+            addGlobs: add_globs,
+            reason,
+            approvedBy: "the user (in chat)",
+          });
+          if (!outcome.ok) {
+            emit("amend_lane", `amendment failed for ${laneName}`, outcome.reason);
+            return text(`The user approved, but the amendment failed: ${outcome.reason}`);
+          }
+          emit(
+            "amend_lane",
+            `lane "${laneName}" widened (user-approved)`,
+            `now allows: ${outcome.allowedGlobs.join(", ")}\nreason: ${reason}`,
+          );
+          return text(
+            `Amendment applied with the user's approval. Lane "${laneName}" now allows: ${outcome.allowedGlobs.join(", ")}. The worker has been told.${decision.answer.custom ? ` User note: ${decision.answer.custom}` : ""}`,
+          );
+        },
+      ),
+      tool(
+        "ask_user",
+        "Put a REAL decision to the user. In a live chat turn this renders clickable options and WAITS for the answer (10-minute timeout; the user always gets a free-text field). In a triage session it instead lands the question in the user's chat AND on the attention queue without waiting — include your recommendation in `context`. Use only for decisions that change what gets built or how; never re-ask what records already answer.",
+        {
+          question: z.string().describe("The decision, phrased concretely"),
+          options: z
+            .array(
+              z.object({
+                label: z.string().describe("Short choice text (1-6 words)"),
+                implication: z
+                  .string()
+                  .describe("What choosing this means in practice, in product terms"),
+              }),
+            )
+            .max(6)
+            .optional()
+            .describe("2-6 choices; omit for a pure free-text question"),
+          multi_select: z
+            .boolean()
+            .optional()
+            .describe("Allow choosing several options (default false)"),
+          context: z
+            .string()
+            .optional()
+            .describe(
+              "Triage escalations: why this needs the user, what you checked, your recommendation",
+            ),
+        },
+        async ({ question, options, multi_select, context: questionContext }) => {
+          if (context.askUser) {
+            const decision = await context.askUser(question, options ?? [], multi_select ?? false);
+            emit(
+              "ask_user",
+              decision.status === "answered" ? "the user decided" : `question ${decision.status}`,
+              `${question}\n↳ ${describeOutcome(decision)}`,
+            );
+            return text(describeOutcome(decision));
+          }
+          if (context.escalateToUser) {
+            // Triage never blocks on the user: fire-and-forget into chat +
+            // queue; the answer arrives through Darwin.
+            const { attentionId } = context.escalateToUser(question, questionContext ?? "");
+            emit("ask_user", `escalated to user: ${oneLine(question, 80)}`, questionContext ?? "");
+            return text(
+              `Question delivered to the user (attention item ${attentionId}). Do not wait for the answer — it will arrive through Darwin.`,
+            );
+          }
+          return text(
+            "The decision channel is not available in this context — ask in plain chat text instead.",
+          );
         },
       ),
       tool(
@@ -410,7 +625,7 @@ export function createManagerToolServer(context: ManagerToolContext) {
           if (!bridge) {
             return text("Worker control is not available in this context.");
           }
-          const outcome = await bridge.workers.stop(id);
+          const outcome = await bridge.workers.stop(id, "Darwin");
           if (!outcome.ok) {
             emit("stop_worker", `stop failed for ${id}`, outcome.reason);
             return text(`Stop failed: ${outcome.reason}`);
@@ -649,28 +864,6 @@ export function createManagerToolServer(context: ManagerToolContext) {
           setDigestStatus(bridge.db, digest.id, verdict);
           emit("review_completion", `${verdict}: ${oneLine(digest.narrative, 80)}`, note);
           return text(`Completion digest for worker ${worker_id} marked ${verdict}.`);
-        },
-      ),
-      tool(
-        "ask_user",
-        "Escalate ONE question to the user: it lands in their chat with Darwin and on the attention queue. Use it only for what genuinely needs the user — failures you cannot resolve, contradictions, direction calls. Include your own recommendation in the context; never relay a worker's question without adding your judgment.",
-        {
-          question: z.string(),
-          context: z
-            .string()
-            .describe("Why this needs the user, what you checked, and your recommendation"),
-        },
-        async ({ question, context: questionContext }) => {
-          if (!context.askUser) {
-            return text(
-              "Direct user escalation is not available in this context — you ARE talking to the user; just ask.",
-            );
-          }
-          const { attentionId } = context.askUser(question, questionContext);
-          emit("ask_user", `escalated to user: ${oneLine(question, 80)}`, questionContext);
-          return text(
-            `Question delivered to the user (attention item ${attentionId}). Do not wait for the answer — it will arrive through Darwin.`,
-          );
         },
       ),
     ],

@@ -23,7 +23,10 @@ export type AttentionKind =
   // Chunk 4 legs (user-confirmed 2026-07-05): the work's integrity is in
   // question — a test-integrity tripwire fired, the watchdog flagged the
   // transcript, or the critic rejected the work against its brief.
-  | "integrity_alert";
+  | "integrity_alert"
+  // Chunk 3 drills (loud-denial ruling): a worker repeatedly denied the
+  // same tool may be improvising around the wall — surface it.
+  | "tool_denied";
 
 export type AttentionStatus = "open" | "resolved" | "dismissed";
 

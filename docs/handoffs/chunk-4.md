@@ -30,7 +30,12 @@ lanes, workers, worker_events, completion_digests, attention_items (you ADD
 evidence_runs per architecture §3); per-project records in each target
 repo's docs/galapagos/; Darwin's tools: git_truth, record_specific,
 list_specifics, read_records, write_record, update_record, spawn_worker,
-steer_worker, stop_worker, list_workers, worker_status; workers run in
+resume_worker (continue stopped work in the same worktree — user-confirmed
+ruling), steer_worker (waits bounded for the worker's reply), hold_worker
+(pause without ending), stop_worker, amend_lane (user-approval-gated lane
+widening), list_workers, worker_status, ask_user (chat decision prompts —
+clickable options + free text, turn waits; 10-min timeout = deferral);
+workers run in
 worktrees under <GALAPAGOS_STATE_DIR>/worktrees/<project-slug>/<lane-slug>/
 on branches galapagos/worker/<lane-slug>, streaming-input query() with
 canUseTool lane guard (preventive; Bash bypass documented), every message
@@ -92,15 +97,41 @@ override everything, including this handoff. Then implement
 
 - Chunk 2 is COMPLETE (all live drills passed) and MERGED to main at
   b40e22e; its branch is deleted. Chunk-2-surface fixes now land on main.
-- Chunk 3 (`claude/chunk-3-workers-lanes-vl5mh8`) is REBASED directly onto
-  main (merge-base == main's tip) and BUILT, awaiting the user's live
-  drills. Chunk-3 fixes land on that branch; rebase your stack after.
+- Chunk 3 is MERGED to main (2026-07-05, user's direction; round-1 drills
+  passed, rounds 2-3 run against main). Chunk-3-surface fixes now land on
+  MAIN. Rebase your stack onto origin/main — it contains everything: the
+  drill fixes, resume_worker, the decision channel, gated amend_lane,
+  hold, steer-ack, loud denials, and the contract amendments.
 - Post-rebase additions on the chunk-3 branch beyond the original build:
   triple-Esc turn interrupt, distill restraint (unaccepted proposals →
   open_question), daemon identity (rev/branch in startup line + /health),
   workers defaulting to claude-opus-4-8 at high effort (user-confirmed).
 - 116 tests green at handoff (`npm test` = typecheck + `node --test` on
   `dist-node/tests`). Keep them green before every commit.
+
+## Scope triage/monitor around closing Darwin's sensory loop
+
+A flow review (docs/reviews/manager-worker-flow-2026-07-05.md,
+user-requested) verified that NO path exists today by which worker events
+reach Darwin — he is blind between his own turns, and the user carries
+worker questions from the /workers page into chat by hand. Treat the
+review's Tier 1 as acceptance criteria for this chunk's triage/monitor/
+evidence work, not new scope: (1) a worker turn ending without a
+completion block raises a question-shaped attention item that triage
+consumes — answering from records when covered, steering the worker,
+escalating only direction calls; (2) every manager turn starts with a
+deterministic LLM-free fleet snapshot from SQLite; (3) Darwin can see
+evidence before he speaks — run_checks (already in your brief) plus a
+bounded worker_diff, and a doctrine line that he may read worker worktrees
+read-only. The review's rulings all landed 2026-07-05 (see the review's Rulings
+section): steer-ack, hold, loud denials, the ask_user decision channel,
+and user-gated amend_lane are BUILT on the chunk-3 branch; malformed-
+retry, deferred spawns, and any merge_worker are REJECTED (merging is
+permanently human — architecture §6); quick_task and the garage are
+stamped roadmap, not built. Your triage's ask_user escalation should use
+the SAME decision mechanism (src/adapters/agent/decisions.ts) rather than
+inventing another channel, and tool_denied attention items now exist as a
+monitor/confidence input.
 
 ## What Chunk 3 added (concrete map)
 
@@ -125,7 +156,7 @@ override everything, including this handoff. Then implement
   (pure, tested), normalized `WorkerStreamEvent`s.
 - `src/adapters/agent/worker-runtime.ts` — daemon-side orchestration:
   `createWorkerRuntime({db, config, sessionFactory?, broadcast?})` →
-  spawn/steer/stop/list/status/reconcileOrphans. `collectAuditFiles`
+  spawn/resume/steer/stop/list/status/reconcileOrphans. `collectAuditFiles`
   (diff base...HEAD ∪ porcelain -uall) lives here — your monitor tick
   wants it. Tests inject a fake sessionFactory; yours can too.
 - `src/adapters/agent/worker-doctrine.ts` — the worker system prompt (lane

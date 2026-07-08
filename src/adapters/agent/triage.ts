@@ -246,7 +246,9 @@ export async function runTriageJob(input: {
     project,
     db,
     config,
-    askUser: createAskUserBridge({ db, project, ...(input.broadcast ? { broadcast: input.broadcast } : {}) }),
+    // Triage gets the fire-and-forget escalation channel, never the blocking
+    // decision channel — a triage session must not wait on the user.
+    escalateToUser: createAskUserBridge({ db, project, ...(input.broadcast ? { broadcast: input.broadcast } : {}) }),
     onToolEvent: (event) => {
       actions.push(`${event.tool}: ${event.summary}`);
     },

@@ -1,6 +1,7 @@
 "use client";
 
 import type { SpecificView } from "./types";
+import { localDate } from "./time";
 
 export function SpecificsPanel({ specifics }: { specifics: SpecificView[] }) {
   return (
@@ -20,7 +21,7 @@ export function SpecificsPanel({ specifics }: { specifics: SpecificView[] }) {
               <div className="q">{specific.question}</div>
               <div className="a">{specific.answer}</div>
               <div className="meta">
-                {specific.status} · {specific.createdAt.slice(0, 10)}
+                {specific.status} · {localDate(specific.createdAt)}
               </div>
             </div>
           ))

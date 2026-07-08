@@ -37,6 +37,8 @@ export type SpawnWorkerSessionInput = {
   briefText: string;
   model: string;
   lane: LaneContract;
+  /** Called on every guard denial — feeds the loud-denial attention pattern. */
+  onToolDenied?: (tool: string) => void;
 };
 
 export type WorkerSessionFactory = (input: SpawnWorkerSessionInput) => WorkerSession;
@@ -76,8 +78,16 @@ const FILE_WRITE_TOOLS: Record<string, string> = {
  * tools outside the lane with an explanation the worker can act on. Pure
  * decision logic — exported for direct testing without an SDK session.
  */
-export function workerCanUseTool(lane: LaneContract, worktreePath: string): CanUseTool {
+export function workerCanUseTool(
+  lane: LaneContract,
+  worktreePath: string,
+  onDeny?: (tool: string) => void,
+): CanUseTool {
   const worktreeRoot = path.resolve(worktreePath);
+  const deny = (toolName: string, message: string) => {
+    onDeny?.(toolName);
+    return { behavior: "deny" as const, message };
+  };
   return async (toolName, input) => {
     const pathField = FILE_WRITE_TOOLS[toolName];
     if (!pathField) {
@@ -85,26 +95,26 @@ export function workerCanUseTool(lane: LaneContract, worktreePath: string): CanU
       // plus lane-checked file writes). Anything else — WebFetch, Task,
       // whatever future tools appear — is refused, not silently granted;
       // a headless daemon has no human watching approvals.
-      return {
-        behavior: "deny",
-        message: `${toolName} is not part of the worker tool surface. You have: Read, Glob, Grep, Bash, TodoWrite, WebFetch, and in-lane Edit/Write. If the task truly needs more, say so and stop — the manager will decide.`,
-      };
+      return deny(
+        toolName,
+        `${toolName} is not part of the worker tool surface. You have: Read, Glob, Grep, Bash, TodoWrite, WebFetch, and in-lane Edit/Write. If the task truly needs more, say so and stop — the manager will decide.`,
+      );
     }
 
     const rawPath = input[pathField];
     if (typeof rawPath !== "string" || !rawPath.trim()) {
-      return {
-        behavior: "deny",
-        message: `${toolName} was called without a usable ${pathField} — retry with an explicit path.`,
-      };
+      return deny(
+        toolName,
+        `${toolName} was called without a usable ${pathField} — retry with an explicit path.`,
+      );
     }
 
     const absolute = path.resolve(worktreeRoot, rawPath);
     if (absolute !== worktreeRoot && !absolute.startsWith(`${worktreeRoot}${path.sep}`)) {
-      return {
-        behavior: "deny",
-        message: `Denied: ${rawPath} is outside your worktree (${worktreeRoot}). You work only inside your own worktree.`,
-      };
+      return deny(
+        toolName,
+        `Denied: ${rawPath} is outside your worktree (${worktreeRoot}). You work only inside your own worktree.`,
+      );
     }
 
     const relative = path.relative(worktreeRoot, absolute).split(path.sep).join("/");
@@ -115,10 +125,10 @@ export function workerCanUseTool(lane: LaneContract, worktreePath: string): CanU
         violation.reason === "forbidden"
           ? `matches the forbidden glob ${violation.glob}`
           : `matches none of your lane's allowed globs (${lane.allowedGlobs.join(", ")})`;
-      return {
-        behavior: "deny",
-        message: `Denied: ${relative} is outside your lane — it ${why}. If the task truly requires this file, say so and stop; the manager will re-scope your lane.`,
-      };
+      return deny(
+        toolName,
+        `Denied: ${relative} is outside your lane — it ${why}. If the task truly requires this file, say so and stop; the manager will re-scope your lane.`,
+      );
     }
 
     return { behavior: "allow", updatedInput: input };
@@ -223,7 +233,7 @@ export function spawnWorkerSession(input: SpawnWorkerSessionInput): WorkerSessio
       effort: input.config.workerEffort,
       systemPrompt: input.systemPrompt,
       allowedTools: WORKER_ALLOWED_TOOLS,
-      canUseTool: workerCanUseTool(input.lane, input.worktreePath),
+      canUseTool: workerCanUseTool(input.lane, input.worktreePath, input.onToolDenied),
       settingSources: [],
       maxTurns: WORKER_MAX_TURNS,
     },
@@ -238,13 +248,45 @@ export function spawnWorkerSession(input: SpawnWorkerSessionInput): WorkerSessio
             continue;
           }
           if (message.type === "assistant") {
+            // Every content block becomes an event or is skipped DELIBERATELY.
+            // The drill-5 finding: WebFetch can execute as a server-side tool,
+            // arriving as server_tool_use / web_fetch_tool_result blocks — an
+            // allowlisted-on-condition-of-visibility tool must never leave a
+            // hole in the stream, so unknown block types fall through to a
+            // generic event rather than silently vanishing.
             for (const block of message.message.content) {
-              if (block.type === "text" && block.text.trim().length > 0) {
-                yield { kind: "assistant", payload: { text: block.text } };
-              } else if (block.type === "tool_use") {
+              if (block.type === "text") {
+                if (block.text.trim().length > 0) {
+                  yield { kind: "assistant", payload: { text: block.text } };
+                }
+              } else if (
+                block.type === "tool_use" ||
+                block.type === "server_tool_use" ||
+                block.type === "mcp_tool_use"
+              ) {
                 yield {
                   kind: "tool_use",
                   payload: { tool: block.name, input: block.input },
+                };
+              } else if (block.type.endsWith("_tool_result")) {
+                const result = block as { type: string; content?: unknown; is_error?: boolean };
+                yield {
+                  kind: "tool_result",
+                  payload: {
+                    content: toolResultText(result.content),
+                    isError: result.is_error === true,
+                  },
+                };
+              } else if (
+                block.type === "thinking" ||
+                block.type === "redacted_thinking" ||
+                block.type === "compaction"
+              ) {
+                // Internal reasoning/bookkeeping — deliberately not persisted.
+              } else {
+                yield {
+                  kind: "tool_use",
+                  payload: { tool: block.type, input: block },
                 };
               }
             }

@@ -192,11 +192,138 @@ sqlite3 ~/.galapagos/state.db "SELECT status, COUNT(*) FROM workers GROUP BY sta
 
 ---
 
-**All ten pass →** flip the stamp in `docs/chunks/3.md` to COMPLETE, and
-rule on the remaining implementer decisions in that stamp (especially #1,
-the hybrid completion-report timing — drill 2 showed you its behavior).
-Then delete `~/Dev/chunk3-drill` and its state rows if you want, or keep
-it as a scratch project.
+# Round 2 — after the post-drill fixes (2026-07-05)
+
+Round 1 passed drills 1–4, 6–9 and the sweep; its four findings are fixed
+on this branch. Pull, `npm install && npm test` (expect 120/120), restart
+`npm run dev`, confirm `/health` reports your checkout's revision. Then:
+
+## R2-1. Timestamps spot-check (finding 0)
+
+With any worker streaming, compare an event's time in the drilldown and a
+record's created date on /records against your system clock.
+
+- [ ] Times match your local clock and timezone, not UTC.
+
+## R2-2. Drill 5 re-run, sharpened (finding 1)
+
+Re-run drill 5 (WebFetch probe, NEW lane name — e.g. "docs fetch two").
+
+- [ ] EVERY fetch appears in the stream: a `WebFetch` chip, a
+      `server_tool_use`-style chip, or a Bash `curl` chip — whichever way
+      your CLI executes it, the trail is visible.
+- [ ] Open the digest card and check each claim's evidence badge: a claim
+      about fetched content backed by a real fetch may say `diff`/`manual`;
+      if the worker could NOT fetch, its narrative must SAY so — content
+      presented as fetched with no fetch chip anywhere is a FAIL (report
+      it; that's a worker-honesty defect, not a pipeline one).
+
+## R2-3. Stop, then continue (findings 2 + 3, the ruled path)
+
+Spawn a worker on a real multi-step task (new lane name). Mid-task, stop
+it with the /workers Stop button.
+
+- [ ] The stream shows "Stopped by the user, via the workers page" — NOT
+      `error_during_execution`. Status pill: `stopped`, not `failed`.
+- [ ] Ask Darwin to CONTINUE that work (phrase it lazily: "pick that back
+      up, and also …"). He uses `resume_worker` — not a new spawn — the
+      drilldown's new worker shows "continues <predecessor>", the SAME
+      worktree path, and the lane is active again.
+- [ ] Ask Darwin to spawn a fresh worker reusing the OLD lane name: he
+      relays a clean rejection (no failed row in `sqlite3 … "SELECT status
+      FROM workers"`).
+
+## R2-4. The lazy request (item 4 — Darwin's brief-writing IS the gate)
+
+Say to Darwin, verbatim or in your own lazy words:
+
+> make a little page that lists the notes files, nothing fancy
+
+Zero lane/glob/brief detail. Judge what he does:
+
+- [ ] He consults records (read_records chip), asks AT MOST a couple of
+      sharp questions if genuinely warranted — none is also acceptable —
+      and never asks you for lane names or globs.
+- [ ] Before spawning he states, in one line, the lane name, globs, and
+      brief title he's about to use.
+- [ ] The lane name is fresh (non-colliding); the globs are the narrowest
+      sensible scope; open the worker_brief record on /records — it reads
+      as a real hand-off: goal, concrete deliverables, constraints, out of
+      scope, done-criteria with self-verification.
+- [ ] The worker completes WITHOUT needing a steer to understand the task.
+
+Your judgment of that brief's quality is the acceptance test — if you
+wouldn't hand that brief to a contractor, the item fails; report what was
+missing.
+
+---
+
+# Round 3 — the decision channel and worker dexterity (2026-07-05)
+
+Pull, `npm install && npm test` (expect 130/130), restart `npm run dev`,
+confirm `/health` shows your revision. Then:
+
+## R3-1. The questionnaire (ask_user)
+
+Tell Darwin something that forces a real fork, e.g.:
+
+> I want the notes page to support sorting — you pick what matters, but
+> ask me anything that changes the product.
+
+- [ ] A decision card appears IN CHAT: clickable options, each with a
+      practical implication, plus a free-text field. Darwin's turn waits.
+- [ ] Click an option (or type a note) — Darwin continues in the same
+      turn, acts on the answer, and records it (record_specific chip).
+- [ ] Reload the page mid-decision: the card re-renders and still answers.
+- [ ] Let one time out (10 min) or triple-Esc: the card settles honestly
+      ("deferred"/"interrupted") and Darwin does NOT guess.
+
+## R3-2. The amendment gate (amend_lane)
+
+Spawn a worker on a narrow lane, then mid-task tell Darwin the task also
+needs one file outside it (or engineer the brief so the worker asks).
+
+- [ ] Darwin proposes the amendment via an accept/deny card naming the
+      globs and his reason — NOTHING changes until you click.
+- [ ] Accept: the drilldown shows the "LANE AMENDED" steer, the worker can
+      now edit the file, and the worker_brief record on /records carries
+      the approved-by note.
+- [ ] Deny one too: the lane stays unchanged and Darwin adjusts the plan.
+
+## R3-3. Hold, then release
+
+While a worker runs, click **Hold** in its drilldown (or ask Darwin to
+hold it).
+
+- [ ] The worker replies with exactly where it is; pill turns
+      `awaiting input`; the lane stays active (an overlapping spawn is
+      still refused).
+- [ ] Ask Darwin to continue it — an ordinary steer releases it. No stop,
+      no audit, no attention items.
+
+## R3-4. Steer acknowledgment
+
+Ask Darwin to steer a busy worker with a change of direction.
+
+- [ ] Darwin's steer chip shows the worker's REPLY (or an honest "no
+      response within the wait window"), and what he tells you reflects
+      the reply, not just "delivered".
+
+## R3-5. Loud denials
+
+Brief a worker to attempt WebSearch three times (a drill brief may say so
+explicitly).
+
+- [ ] The stream shows each denial; after the third, ONE `tool_denied`
+      attention row exists (`sqlite3 ~/.galapagos/state.db "SELECT kind,
+      title FROM attention_items WHERE kind='tool_denied'"`).
+
+---
+
+**All of round 2 passes →** flip the stamp in `docs/chunks/3.md` to
+COMPLETE. Every decision in the stamp is now user-ruled. Then delete
+`~/Dev/chunk3-drill` and its state rows if you want, and the branch merges
+to main (chunk 4 rebases on it).
 
 **Likely failure points:** drill 1 needs your keychain auth (`claude
 /login` state) — a "Not logged in" turn error means the daemon wasn't

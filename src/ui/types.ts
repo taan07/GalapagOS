@@ -39,11 +39,23 @@ export type RebriefView = {
   cleared: boolean;
 };
 
+/** A decision Darwin put to the user in chat (ask_user / amend_lane gate). */
+export type DecisionView = {
+  decisionId: string;
+  question: string;
+  options: { label: string; implication: string }[];
+  multiSelect: boolean;
+  status: "pending" | "answered" | "timeout" | "interrupted" | "expired";
+  selections: string[];
+  custom: string;
+};
+
 export type ChatItem =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string }
   | { kind: "chip"; chip: ToolChip }
   | { kind: "rebrief"; rebrief: RebriefView }
+  | { kind: "decision"; decision: DecisionView }
   | { kind: "note"; text: string };
 
 export type ManagerStreamEvent =
@@ -53,6 +65,21 @@ export type ManagerStreamEvent =
   | { type: "rebrief"; reason: string; preamble: string | null; turnId: string | null }
   | { type: "turn_complete"; resultText: string; sdkSessionId: string | null }
   | { type: "interrupted"; message: string }
+  | {
+      type: "decision_request";
+      turnId: string;
+      decisionId: string;
+      question: string;
+      options: { label: string; implication: string }[];
+      multiSelect: boolean;
+    }
+  | {
+      type: "decision_settled";
+      decisionId: string;
+      status: "answered" | "timeout" | "interrupted";
+      selections: string[];
+      custom: string;
+    }
   | {
       type: "distilled";
       recordsWritten: number;
@@ -77,6 +104,8 @@ export type WorkerView = {
   createdAt: string;
   hasDigest: boolean;
   openAttentionCount: number;
+  /** Predecessor worker id when this session continues stopped work. */
+  resumedFrom: string | null;
 };
 
 export type WorkerEventView = {

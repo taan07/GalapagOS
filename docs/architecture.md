@@ -166,8 +166,16 @@ worker briefs + open attention). This is the reason records exist.
 Manager tools (in-process `createSdkMcpServer` + `tool()`):
 `read_records`, `write_record`, `update_record`, `list_workers`,
 `worker_status(id)`, `git_truth(scope)`, `spawn_worker(lane, brief)`,
-`steer_worker(id, message)`, `stop_worker(id)`, `run_checks(worker_id?, keys[])`,
-`ask_user(question, context)`, `resolve_attention(id, resolution)`.
+`resume_worker(id, note)` (continue stopped work in the same worktree),
+`steer_worker(id, message)` (waits bounded for the worker's reply),
+`hold_worker(id)` (pause without ending), `stop_worker(id)`,
+`amend_lane(id, add_globs, reason)` (user-approval-gated; see §7),
+`run_checks(worker_id?, keys[])`, `ask_user(question, options)`,
+`resolve_attention(id, resolution)`. `ask_user` renders as clickable
+options in the chat — single or multiple choice, implications worded in
+product terms, always a free-text field — and the manager turn waits for
+the answer (10-minute timeout resolves as a deferral; user-confirmed
+2026-07-05).
 `write_record(type=decision)` triggers the checkpoint mechanism (section 8).
 
 **Distillation:** after each manager turn, enqueue a `distill` job — one cheap
@@ -215,7 +223,10 @@ message to end with a fenced block:
 
 The daemon parses it into `completion_digests`. Missing or malformed report →
 `unstructured_completion` attention item; the worker is **not** rendered as
-done. The visual change map is derived live from `git diff --numstat
+done. **Merging a worker's branch into the project is the USER's,
+permanently (user-confirmed 2026-07-05):** the manager's completion duty is
+the branch name plus an honest evidence summary — the mutating-git surface
+never grows a merge. The visual change map is derived live from `git diff --numstat
 <lane.base_sha>...HEAD`, not from the report.
 
 **Worker harness abstraction.** `adapters/agent/worker-session.ts` is the ONLY
@@ -235,7 +246,12 @@ external harness binary.
 Lane = `allowed_globs` / `forbidden_globs` (picomatch) + `base_sha`, declared at
 spawn, echoed in the worker_brief record and worker system prompt. Spawn-time
 overlap rejection: a new lane whose allowed globs intersect an active lane's is
-refused.
+refused. A live lane may be WIDENED mid-flight (`amend_lane`,
+user-confirmed 2026-07-05) through the exact same exclusivity gate a spawn
+passes, and only with the user's explicit chat approval; every amendment is
+recorded on the lane row and the worker_brief record and announced to the
+worker. Exclusivity is never weakened — no two active lanes may overlap,
+before or after amendment.
 
 Two enforcement layers:
 1. **Preventive (best-effort UX):** `canUseTool` denies Edit/Write outside the

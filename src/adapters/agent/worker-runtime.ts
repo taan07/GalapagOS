@@ -3,6 +3,7 @@
 // SQLite as it happens): spawn = lane row + worktree + brief record + session,
 // steer = streaming-input injection, stop = end session + detective lane
 // audit + completion check. The harness itself is behind worker-session.ts.
+import { existsSync } from "node:fs";
 import type { GalapagosConfig } from "../../config";
 import { checkLane, findLaneOverlap, type LaneContract } from "../../core/lanes/lane-check";
 import { parseCompletionReport } from "../../core/digests/completion";
@@ -10,10 +11,12 @@ import { parseStatusPorcelain } from "../../core/git/parsers";
 import { oneLine } from "../../core/text";
 import type { GalapagosDb } from "../db/db";
 import {
+  amendLaneGlobs,
   createLane,
   getLane,
   laneGlobs,
   listActiveLanes,
+  reactivateLane,
   retireLane,
   type LaneRow,
 } from "../db/repos/lanes";
@@ -119,6 +122,13 @@ type LiveEntry = {
   session: WorkerSession;
   loopDone: Promise<void>;
   stopRequested: boolean;
+  /**
+   * The live lane contract — the SAME object the session's canUseTool closes
+   * over, so a user-approved lane amendment takes effect on the next write.
+   */
+  contract: LaneContract;
+  /** One-shot waiters for the worker's next visible reply (steer-with-ack). */
+  replyWaiters: ((summary: string) => void)[];
 };
 
 /**
@@ -167,6 +177,53 @@ export function createWorkerRuntime(deps: {
   // (manager tool racing the HTTP route) must not run the audit twice and
   // duplicate attention items.
   const stopping = new Set<string>();
+  // Same-tool denial counters per live worker (loud-denial ruling): a worker
+  // silently improvising around a permission wall must become visible.
+  const denialCounts = new Map<string, Map<string, number>>();
+  const DENIAL_ATTENTION_THRESHOLD = 3;
+
+  const recordDenial = (workerId: string, projectId: string, tool: string) => {
+    const perWorker = denialCounts.get(workerId) ?? new Map<string, number>();
+    denialCounts.set(workerId, perWorker);
+    const count = (perWorker.get(tool) ?? 0) + 1;
+    perWorker.set(tool, count);
+    if (count === DENIAL_ATTENTION_THRESHOLD) {
+      createAttentionItem(db, {
+        projectId,
+        workerId,
+        kind: "tool_denied",
+        title: `Worker denied ${tool} ${count} times`,
+        detail: `The lane/tool guard denied ${tool} ${count} times in this session. The worker may be improvising around the denial — review its stream, steer it an alternative, or escalate whether ${tool} should be granted.`,
+      });
+    }
+  };
+
+  const drainReplyWaiters = (workerId: string, summary: string) => {
+    const entry = live.get(workerId);
+    if (entry && entry.replyWaiters.length > 0) {
+      const waiters = entry.replyWaiters.splice(0);
+      for (const waiter of waiters) {
+        waiter(summary);
+      }
+    }
+  };
+
+  /** Bounded wait for the worker's next visible reply; null on timeout. */
+  const awaitReply = (entry: LiveEntry, timeoutMs: number): Promise<string | null> =>
+    new Promise<string | null>((resolve) => {
+      const timer = setTimeout(() => {
+        const index = entry.replyWaiters.indexOf(waiter);
+        if (index !== -1) {
+          entry.replyWaiters.splice(index, 1);
+        }
+        resolve(null);
+      }, timeoutMs);
+      const waiter = (summary: string) => {
+        clearTimeout(timer);
+        resolve(summary);
+      };
+      entry.replyWaiters.push(waiter);
+    });
 
   const broadcastStatus = (worker: { id: string; project_id: string }) => {
     const row = getWorker(db, worker.id);
@@ -302,6 +359,7 @@ export function createWorkerRuntime(deps: {
           break;
         case "assistant":
           persistEvent(worker, "assistant", event.payload, oneLine(event.payload.text));
+          drainReplyWaiters(workerId, oneLine(event.payload.text, 400));
           break;
         case "tool_use": {
           // Write/Edit inputs can carry whole files; the worktree already
@@ -324,13 +382,14 @@ export function createWorkerRuntime(deps: {
           });
           break;
         case "result":
+          if (event.payload.isError && live.get(workerId)?.stopRequested) {
+            // Interrupting an in-flight turn surfaces as an error RESULT from
+            // the SDK. A requested stop is not a failure: persist nothing here
+            // — finalizeStop writes the honest "stopped by …" marker.
+            break;
+          }
           persistEvent(worker, "result", event.payload);
           if (event.payload.isError) {
-            if (live.get(workerId)?.stopRequested) {
-              // Interrupting an in-flight turn can surface as an error
-              // RESULT: the user stopped this worker; it did not fail.
-              break;
-            }
             // Auth/model/max-turn failure: the session cannot continue. Never
             // retried on a fresh session (chunk 2 rule, same for workers).
             failed = true;
@@ -345,6 +404,12 @@ export function createWorkerRuntime(deps: {
             // doctrine, a stated blocker or question — the worker is waiting
             // on its manager, not resting.
             setStatus(worker, parseStatus === "missing" ? "awaiting_input" : "idle");
+            drainReplyWaiters(
+              workerId,
+              event.payload.resultText
+                ? oneLine(event.payload.resultText, 400)
+                : "(turn ended without text)",
+            );
           }
           break;
         case "error": {
@@ -378,9 +443,16 @@ export function createWorkerRuntime(deps: {
    * The at-stop safety pass: detective lane audit over the worktree, the
    * has-a-digest check, lane retirement. Runs for live stops and for boot
    * reconciliation alike. Never silently skipped — an audit that cannot run
-   * becomes an attention item.
+   * becomes an attention item. `stoppedBy` names who ended this worker so
+   * the stream records a deliberate stop as a stop, never as a failure.
    */
-  const finalizeStop = async (worker: WorkerRow): Promise<StopWorkerOutcome> => {
+  const finalizeStop = async (worker: WorkerRow, stoppedBy: string): Promise<StopWorkerOutcome> => {
+    persistEvent(worker, "result", {
+      subtype: "stopped",
+      isError: false,
+      resultText: null,
+      stoppedBy,
+    });
     const lane = getLane(db, worker.lane_id);
     const violations: { path: string; reason: string }[] = [];
     let auditError: string | null = null;
@@ -500,6 +572,28 @@ export function createWorkerRuntime(deps: {
         }
       }
 
+      // Leftovers from a retired lane of the same name are a CLEAN rejection
+      // — Darwin reads the reason and picks a new name (or resumes the old
+      // worker). They must never become a failed worker row (drill finding).
+      const worktreePath = workerWorktreePath(config.stateDir, project.slug, laneSlug);
+      const branch = `galapagos/worker/${laneSlug}`;
+      if (existsSync(worktreePath)) {
+        return {
+          ok: false,
+          reason: `A previous lane named "${laneName}" left its worktree at ${worktreePath} — that work is preserved there. Pick a NEW lane name for new work, or use resume_worker on the stopped worker to continue the old task.`,
+        };
+      }
+      try {
+        const runner = new LocalGitCommandRunner();
+        await runner.runGit(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], project.root_path);
+        return {
+          ok: false,
+          reason: `The branch ${branch} already exists from a previous lane named "${laneName}". Pick a NEW lane name — worker branches are never reused.`,
+        };
+      } catch {
+        // branch does not exist — the name is free
+      }
+
       const lane = createLane(db, {
         projectId: project.id,
         name: laneName,
@@ -508,8 +602,6 @@ export function createWorkerRuntime(deps: {
         forbiddenGlobs,
         baseSha,
       });
-      const worktreePath = workerWorktreePath(config.stateDir, project.slug, laneSlug);
-      const branch = `galapagos/worker/${laneSlug}`;
       const worker = createWorker(db, {
         projectId: project.id,
         laneId: lane.id,
@@ -576,6 +668,9 @@ export function createWorkerRuntime(deps: {
         );
       }
 
+      // One shared contract object: the session's canUseTool closes over it,
+      // so an approved amend_lane mutation applies to the very next write.
+      const contract: LaneContract = { allowedGlobs, forbiddenGlobs };
       let session: WorkerSession;
       try {
         session = sessionFactory({
@@ -592,7 +687,8 @@ export function createWorkerRuntime(deps: {
           }),
           briefText: input.brief,
           model: input.model?.trim() || config.workerModel,
-          lane: { allowedGlobs, forbiddenGlobs },
+          lane: contract,
+          onToolDenied: (tool) => recordDenial(worker.id, project.id, tool),
         });
       } catch (error) {
         await removeWorktree({
@@ -606,7 +702,7 @@ export function createWorkerRuntime(deps: {
         );
       }
       const loopDone = consumeSession(worker.id, session);
-      live.set(worker.id, { session, loopDone, stopRequested: false });
+      live.set(worker.id, { session, loopDone, stopRequested: false, contract, replyWaiters: [] });
 
       return {
         ok: true,
@@ -620,7 +716,183 @@ export function createWorkerRuntime(deps: {
       };
     },
 
-    steer(workerId: string, message: string): { ok: true } | { ok: false; reason: string } {
+    /**
+     * Continue a stopped worker's task (user-confirmed ruling, 2026-07-05):
+     * a FRESH session in the SAME worktree and branch, lane re-activated
+     * after re-checking exclusivity, briefed from the original worker_brief
+     * record plus the worktree's actual git state. The old session is gone —
+     * this is continuation of the WORK, not resurrection of the transcript.
+     */
+    async resume(input: {
+      project: ProjectRow;
+      workerId: string;
+      note?: string;
+    }): Promise<SpawnWorkerOutcome> {
+      const { project } = input;
+      const predecessor = getWorker(db, input.workerId);
+      if (!predecessor) {
+        return { ok: false, reason: `No worker with id ${input.workerId}.` };
+      }
+      if (live.has(predecessor.id) || stopping.has(predecessor.id)) {
+        return {
+          ok: false,
+          reason: `Worker ${predecessor.id} is still live — steer it instead of resuming.`,
+        };
+      }
+      if (predecessor.status !== "stopped" && predecessor.status !== "failed") {
+        return {
+          ok: false,
+          reason: `Worker ${predecessor.id} is ${predecessor.status} — only stopped or failed workers can be resumed.`,
+        };
+      }
+      const lane = getLane(db, predecessor.lane_id);
+      if (!lane) {
+        return { ok: false, reason: `Worker ${predecessor.id} has no lane row — cannot resume.` };
+      }
+      if (!existsSync(predecessor.worktree_path)) {
+        return {
+          ok: false,
+          reason: `The worktree at ${predecessor.worktree_path} no longer exists — the work is gone; spawn a fresh worker instead.`,
+        };
+      }
+
+      // Exclusivity holds across resume: the lane's globs must not overlap
+      // any lane that became active while this one was retired.
+      const contract = laneGlobs(lane);
+      for (const active of listActiveLanes(db, project.id)) {
+        if (active.id === lane.id) {
+          continue;
+        }
+        const overlap = findLaneOverlap(contract.allowedGlobs, laneGlobs(active).allowedGlobs);
+        if (overlap) {
+          return {
+            ok: false,
+            reason: `Resume rejected: this lane's glob "${overlap.candidateGlob}" overlaps "${overlap.existingGlob}" of the now-active lane "${active.name}". Stop that worker first or wait for it.`,
+          };
+        }
+      }
+
+      // The continuation brief: the original doctrine-judged brief plus the
+      // honest state of the worktree the new session inherits.
+      let originalBrief = "(the original worker_brief record is unavailable — inspect the worktree and its commits to reconstruct the task)";
+      if (predecessor.brief_record_id) {
+        const store = createRecordsStore(project.root_path, project.slug);
+        const record = store.get(predecessor.brief_record_id);
+        if (record) {
+          originalBrief = `${record.title}\n\n${record.body.trim()}`;
+        }
+      }
+      let commits = "(could not read)";
+      let dirty = "(could not read)";
+      try {
+        const runner = new LocalGitCommandRunner();
+        commits =
+          (
+            await runner.runGit(
+              ["log", "--oneline", `${lane.base_sha}..HEAD`],
+              predecessor.worktree_path,
+            )
+          ).trim() || "(none yet)";
+        dirty =
+          (
+            await runner.runGit(["status", "--porcelain", "-uall"], predecessor.worktree_path)
+          ).trim() || "(clean)";
+      } catch (error) {
+        return {
+          ok: false,
+          reason: `Could not read the worktree's git state: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+
+      const briefText = `CONTINUATION: you are resuming a task a previous worker session started
+and did not finish. You work in the SAME worktree — its state below is
+real; inspect it with git before acting, and do not redo finished work.
+
+## Original brief
+
+${originalBrief}
+
+## Worktree state at resume
+
+Commits since the lane base:
+${commits}
+
+Uncommitted changes:
+${dirty}
+
+## Continuation instruction from the manager
+
+${input.note?.trim() || "Continue toward the original brief's done-criteria."}
+
+Review the state first, then continue. End with your completion report as
+required.`;
+
+      reactivateLane(db, lane.id);
+      const worker = createWorker(db, {
+        projectId: project.id,
+        laneId: lane.id,
+        worktreePath: predecessor.worktree_path,
+        branch: predecessor.branch,
+        briefRecordId: predecessor.brief_record_id,
+        resumedFrom: predecessor.id,
+      });
+
+      let session: WorkerSession;
+      try {
+        session = sessionFactory({
+          config,
+          worktreePath: predecessor.worktree_path,
+          systemPrompt: buildWorkerDoctrine({
+            projectName: project.name,
+            laneName: lane.name,
+            allowedGlobs: contract.allowedGlobs,
+            forbiddenGlobs: contract.forbiddenGlobs,
+            baseSha: lane.base_sha,
+            branch: predecessor.branch,
+            worktreePath: predecessor.worktree_path,
+          }),
+          briefText,
+          model: config.workerModel,
+          lane: contract,
+          onToolDenied: (tool) => recordDenial(worker.id, project.id, tool),
+        });
+      } catch (error) {
+        persistEvent(worker, "error", {
+          message: `Resuming the worker session failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        retireLane(db, lane.id);
+        setStatus(worker, "failed");
+        return {
+          ok: false,
+          reason: `Resuming the worker session failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      const loopDone = consumeSession(worker.id, session);
+      live.set(worker.id, { session, loopDone, stopRequested: false, contract, replyWaiters: [] });
+
+      return {
+        ok: true,
+        workerId: worker.id,
+        laneSlug: lane.slug,
+        branch: predecessor.branch,
+        worktreePath: predecessor.worktree_path,
+        baseSha: lane.base_sha,
+        briefRecordId: predecessor.brief_record_id ?? "(none)",
+        briefCommitNote: null,
+      };
+    },
+
+    /**
+     * Inject a message mid-run. With awaitResponse (steer-with-acknowledgment,
+     * user-confirmed ruling) the call waits — bounded — for the worker's next
+     * visible reply so the manager catches misinterpretation in the same
+     * turn; on timeout it reports "delivered, no response yet" honestly.
+     */
+    async steer(
+      workerId: string,
+      message: string,
+      options: { awaitResponse?: boolean; timeoutMs?: number } = {},
+    ): Promise<{ ok: true; response: string | null } | { ok: false; reason: string }> {
       const worker = getWorker(db, workerId);
       if (!worker) {
         return { ok: false, reason: `No worker with id ${workerId}.` };
@@ -650,10 +922,138 @@ export function createWorkerRuntime(deps: {
       }
       persistEvent(worker, "steer", { text: message });
       setStatus(worker, "running");
-      return { ok: true };
+
+      if (!options.awaitResponse) {
+        return { ok: true, response: null };
+      }
+      const response = await awaitReply(entry, options.timeoutMs ?? 60_000);
+      return { ok: true, response };
     },
 
-    async stop(workerId: string): Promise<StopWorkerOutcome> {
+    /**
+     * Hold (user-confirmed ruling): the brake that is not a Stop. A canned
+     * pause steer — the worker states where it is and waits (rendering
+     * awaiting_input by the completion contract). The lane stays active, the
+     * session stays live; release is an ordinary steer.
+     */
+    async hold(
+      workerId: string,
+      heldBy: string,
+    ): Promise<{ ok: true; response: string | null } | { ok: false; reason: string }> {
+      const worker = getWorker(db, workerId);
+      if (!worker) {
+        return { ok: false, reason: `No worker with id ${workerId}.` };
+      }
+      const entry = live.get(workerId);
+      if (!entry || worker.status === "failed" || worker.status === "stopped") {
+        return {
+          ok: false,
+          reason: `Worker ${workerId} is ${worker.status} — there is no live session to hold.`,
+        };
+      }
+      const holdMessage = `HOLD (requested by ${heldBy}): pause now. Do not start anything new and do not write further changes. Reply with ONE short message stating exactly where you are and what remains, then wait for further instructions. Do not emit a completion block.`;
+      try {
+        entry.session.send(holdMessage);
+      } catch (error) {
+        return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+      }
+      persistEvent(worker, "steer", { text: holdMessage, hold: true, heldBy });
+      const response = await awaitReply(entry, 60_000);
+      return { ok: true, response };
+    },
+
+    /**
+     * Apply a user-APPROVED lane amendment (the approval gate lives in the
+     * amend_lane tool — the runtime only ever applies what the user allowed):
+     * widen the lane through the same exclusivity gate a spawn passes, record
+     * the amendment on the lane row and brief record, tell the worker.
+     */
+    async applyLaneAmendment(input: {
+      project: ProjectRow;
+      workerId: string;
+      addGlobs: string[];
+      reason: string;
+      approvedBy: string;
+    }): Promise<{ ok: true; allowedGlobs: string[] } | { ok: false; reason: string }> {
+      const { project } = input;
+      const worker = getWorker(db, input.workerId);
+      if (!worker) {
+        return { ok: false, reason: `No worker with id ${input.workerId}.` };
+      }
+      const entry = live.get(input.workerId);
+      if (!entry || worker.status === "failed" || worker.status === "stopped") {
+        return {
+          ok: false,
+          reason: `Worker ${input.workerId} is ${worker.status} — amend lanes only on live workers (resume first).`,
+        };
+      }
+      const lane = getLane(db, worker.lane_id);
+      if (!lane) {
+        return { ok: false, reason: `Worker ${input.workerId} has no lane row.` };
+      }
+      const addGlobs = input.addGlobs.map((glob) => glob.trim()).filter(Boolean);
+      if (addGlobs.length === 0) {
+        return { ok: false, reason: "An amendment needs at least one glob to add." };
+      }
+
+      // The SAME exclusivity gate a spawn passes: the widened lane must not
+      // overlap any other active lane.
+      for (const active of listActiveLanes(db, project.id)) {
+        if (active.id === lane.id) {
+          continue;
+        }
+        const overlap = findLaneOverlap(addGlobs, laneGlobs(active).allowedGlobs);
+        if (overlap) {
+          return {
+            ok: false,
+            reason: `Amendment rejected: "${overlap.candidateGlob}" overlaps "${overlap.existingGlob}" of active lane "${active.name}". Lanes stay exclusive — stop that worker first or scope differently.`,
+          };
+        }
+      }
+
+      const current = laneGlobs(lane);
+      const merged = [...current.allowedGlobs, ...addGlobs.filter((glob) => !current.allowedGlobs.includes(glob))];
+      amendLaneGlobs(db, lane.id, merged);
+      // Mutate the live contract object the session's canUseTool closes over.
+      entry.contract.allowedGlobs.length = 0;
+      entry.contract.allowedGlobs.push(...merged);
+
+      // The brief record carries the amendment — the lane contract's paper
+      // trail stays in the target repo's history.
+      if (worker.brief_record_id) {
+        try {
+          const store = createRecordsStore(project.root_path, project.slug);
+          store.update({
+            id: worker.brief_record_id,
+            note: `Lane amended (approved by ${input.approvedBy}): allowed globs now ${merged.join(", ")}. Reason: ${input.reason}`,
+          });
+          await commitRecords(
+            project.root_path,
+            `galapagos(records): lane amendment for ${lane.slug}`,
+          );
+        } catch {
+          // The amendment itself stands; the record note is best-effort and
+          // the next distill commit will carry any pending record changes.
+        }
+      }
+
+      const notice = `LANE AMENDED (approved by ${input.approvedBy}): your allowed globs are now: ${merged.join(", ")}. Reason: ${input.reason}. The forbidden globs are unchanged.`;
+      try {
+        entry.session.send(notice);
+      } catch (error) {
+        return {
+          ok: false,
+          reason: `Amendment applied but the worker could not be told: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      persistEvent(worker, "steer", { text: notice, laneAmendment: { addGlobs } });
+      return { ok: true, allowedGlobs: merged };
+    },
+
+    async stop(
+      workerId: string,
+      stoppedBy = "an unspecified caller",
+    ): Promise<StopWorkerOutcome> {
       const worker = getWorker(db, workerId);
       if (!worker) {
         return { ok: false, reason: `No worker with id ${workerId}.` };
@@ -682,7 +1082,7 @@ export function createWorkerRuntime(deps: {
           await entry.session.stop();
           await entry.loopDone;
         }
-        return await finalizeStop(worker);
+        return await finalizeStop(worker, stoppedBy);
       } finally {
         stopping.delete(workerId);
       }
@@ -723,7 +1123,7 @@ export function createWorkerRuntime(deps: {
           message:
             "Daemon restarted — the live worker session was lost. Work up to this point remains in the worktree.",
         });
-        await finalizeStop(worker);
+        await finalizeStop(worker, "the daemon (restart reconciliation)");
       }
       return orphans.length;
     },
