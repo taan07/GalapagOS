@@ -16,7 +16,12 @@ import { getLane, laneGlobs } from "../db/repos/lanes";
 import type { ProjectRow } from "../db/repos/projects";
 import { getWorker } from "../db/repos/workers";
 import { runChecks, renderRunChecksResult } from "../checks/run-checks";
-import { describeOutcome, type DecisionOption, type DecisionOutcome } from "./decisions";
+import {
+  describeOutcome,
+  type DecisionField,
+  type DecisionOption,
+  type DecisionOutcome,
+} from "./decisions";
 import { observeGitRepository, recentLog } from "../git/runner";
 import { createRecordsStore, type RecordDoc } from "../records/store";
 import { recordAgreedSpecific } from "../records/write-through";
@@ -51,6 +56,17 @@ export type ManagerToolContext = {
     options: DecisionOption[],
     multiSelect: boolean,
   ) => Promise<DecisionOutcome>;
+  /**
+   * A compact batch of 2-4 clickable questions as ONE card (2026-07-08): the
+   * antidote to a wall of prose. Each field is select-only; free text still
+   * arrives via the chat composer. Live manager turns only.
+   */
+  askBatch?: (fields: DecisionField[]) => Promise<DecisionOutcome>;
+  /**
+   * Play back your current understanding for the user to confirm or correct
+   * ([Confirmed] / [Needs correction] + chat free-text). Live turns only.
+   */
+  askConfirm?: (playback: string) => Promise<DecisionOutcome>;
   /**
    * Fire-and-forget escalation (chunk 4 triage): the question lands as a
    * system note in Darwin's chat AND a high-priority queue item; answers
@@ -613,6 +629,98 @@ export function createManagerToolServer(context: ManagerToolContext) {
           }
           return text(
             "The decision channel is not available in this context — ask in plain chat text instead.",
+          );
+        },
+      ),
+      tool(
+        "ask_batch",
+        "Put a COMPACT BATCH of 2-4 related decisions to the user as ONE clickable card — the antidote to a wall of questions in prose. Each question is select-only (the user picks; any free-text answer arrives via the chat composer, so never ask them to type into an option). Use when you have several small forks to resolve at once (e.g. tone + scope + units). Every option's implication MUST carry a concrete example so the choice is unambiguous ('Deadpan — e.g. \"Clear skies, a brisk -180°C\" with no wink'). Live chat turns only.",
+        {
+          questions: z
+            .array(
+              z.object({
+                prompt: z.string().describe("The single question, phrased concretely"),
+                options: z
+                  .array(
+                    z.object({
+                      label: z.string().describe("Short choice text (1-6 words)"),
+                      implication: z
+                        .string()
+                        .describe(
+                          "What choosing this means in practice — MUST include a concrete 'e.g.' example",
+                        ),
+                    }),
+                  )
+                  .min(2)
+                  .max(6)
+                  .describe("2-6 choices for this question"),
+                multi_select: z
+                  .boolean()
+                  .optional()
+                  .describe("Allow choosing several options for this question (default false)"),
+              }),
+            )
+            .min(2)
+            .max(4)
+            .describe("2-4 questions rendered as one card"),
+        },
+        async ({ questions }) => {
+          if (!context.askBatch) {
+            return text(
+              "The batch decision channel is not available in this context — ask in plain chat text instead.",
+            );
+          }
+          const fields: DecisionField[] = questions.map((q, index) => ({
+            id: `q${index + 1}`,
+            prompt: q.prompt,
+            options: q.options,
+            multiSelect: q.multi_select ?? false,
+          }));
+          const decision = await context.askBatch(fields);
+          emit(
+            "ask_batch",
+            decision.status === "answered"
+              ? `the user answered ${questions.length} questions`
+              : `batch ${decision.status}`,
+            `${questions.map((q) => `• ${q.prompt}`).join("\n")}\n↳ ${describeOutcome(decision, fields)}`,
+          );
+          return text(describeOutcome(decision, fields));
+        },
+      ),
+      tool(
+        "confirm_understanding",
+        "Play back your CURRENT understanding of the task/direction in one tight paragraph and ask the user to confirm or correct it — a [Confirmed] / [Needs correction] card. Use after a material context shift or right before you spawn a worker on something consequential, NEVER as filler. 'Confirmed' means proceed; 'Needs correction' means the user will type the fix in chat — read it and update your synthesis (record_specific) before acting.",
+        {
+          playback: z
+            .string()
+            .describe("Your understanding in 2-5 sentences, concrete and checkable"),
+        },
+        async ({ playback }) => {
+          if (!context.askConfirm) {
+            return text(
+              "The confirm channel is not available in this context — state your understanding in plain chat instead.",
+            );
+          }
+          const decision = await context.askConfirm(playback);
+          if (decision.status !== "answered") {
+            emit("confirm_understanding", `playback ${decision.status}`, playback);
+            return text(
+              decision.status === "timeout"
+                ? "The user did not confirm within the time limit. Do not assume your understanding is right; re-confirm before consequential action."
+                : "The turn was interrupted before the user confirmed. Do not assume your understanding is right.",
+            );
+          }
+          const confirmed =
+            decision.answer.selections.includes("Confirmed") && !decision.answer.custom.trim();
+          emit(
+            "confirm_understanding",
+            confirmed ? "user confirmed understanding" : "user asked for a correction",
+            `${playback}\n↳ ${describeOutcome(decision)}`,
+          );
+          return text(
+            confirmed
+              ? "The user CONFIRMED your understanding. Proceed on it."
+              : `The user wants a correction: ${describeOutcome(decision)}. Update your synthesis (record_specific) before acting.`,
           );
         },
       ),

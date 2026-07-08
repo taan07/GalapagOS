@@ -19,7 +19,13 @@ import type { ProjectRow } from "../db/repos/projects";
 import { buildManagerDoctrine } from "../../daemon/doctrine";
 import { createRecordsStore, type RecordDoc, type RecordsStore } from "../records/store";
 import { createManagerToolServer } from "./manager-tools";
-import type { DecisionBroker, DecisionOption, DecisionOutcome } from "./decisions";
+import type {
+  DecisionBroker,
+  DecisionField,
+  DecisionKind,
+  DecisionOption,
+  DecisionOutcome,
+} from "./decisions";
 import { baseQueryOptions } from "./spawn";
 import type { WorkerRuntime } from "./worker-runtime";
 
@@ -41,15 +47,20 @@ export type ManagerTurnEvent =
       type: "decision_request";
       turnId: string;
       decisionId: string;
+      /** Card presentation: single decision, batch of questions, or confirm. */
+      cardKind: DecisionKind;
       question: string;
       options: DecisionOption[];
       multiSelect: boolean;
+      /** The 2-4 questions of a batch card (empty for single / confirm). */
+      fields: DecisionField[];
     }
   | {
       type: "decision_settled";
       decisionId: string;
       status: "answered" | "timeout" | "interrupted";
       selections: string[];
+      responses: Record<string, string[]>;
       custom: string;
     }
   | { type: "turn_error"; message: string };
@@ -57,12 +68,18 @@ export type ManagerTurnEvent =
 /** Persisted payload of a system decision turn (manager_turns.content). */
 export type DecisionTurnPayload = {
   kind: "decision";
+  /** Card presentation. Absent on turns persisted before 2026-07-08 → "decision". */
+  cardKind?: DecisionKind;
   decisionId: string;
   question: string;
   options: DecisionOption[];
   multiSelect: boolean;
+  /** Batch questions (absent/empty on single decisions and confirms). */
+  fields?: DecisionField[];
   status: "pending" | "answered" | "timeout" | "interrupted" | "expired";
   selections: string[];
+  /** Per-field selected labels for a batch. */
+  responses?: Record<string, string[]>;
   custom: string;
 };
 
@@ -189,57 +206,107 @@ export async function runManagerTurn(input: {
    * the broker, stamp the settled state back into the turn. Darwin's turn
    * holds while the user decides; timeout and interrupt resolve honestly.
    */
-  const askUser =
-    input.decisions !== undefined
-      ? async (question: string, options: DecisionOption[], multiSelect: boolean) => {
-          const broker = input.decisions as DecisionBroker;
-          const { request, outcome } = broker.ask({
-            question,
-            options,
-            multiSelect,
-            ...(input.abortController ? { signal: input.abortController.signal } : {}),
-          });
-          const payload: DecisionTurnPayload = {
-            kind: "decision",
-            decisionId: request.id,
-            question,
-            options,
-            multiSelect,
-            status: "pending",
-            selections: [],
-            custom: "",
-          };
-          const turn = appendTurn(db, {
-            sessionId: session.id,
-            role: "system",
-            content: JSON.stringify(payload),
-          });
-          emit({
-            type: "decision_request",
-            turnId: turn.id,
-            decisionId: request.id,
-            question,
-            options,
-            multiSelect,
-          });
-          const settled: DecisionOutcome = await outcome;
-          const settledPayload: DecisionTurnPayload = {
-            ...payload,
-            status: settled.status,
-            selections: settled.status === "answered" ? settled.answer.selections : [],
-            custom: settled.status === "answered" ? settled.answer.custom : "",
-          };
-          updateTurnContent(db, turn.id, JSON.stringify(settledPayload));
-          emit({
-            type: "decision_settled",
-            decisionId: request.id,
-            status: settled.status,
-            selections: settledPayload.selections,
-            custom: settledPayload.custom,
-          });
-          return settled;
-        }
-      : undefined;
+  // Shared machinery for every chat card — single decision, batch of
+  // questions, or understanding playback: persist a system turn (survives
+  // reloads), stream the request as clickable options, wait on the broker,
+  // stamp the settled state back. The free-text answer arrives via the chat
+  // composer (2026-07-08 ruling), never an embedded field.
+  const putDecision = input.decisions
+    ? async (spec: {
+        cardKind: DecisionKind;
+        question: string;
+        options: DecisionOption[];
+        multiSelect: boolean;
+        fields: DecisionField[];
+      }): Promise<DecisionOutcome> => {
+        const broker = input.decisions as DecisionBroker;
+        const { request, outcome } = broker.ask({
+          kind: spec.cardKind,
+          question: spec.question,
+          options: spec.options,
+          multiSelect: spec.multiSelect,
+          fields: spec.fields,
+          ...(input.abortController ? { signal: input.abortController.signal } : {}),
+        });
+        const payload: DecisionTurnPayload = {
+          kind: "decision",
+          cardKind: spec.cardKind,
+          decisionId: request.id,
+          question: spec.question,
+          options: spec.options,
+          multiSelect: spec.multiSelect,
+          fields: spec.fields,
+          status: "pending",
+          selections: [],
+          responses: {},
+          custom: "",
+        };
+        const turn = appendTurn(db, {
+          sessionId: session.id,
+          role: "system",
+          content: JSON.stringify(payload),
+        });
+        emit({
+          type: "decision_request",
+          turnId: turn.id,
+          decisionId: request.id,
+          cardKind: spec.cardKind,
+          question: spec.question,
+          options: spec.options,
+          multiSelect: spec.multiSelect,
+          fields: spec.fields,
+        });
+        const settled: DecisionOutcome = await outcome;
+        const answered = settled.status === "answered" ? settled.answer : null;
+        const settledPayload: DecisionTurnPayload = {
+          ...payload,
+          status: settled.status,
+          selections: answered?.selections ?? [],
+          responses: answered?.responses ?? {},
+          custom: answered?.custom ?? "",
+        };
+        updateTurnContent(db, turn.id, JSON.stringify(settledPayload));
+        emit({
+          type: "decision_settled",
+          decisionId: request.id,
+          status: settled.status,
+          selections: settledPayload.selections,
+          responses: settledPayload.responses ?? {},
+          custom: settledPayload.custom,
+        });
+        return settled;
+      }
+    : undefined;
+
+  const askUser = putDecision
+    ? (question: string, options: DecisionOption[], multiSelect: boolean) =>
+        putDecision({ cardKind: "decision", question, options, multiSelect, fields: [] })
+    : undefined;
+
+  const askBatch = putDecision
+    ? (fields: DecisionField[]) =>
+        putDecision({ cardKind: "batch", question: "", options: [], multiSelect: false, fields })
+    : undefined;
+
+  const askConfirm = putDecision
+    ? (playback: string) =>
+        putDecision({
+          cardKind: "confirm",
+          question: playback,
+          options: [
+            {
+              label: "Confirmed",
+              implication: "Your understanding is right — Darwin proceeds on it.",
+            },
+            {
+              label: "Needs correction",
+              implication: "Something's off — type the fix in chat and Darwin adjusts.",
+            },
+          ],
+          multiSelect: false,
+          fields: [],
+        })
+    : undefined;
 
   const toolServer = createManagerToolServer({
     projectRoot: project.root_path,
@@ -252,7 +319,10 @@ export async function runManagerTurn(input: {
     project,
     ...(input.workers ? { workers: input.workers } : {}),
     // The chat decision channel (chunk 3 drills): clickable options, waits.
+    // 2026-07-08: also a batch card and an understanding-playback confirm.
     ...(askUser ? { askUser } : {}),
+    ...(askBatch ? { askBatch } : {}),
+    ...(askConfirm ? { askConfirm } : {}),
     onToolEvent: (event) => {
       const turn = appendTurn(db, {
         sessionId: session.id,

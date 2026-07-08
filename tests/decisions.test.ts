@@ -86,6 +86,39 @@ test("describeOutcome renders answers Darwin can act on", () => {
   );
 });
 
+test("a batch card resolves with per-field responses, labeled by prompt", async () => {
+  const broker = createDecisionBroker();
+  const fields = [
+    { id: "tone", prompt: "Voice?", options: OPTIONS, multiSelect: false },
+    { id: "units", prompt: "Units?", options: OPTIONS, multiSelect: false },
+  ];
+  const { request, outcome } = broker.ask({ kind: "batch", fields });
+  assert.equal(request.kind, "batch");
+  assert.equal(
+    broker.answer(request.id, {
+      selections: [],
+      responses: { tone: ["Allow"], units: ["Deny"] },
+      custom: "",
+    }),
+    true,
+  );
+  const settled = await outcome;
+  assert.equal(settled.status, "answered");
+  const described = describeOutcome(settled, fields);
+  assert.match(described, /Voice\? → Allow/);
+  assert.match(described, /Units\? → Deny/);
+});
+
+test("describeOutcome carries the user's chat note as the free-text answer", () => {
+  assert.match(
+    describeOutcome({
+      status: "answered",
+      answer: { selections: [], responses: {}, custom: "actually, make it deadpan" },
+    }),
+    /Their note: actually, make it deadpan/,
+  );
+});
+
 test("boot sweep expires decision turns left pending by a dead daemon", async () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "glp-dec-state-"));
   const projectDir = mkdtempSync(path.join(os.tmpdir(), "glp-dec-proj-"));

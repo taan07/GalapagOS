@@ -499,7 +499,17 @@ async function handleDecisionAnswer(
   }
   const selections = asStringArray(body.selections) ?? [];
   const custom = typeof body.custom === "string" ? body.custom : "";
-  if (!decisions.answer(decisionId, { selections, custom })) {
+  // Batch answers carry per-field selected labels, keyed by field id.
+  const responses: Record<string, string[]> = {};
+  if (body.responses && typeof body.responses === "object") {
+    for (const [fieldId, value] of Object.entries(body.responses as Record<string, unknown>)) {
+      const labels = asStringArray(value);
+      if (labels) {
+        responses[fieldId] = labels;
+      }
+    }
+  }
+  if (!decisions.answer(decisionId, { selections, responses, custom })) {
     sendJson(res, 409, {
       error: "That decision is no longer pending — it was answered, timed out, or belongs to an ended turn.",
     });

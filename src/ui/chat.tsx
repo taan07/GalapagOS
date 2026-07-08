@@ -3,10 +3,33 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChatItem, DecisionView, RebriefView } from "./types";
 
+/** Render a settled card's outcome as one scannable line. */
+function settledSummary(decision: DecisionView): string {
+  const fields = decision.fields ?? [];
+  if (fields.length > 0) {
+    const parts = fields
+      .map((field) => {
+        const chosen = decision.responses?.[field.id] ?? [];
+        return chosen.length > 0 ? `${field.prompt}: ${chosen.join(", ")}` : null;
+      })
+      .filter(Boolean) as string[];
+    if (decision.custom) {
+      parts.push(`Note: ${decision.custom}`);
+    }
+    return parts.length > 0 ? parts.join(" · ") : "Answered";
+  }
+  const parts = [
+    decision.selections.length > 0 ? `Chose: ${decision.selections.join("; ")}` : null,
+    decision.custom ? `Note: ${decision.custom}` : null,
+  ].filter(Boolean);
+  return parts.join(" · ") || "Answered without a selection";
+}
+
 /**
- * A decision Darwin put to the user: clickable options with practical
- * implications, always a free-text field (user-confirmed 2026-07-05).
- * Single-select answers on click; multi-select collects then submits.
+ * A card Darwin put to the user — clickable options ONLY. There is no embedded
+ * free-text field (2026-07-08 ruling): the chat composer IS the "other"
+ * answer. A single decision/confirm submits on click; a multi-select or a
+ * batch of questions collects picks then submits.
  */
 function DecisionPrompt({
   decision,
@@ -15,95 +38,124 @@ function DecisionPrompt({
 }: {
   decision: DecisionView;
   disabled: boolean;
-  onAnswer: (selections: string[], custom: string) => void;
+  onAnswer: (selections: string[], responses: Record<string, string[]>, custom: string) => void;
 }) {
   const [picked, setPicked] = useState<string[]>([]);
-  const [custom, setCustom] = useState("");
+  const [responses, setResponses] = useState<Record<string, string[]>>({});
   const [sending, setSending] = useState(false);
+  const fields = decision.fields ?? [];
+  const isBatch = fields.length > 0;
+  const isConfirm = decision.cardKind === "confirm";
 
   if (decision.status !== "pending") {
-    const outcome =
+    const summary =
       decision.status === "answered"
-        ? [
-            decision.selections.length > 0 ? `Chose: ${decision.selections.join("; ")}` : null,
-            decision.custom ? `Note: ${decision.custom}` : null,
-          ]
-            .filter(Boolean)
-            .join(" · ") || "Answered without a selection"
+        ? settledSummary(decision)
         : decision.status === "timeout"
           ? "Not answered in time — Darwin treats it as deferred"
           : decision.status === "expired"
             ? "Expired (the daemon restarted before an answer)"
             : "Interrupted before an answer";
     return (
-      <div className="decision settled">
-        <div className="decision-question">{decision.question}</div>
-        <div className="decision-outcome">{outcome}</div>
+      <div className={`decision settled${isConfirm ? " confirm" : ""}${isBatch ? " batch" : ""}`}>
+        <div className="decision-question">{decision.question || "Batch decision"}</div>
+        <div className="decision-outcome">{summary}</div>
       </div>
     );
   }
 
-  const submit = (selections: string[]) => {
+  const submit = (payload: { selections?: string[]; responses?: Record<string, string[]> }) => {
     setSending(true);
-    onAnswer(selections, custom.trim());
+    onAnswer(payload.selections ?? [], payload.responses ?? {}, "");
   };
 
+  const optionButton = (
+    option: { label: string; implication: string },
+    selected: boolean,
+    onPick: () => void,
+  ) => (
+    <button
+      key={option.label}
+      className={`decision-option${selected ? " selected" : ""}`}
+      disabled={disabled || sending}
+      onClick={onPick}
+    >
+      <span className="decision-label">{option.label}</span>
+      <span className="decision-implication">{option.implication}</span>
+    </button>
+  );
+
+  if (isBatch) {
+    const complete = fields.every((field) => (responses[field.id]?.length ?? 0) > 0);
+    return (
+      <div className="decision batch">
+        {decision.question ? <div className="decision-question">{decision.question}</div> : null}
+        {fields.map((field) => (
+          <div className="decision-field" key={field.id}>
+            <div className="decision-field-prompt">{field.prompt}</div>
+            <div className="decision-options">
+              {field.options.map((option) => {
+                const chosen = responses[field.id]?.includes(option.label) ?? false;
+                return optionButton(option, chosen, () =>
+                  setResponses((current) => {
+                    const prev = current[field.id] ?? [];
+                    const next = field.multiSelect
+                      ? chosen
+                        ? prev.filter((label) => label !== option.label)
+                        : [...prev, option.label]
+                      : [option.label];
+                    return { ...current, [field.id]: next };
+                  }),
+                );
+              })}
+            </div>
+          </div>
+        ))}
+        <div className="decision-actions">
+          <button
+            className="decision-submit"
+            disabled={disabled || sending || !complete}
+            onClick={() => submit({ responses })}
+          >
+            {sending ? "Sending…" : "Submit answers"}
+          </button>
+          <span className="decision-hint">…or just type your answer below.</span>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="decision">
+    <div className={`decision${isConfirm ? " confirm" : ""}`}>
       <div className="decision-question">{decision.question}</div>
       <div className="decision-options">
         {decision.options.map((option) => {
           const selected = picked.includes(option.label);
-          return (
-            <button
-              key={option.label}
-              className={`decision-option${selected ? " selected" : ""}`}
-              disabled={disabled || sending}
-              onClick={() => {
-                if (decision.multiSelect) {
-                  setPicked((current) =>
-                    selected
-                      ? current.filter((label) => label !== option.label)
-                      : [...current, option.label],
-                  );
-                } else {
-                  submit([option.label]);
-                }
-              }}
-            >
-              <span className="decision-label">{option.label}</span>
-              <span className="decision-implication">{option.implication}</span>
-            </button>
-          );
+          return optionButton(option, selected, () => {
+            if (decision.multiSelect) {
+              setPicked((current) =>
+                selected
+                  ? current.filter((label) => label !== option.label)
+                  : [...current, option.label],
+              );
+            } else {
+              submit({ selections: [option.label] });
+            }
+          });
         })}
       </div>
-      <div className="decision-custom">
-        <input
-          value={custom}
-          placeholder="Add a note, or answer in your own words…"
-          disabled={disabled || sending}
-          onChange={(event) => setCustom(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !decision.multiSelect && custom.trim()) {
-              event.preventDefault();
-              submit([]);
-            }
-          }}
-        />
-        {decision.multiSelect || decision.options.length === 0 ? (
+      <div className="decision-actions">
+        {decision.multiSelect ? (
           <button
-            disabled={disabled || sending || (picked.length === 0 && !custom.trim())}
-            onClick={() => submit(picked)}
+            className="decision-submit"
+            disabled={disabled || sending || picked.length === 0}
+            onClick={() => submit({ selections: picked })}
           >
-            {sending ? "Sending…" : "Answer"}
-          </button>
-        ) : custom.trim() ? (
-          <button disabled={disabled || sending} onClick={() => submit([])}>
-            {sending ? "Sending…" : "Answer with note only"}
+            {sending ? "Sending…" : "Submit selection"}
           </button>
         ) : null}
+        <span className="decision-hint">…or just type your answer below.</span>
       </div>
-      <div className="decision-hint">Darwin is waiting on this before continuing.</div>
     </div>
   );
 }
@@ -113,6 +165,7 @@ export function Chat({
   working,
   queued,
   disabled,
+  answering,
   projectName,
   onSend,
   onClearRebrief,
@@ -122,10 +175,17 @@ export function Chat({
   working: boolean;
   queued: string[];
   disabled: boolean;
+  /** A card is waiting — the composer becomes its free-text answer. */
+  answering: boolean;
   projectName: string;
   onSend: (text: string) => void;
   onClearRebrief: (rebrief: RebriefView) => void;
-  onAnswerDecision: (decisionId: string, selections: string[], custom: string) => void;
+  onAnswerDecision: (
+    decisionId: string,
+    selections: string[],
+    responses: Record<string, string[]>,
+    custom: string,
+  ) => void;
 }) {
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -217,8 +277,8 @@ export function Chat({
                 key={item.decision.decisionId}
                 decision={item.decision}
                 disabled={disabled}
-                onAnswer={(selections, custom) =>
-                  onAnswerDecision(item.decision.decisionId, selections, custom)
+                onAnswer={(selections, responses, custom) =>
+                  onAnswerDecision(item.decision.decisionId, selections, responses, custom)
                 }
               />
             );
@@ -231,10 +291,16 @@ export function Chat({
         })}
         {working ? <div className="working">Darwin is working — Esc ×3 to stop</div> : null}
       </div>
-      <div className="chat-compose">
+      <div className={`chat-compose${answering ? " answering" : ""}`}>
         <textarea
           value={draft}
-          placeholder={disabled ? "Chat unavailable — daemon offline." : "Message Darwin…"}
+          placeholder={
+            disabled
+              ? "Chat unavailable — daemon offline."
+              : answering
+                ? "Pick above, or type your own answer here…"
+                : "Message Darwin…"
+          }
           disabled={disabled}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
@@ -245,7 +311,9 @@ export function Chat({
           }}
         />
         <div className="compose-row">
-          {queued.length > 0 ? (
+          {answering ? (
+            <span className="hint">Your message answers the question above.</span>
+          ) : queued.length > 0 ? (
             <span className="queue-note">
               {queued.length} message{queued.length === 1 ? "" : "s"} queued — sending when Darwin
               finishes this turn.
@@ -254,7 +322,7 @@ export function Chat({
             <span className="hint">Enter to send · Shift+Enter for a new line</span>
           )}
           <button onClick={submit} disabled={disabled || draft.trim().length === 0}>
-            {working ? "Queue" : "Send"}
+            {answering ? "Answer" : working ? "Queue" : "Send"}
           </button>
         </div>
       </div>

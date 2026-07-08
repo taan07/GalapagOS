@@ -39,14 +39,34 @@ export type RebriefView = {
   cleared: boolean;
 };
 
-/** A decision Darwin put to the user in chat (ask_user / amend_lane gate). */
+export type DecisionOptionView = { label: string; implication: string };
+
+/** One question of a batch card — select-only (free text goes to the chat). */
+export type DecisionFieldView = {
+  id: string;
+  prompt: string;
+  options: DecisionOptionView[];
+  multiSelect: boolean;
+};
+
+/** How a card presents: single decision, batch of questions, or a confirm. */
+export type DecisionCardKind = "decision" | "batch" | "confirm";
+
+/** A card Darwin put to the user in chat (ask_user / ask_batch /
+ * confirm_understanding / amend_lane gate). */
 export type DecisionView = {
   decisionId: string;
+  /** Absent on cards persisted before 2026-07-08 → treat as "decision". */
+  cardKind?: DecisionCardKind;
   question: string;
-  options: { label: string; implication: string }[];
+  options: DecisionOptionView[];
   multiSelect: boolean;
+  /** Batch questions (empty for single decisions and confirms). */
+  fields?: DecisionFieldView[];
   status: "pending" | "answered" | "timeout" | "interrupted" | "expired";
   selections: string[];
+  /** Per-field selected labels for a batch, keyed by field id. */
+  responses?: Record<string, string[]>;
   custom: string;
 };
 
@@ -69,15 +89,18 @@ export type ManagerStreamEvent =
       type: "decision_request";
       turnId: string;
       decisionId: string;
+      cardKind: DecisionCardKind;
       question: string;
-      options: { label: string; implication: string }[];
+      options: DecisionOptionView[];
       multiSelect: boolean;
+      fields: DecisionFieldView[];
     }
   | {
       type: "decision_settled";
       decisionId: string;
       status: "answered" | "timeout" | "interrupted";
       selections: string[];
+      responses: Record<string, string[]>;
       custom: string;
     }
   | {
