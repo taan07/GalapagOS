@@ -169,6 +169,38 @@ select:focus {
   padding: 6px 12px;
 }
 
+.msg.system-note.limit-note {
+  align-self: center;
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+  background: color-mix(in srgb, var(--danger) 8%, var(--bg));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 60ch;
+  text-align: center;
+}
+
+.limit-note .limit-headline {
+  font-weight: 600;
+}
+
+.limit-note .limit-detail {
+  color: var(--muted);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+.limit-note .limit-switch {
+  align-self: center;
+}
+
+.limit-note .limit-switched {
+  color: var(--muted);
+  font-style: italic;
+}
+
 .chip {
   align-self: flex-start;
   font-size: 12px;

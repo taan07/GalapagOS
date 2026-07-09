@@ -12,6 +12,7 @@ import {
 } from "../adapters/db/repos/projects";
 import { runDistillJob } from "../adapters/agent/distill";
 import {
+  isUsageLimitError,
   runManagerTurn,
   type ManagerTurnEvent,
   type RebriefTurnPayload,
@@ -41,8 +42,17 @@ const db = openDb(config.stateDir);
 // in-flight turn kill switches, and the worker runtime's live session
 // handles. Everything durable lives in SQLite as it lands.
 const busyProjects = new Set<string>();
+// Post-turn distillation in flight, per project. Distill no longer holds the
+// busy flag (the user's chat unlocks the moment the turn completes) — but the
+// manager session must never be forked concurrently with a new turn, so the
+// NEXT turn awaits this promise instead of the user eating a 409.
+const distillsInFlight = new Map<string, Promise<void>>();
 const eventClients = new Set<http.ServerResponse>();
 const activeTurnControllers = new Map<string, AbortController>();
+// Per-project manager-model override, set when the user hits "change to Opus"
+// after Fable's usage limit. In-memory on purpose: a daemon restart drops it,
+// so Darwin retries on Fable once the limit window has likely reset.
+const managerModelOverrides = new Map<string, string>();
 const workers = createWorkerRuntime({
   db,
   config,
@@ -204,7 +214,35 @@ async function handleManagerMessage(
     return;
   }
 
+  // An explicit model (the "change to Opus" retry) switches this project's
+  // manager model for good — a limited Fable stays limited, so every later
+  // turn defaults to the override until the daemon restarts.
+  const requestedModel = asString(body.model);
+  if (requestedModel) {
+    managerModelOverrides.set(projectId, requestedModel);
+  }
+  const activeManagerModel = managerModelOverrides.get(projectId) ?? config.managerModel;
+  const effectiveConfig =
+    activeManagerModel === config.managerModel
+      ? config
+      : { ...config, managerModel: activeManagerModel };
+
   busyProjects.add(projectId);
+  // Everything below releases ONLY what this request owns: by the time a
+  // late finally runs, the busy flag and kill switch may already belong to
+  // the user's next turn.
+  let busyReleased = false;
+  const releaseBusy = () => {
+    if (!busyReleased) {
+      busyReleased = true;
+      busyProjects.delete(projectId);
+    }
+  };
+  let myController: AbortController | null = null;
+  const armController = (controller: AbortController) => {
+    myController = controller;
+    activeTurnControllers.set(projectId, controller);
+  };
   startSse(res);
   const emit = (event: ManagerTurnEvent) => {
     sseWrite(res, event);
@@ -214,14 +252,23 @@ async function handleManagerMessage(
   };
 
   try {
+    // The previous turn's distillation may still be running. The fork
+    // invariant stands — the manager session is never forked concurrently
+    // with a live turn — but the wait moved server-side: the message is
+    // accepted and queues here instead of bouncing off a 409.
+    const pendingDistill = distillsInFlight.get(projectId);
+    if (pendingDistill) {
+      await pendingDistill;
+    }
+
     // One kill switch per phase: interrupting the turn must not also kill the
     // distill pass that follows (the user chose to keep it), but a second
     // triple-Esc during distillation aborts the fork too.
     const turnController = new AbortController();
-    activeTurnControllers.set(projectId, turnController);
+    armController(turnController);
     const outcome = await runManagerTurn({
       db,
-      config,
+      config: effectiveConfig,
       project,
       userText: text,
       emit,
@@ -230,40 +277,60 @@ async function handleManagerMessage(
       decisions,
     });
 
-    // Post-turn distillation runs while the stream (and the busy flag) is
-    // still held: the manager session must never be forked concurrently with
-    // a new user turn. The fork's records land before the input unlocks.
-    // Interrupted turns still distill — partial exchanges can hold durable
-    // agreements, and the records commit must happen regardless.
+    // Post-turn distillation no longer holds the input lock: the turn is
+    // over, so the chat unlocks NOW. The stream stays open to deliver the
+    // distilled note, and distillsInFlight serializes the next turn against
+    // the fork. Interrupted turns still distill — partial exchanges can hold
+    // durable agreements, and the records commit must happen regardless.
     if (outcome.completed || outcome.interrupted) {
       const distillController = new AbortController();
-      activeTurnControllers.set(projectId, distillController);
-      const distill = await runDistillJob({
-        db,
-        config,
-        project,
-        sessionId: outcome.sessionId,
-        sdkSessionId: outcome.sdkSessionId,
-        abortController: distillController,
-      });
-      sseWrite(res, {
-        type: "distilled",
-        recordsWritten: distill.recordsWritten,
-        committed: distill.commit.status === "committed",
-        ...(distill.commit.status === "skipped"
-          ? { commitSkippedReason: distill.commit.reason }
-          : {}),
-        ...(distill.error ? { error: distill.error } : {}),
-      });
+      armController(distillController);
+      const distillPromise = (async () => {
+        const distill = await runDistillJob({
+          db,
+          config,
+          project,
+          sessionId: outcome.sessionId,
+          sdkSessionId: outcome.sdkSessionId,
+          abortController: distillController,
+        });
+        sseWrite(res, {
+          type: "distilled",
+          recordsWritten: distill.recordsWritten,
+          committed: distill.commit.status === "committed",
+          ...(distill.commit.status === "skipped"
+            ? { commitSkippedReason: distill.commit.reason }
+            : {}),
+          ...(distill.error ? { error: distill.error } : {}),
+        });
+      })();
+      // Register the guard (swallowed copy — a distill failure must not
+      // reject the next turn's wait) BEFORE releasing the busy flag, so
+      // there is no instant where a new turn sees neither lock.
+      const guard = distillPromise.catch(() => {});
+      distillsInFlight.set(projectId, guard);
+      releaseBusy();
+      try {
+        await distillPromise;
+      } finally {
+        if (distillsInFlight.get(projectId) === guard) {
+          distillsInFlight.delete(projectId);
+        }
+      }
     }
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     sseWrite(res, {
       type: "turn_error",
-      message: error instanceof Error ? error.message : String(error),
+      message,
+      limitReached: isUsageLimitError(message),
+      model: effectiveConfig.managerModel,
     });
   } finally {
-    activeTurnControllers.delete(projectId);
-    busyProjects.delete(projectId);
+    if (myController && activeTurnControllers.get(projectId) === myController) {
+      activeTurnControllers.delete(projectId);
+    }
+    releaseBusy();
     res.end();
   }
 }

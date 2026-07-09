@@ -56,7 +56,9 @@ export type ChatItem =
   | { kind: "chip"; chip: ToolChip }
   | { kind: "rebrief"; rebrief: RebriefView }
   | { kind: "decision"; decision: DecisionView }
-  | { kind: "note"; text: string };
+  | { kind: "note"; text: string }
+  /** A usage-limit failure with a retry-on-Opus offer (see turn_error). */
+  | { kind: "limit"; message: string; failedText: string; model: string };
 
 export type ManagerStreamEvent =
   | { type: "turn_started"; sessionId: string }
@@ -87,7 +89,7 @@ export type ManagerStreamEvent =
       commitSkippedReason?: string;
       error?: string;
     }
-  | { type: "turn_error"; message: string };
+  | { type: "turn_error"; message: string; limitReached?: boolean; model?: string };
 
 /** One worker row as served by /api/workers — lane joined, liveness raw. */
 export type WorkerView = {

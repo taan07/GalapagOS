@@ -25,6 +25,12 @@ export type WorkerSession = {
   events: AsyncIterable<WorkerStreamEvent>;
   /** Inject a steering message mid-run (streaming input). */
   send(text: string): void;
+  /**
+   * Abort the in-flight turn WITHOUT ending the session — the brake behind
+   * hold. The streaming-input channel stays open, so the next send() starts
+   * a fresh turn immediately instead of queuing behind minutes of work.
+   */
+  interrupt(): Promise<void>;
   /** End the input stream and abort any in-flight turn. */
   stop(): Promise<void>;
 };
@@ -333,6 +339,12 @@ export function spawnWorkerSession(input: SpawnWorkerSessionInput): WorkerSessio
     events,
     send(text: string) {
       queue.push(text);
+    },
+    async interrupt() {
+      // Brake, not stop: abort the in-flight turn but leave the queue open.
+      // Idle between turns there is nothing to interrupt and the call may
+      // reject — that is fine.
+      await stream.interrupt().catch(() => {});
     },
     async stop() {
       queue.end();

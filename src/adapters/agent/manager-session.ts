@@ -52,7 +52,15 @@ export type ManagerTurnEvent =
       selections: string[];
       custom: string;
     }
-  | { type: "turn_error"; message: string };
+  | {
+      type: "turn_error";
+      message: string;
+      /** True when the turn died on a usage/rate limit — the turn is retryable
+       * on a different model (the UI offers "change to Opus"). */
+      limitReached: boolean;
+      /** The manager model that failed, so the UI knows what it's switching from. */
+      model: string;
+    };
 
 /** Persisted payload of a system decision turn (manager_turns.content). */
 export type DecisionTurnPayload = {
@@ -99,6 +107,7 @@ const MANAGER_ALLOWED_TOOLS = [
   "mcp__galapagos__hold_worker",
   "mcp__galapagos__stop_worker",
   "mcp__galapagos__amend_lane",
+  "mcp__galapagos__merge_worker",
   "mcp__galapagos__list_workers",
   "mcp__galapagos__worker_status",
   "mcp__galapagos__run_checks",
@@ -110,6 +119,24 @@ const MANAGER_ALLOWED_TOOLS = [
   "Glob",
   "Grep",
 ];
+
+/**
+ * A usage or rate limit — Fable's subscription cap, an API 429, or an
+ * overload. The turn itself is fine; retrying on a different model can get
+ * through, so the UI surfaces a "change to Opus" action instead of a dead
+ * error note. Kept permissive: the upstream wording varies by limit type.
+ *
+ * The observed subscription-cap string is the anchor case:
+ *   "You've reached your Fable 5 limit. Run /usage-credits to continue or
+ *    switch models with /model."
+ * — note it's "reached your … limit", not "usage/limit reached", and the
+ * actionable tells (/usage-credits, "switch models") are the reliable signals.
+ */
+export function isUsageLimitError(text: string): boolean {
+  return /usage limit|rate limit|limit reached|reached your .*\blimit\b|usage-credits|switch models|resource[_ ]exhausted|too many requests|\b429\b|quota|overloaded/i.test(
+    text,
+  );
+}
 
 /** Thrown when a resumed query silently restarts blank (init id mismatch). */
 class ResumeMismatchError extends Error {
@@ -406,7 +433,12 @@ export async function runManagerTurn(input: {
       const guidance = /not logged in/i.test(messageText)
         ? " The daemon cannot reach Claude Code's credentials. Start Galapagos from your own terminal (npm run dev) so the spawned Claude binary can use your keychain login, and check `claude /login` status."
         : "";
-      emit({ type: "turn_error", message: `${messageText}${guidance}` });
+      emit({
+        type: "turn_error",
+        message: `${messageText}${guidance}`,
+        limitReached: isUsageLimitError(messageText),
+        model: config.managerModel,
+      });
       return outcome();
     }
 
@@ -418,11 +450,21 @@ export async function runManagerTurn(input: {
         return outcome();
       } catch (retryError) {
         const retryText = retryError instanceof Error ? retryError.message : String(retryError);
-        emit({ type: "turn_error", message: retryText });
+        emit({
+          type: "turn_error",
+          message: retryText,
+          limitReached: isUsageLimitError(retryText),
+          model: config.managerModel,
+        });
         return outcome();
       }
     }
-    emit({ type: "turn_error", message: messageText });
+    emit({
+      type: "turn_error",
+      message: messageText,
+      limitReached: isUsageLimitError(messageText),
+      model: config.managerModel,
+    });
   }
   return outcome();
 }
