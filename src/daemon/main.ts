@@ -90,6 +90,15 @@ const monitor = createMonitor({
     }
     return runCriticReview({ db, config, project, worker, lane, digestId });
   },
+  // Quality-gated retirement: the tick just proved the completion clean, so
+  // the stop is ungated ("force"); the reason lands in the stream's stopped
+  // marker so the retirement reads honestly.
+  retireWorker: async (workerId, reason) => {
+    const outcome = await workers.stop(workerId, reason, { intent: "force" });
+    if (!outcome.ok) {
+      console.error(`[monitor] auto-retire of ${workerId} refused: ${outcome.reason}`);
+    }
+  },
   runTriage: async (project) => {
     const outcome = await runTriageJob({
       db,
@@ -702,7 +711,10 @@ async function handleDecisionAnswer(
 }
 
 async function handleStopWorker(res: http.ServerResponse, workerId: string): Promise<void> {
-  const outcome = await workers.stop(workerId, "the user, via the workers page");
+  // The user's Stop button is the ungated escape hatch — never quality-gated.
+  const outcome = await workers.stop(workerId, "the user, via the workers page", {
+    intent: "force",
+  });
   if (!outcome.ok) {
     sendJson(res, 409, { error: outcome.reason });
     return;

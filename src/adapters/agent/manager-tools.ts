@@ -12,6 +12,7 @@ import {
 } from "../db/repos/attention";
 import { latestDigestForWorker, setDigestStatus } from "../db/repos/digests";
 import { buildWorkerEvidence } from "../evidence/adapter";
+import { scoreWorker } from "../../core/confidence/engine";
 import { getLane, laneGlobs } from "../db/repos/lanes";
 import type { ProjectRow } from "../db/repos/projects";
 import { getWorker } from "../db/repos/workers";
@@ -815,15 +816,46 @@ export function createManagerToolServer(context: ManagerToolContext) {
       ),
       tool(
         "stop_worker",
-        "Stop a worker: ends its session, audits every change in its worktree against the lane (out-of-lane files raise a high-priority lane_violation), retires the lane, and checks for a structured completion report. The worktree and branch survive for review.",
-        { id: z.string() },
-        async ({ id }) => {
+        'Stop a worker: ends its session, audits every change in its worktree against the lane (out-of-lane files raise a high-priority lane_violation), retires the lane, and checks for a structured completion report. The worktree and branch survive for review. Retirement is QUALITY-GATED: intent "retire" (the default) is refused with the confidence reasons unless the completion is manager_reviewed — the monitor auto-reviews (and auto-retires) a completion whose evidence is strong with a clear queue. Use intent "abandon" to deliberately end unfinished or failing work (the abandonment is raised as an attention item).',
+        {
+          id: z.string(),
+          intent: z.enum(["retire", "abandon"]).optional(),
+          reason: z.string().optional(),
+        },
+        async ({ id, intent, reason }) => {
           const bridge = requireWorkers();
           if (!bridge) {
             return text("Worker control is not available in this context.");
           }
-          const outcome = await bridge.workers.stop(id, "Darwin");
+          const stopIntent = intent ?? "retire";
+          const stoppedBy = reason ? `Darwin (${reason})` : "Darwin";
+          const outcome = await bridge.workers.stop(id, stoppedBy, { intent: stopIntent });
           if (!outcome.ok) {
+            // A refused retire carries the WHY: the same confidence report the
+            // gauge shows, so Darwin can relay what is actually holding it.
+            const evidenceContext = requireEvidence();
+            if (stopIntent === "retire" && evidenceContext) {
+              const worker = getWorker(evidenceContext.db, id);
+              if (worker) {
+                const lane = getLane(evidenceContext.db, worker.lane_id) ?? null;
+                const evidence = await buildWorkerEvidence(evidenceContext.db, {
+                  worker,
+                  lane,
+                  staleWorkerSeconds: evidenceContext.config.staleWorkerSeconds,
+                });
+                const report = scoreWorker(evidence.input);
+                const capLines = report.caps.map((cap) => `  - ${cap.label}`).join("\n");
+                const detail = [
+                  `Retire refused: ${outcome.reason}`,
+                  `Confidence ${report.score} (${report.state}) — ${report.stateReason}`,
+                  capLines ? `What is holding it down:\n${capLines}` : "",
+                ]
+                  .filter(Boolean)
+                  .join("\n");
+                emit("stop_worker", `retire refused for ${id.slice(0, 8)}`, detail);
+                return text(detail);
+              }
+            }
             emit("stop_worker", `stop failed for ${id}`, outcome.reason);
             return text(`Stop failed: ${outcome.reason}`);
           }

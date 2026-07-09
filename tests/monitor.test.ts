@@ -85,6 +85,7 @@ type Fixture = {
   clock: { now: Date };
   legs: LegBehavior;
   legRuns: string[];
+  retired: { workerId: string; reason: string }[];
 };
 
 async function fixture(): Promise<Fixture> {
@@ -143,6 +144,7 @@ async function fixture(): Promise<Fixture> {
         workerId: input.worker.id,
       });
     };
+  const retired: { workerId: string; reason: string }[] = [];
   const monitor = createMonitor({
     db,
     config,
@@ -150,6 +152,9 @@ async function fixture(): Promise<Fixture> {
     broadcast: (event) => events.push(event),
     runWatchdog: fakeLeg("watchdog"),
     runCritic: fakeLeg("critic"),
+    retireWorker: async (workerId, reason) => {
+      retired.push({ workerId, reason });
+    },
     runTriage: async (target) => {
       // The real triage records its job — the trigger cutoff depends on it.
       createJob(db, "triage", { projectId: target.id });
@@ -168,6 +173,7 @@ async function fixture(): Promise<Fixture> {
     clock,
     legs,
     legRuns,
+    retired,
   };
 }
 

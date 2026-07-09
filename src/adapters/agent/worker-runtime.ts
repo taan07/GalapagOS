@@ -1244,10 +1244,22 @@ required.`;
       return { ok: true, allowedGlobs: merged };
     },
 
+    /**
+     * End a worker. `intent` is the caller's honesty about WHY (quality-gated
+     * retirement, user-confirmed 2026-07-08):
+     * - "retire": the work is done and clean — refused unless the latest
+     *   digest is manager_reviewed (the monitor's LLM-free quality gate).
+     * - "abandon": deliberately stopping unfinished/failing work — proceeds,
+     *   and the abandonment is raised as a visible attention item.
+     * - "force" (default): the ungated paths — the user's Stop button, the
+     *   monitor's own auto-retire (quality already proven), boot cleanup.
+     */
     async stop(
       workerId: string,
       stoppedBy = "an unspecified caller",
+      options: { intent?: "retire" | "abandon" | "force" } = {},
     ): Promise<StopWorkerOutcome> {
+      const intent = options.intent ?? "force";
       const worker = getWorker(db, workerId);
       if (!worker) {
         return { ok: false, reason: `No worker with id ${workerId}.` };
@@ -1257,6 +1269,21 @@ required.`;
       }
       if (stopping.has(workerId)) {
         return { ok: false, reason: `Worker ${workerId} is already being stopped.` };
+      }
+      if (intent === "retire") {
+        const digest = latestDigestForWorker(db, worker.id);
+        if (!digest) {
+          return {
+            ok: false,
+            reason: `Worker ${workerId} has no completion report — it is not done, whatever its transcript says. Steer it onward, or stop it with intent "abandon" if you mean to end unfinished work.`,
+          };
+        }
+        if (digest.status !== "manager_reviewed") {
+          return {
+            ok: false,
+            reason: `Worker ${workerId}'s completion has NOT passed the quality gate (digest status: ${digest.status}). The monitor auto-reviews a completion once its evidence is strong and its attention queue is clear — run run_checks in its worktree, resolve its open attention items, or stop it with intent "abandon" if you mean to discard the work.`,
+          };
+        }
       }
       // A failed worker with a retired lane was already finalized (its audit
       // ran at spawn-abort, an earlier stop, or boot reconciliation) —
@@ -1276,7 +1303,19 @@ required.`;
           await entry.session.stop();
           await entry.loopDone;
         }
-        return await finalizeStop(worker, stoppedBy);
+        const outcome = await finalizeStop(worker, stoppedBy);
+        if (outcome.ok && intent === "abandon") {
+          // The abandonment itself must be visible: without this, a stopped
+          // worker with unfinished work reads the same as one retired clean.
+          createAttentionItem(db, {
+            projectId: worker.project_id,
+            workerId: worker.id,
+            kind: "worker_abandoned",
+            title: "Worker abandoned before quality passed",
+            detail: `Stopped by ${stoppedBy} with intent "abandon" — its completion never reached manager_reviewed. The worktree (${worker.worktree_path}) and branch survive; review or discard the work deliberately.`,
+          });
+        }
+        return outcome;
       } finally {
         stopping.delete(workerId);
       }
