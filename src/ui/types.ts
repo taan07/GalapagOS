@@ -70,6 +70,9 @@ export type DecisionView = {
   custom: string;
 };
 
+/** A message waiting its turn while Darwin works — visible and steerable. */
+export type QueuedMessage = { id: string; text: string };
+
 export type ChatItem =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string }

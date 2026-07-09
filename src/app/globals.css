@@ -140,6 +140,34 @@ select:focus {
   overflow-wrap: break-word;
 }
 
+.msg.user,
+.msg.assistant {
+  position: relative;
+}
+
+/* Copy affordance: invisible until the bubble is hovered. */
+.msg-copy {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+  font-size: 11px;
+  padding: 2px 8px;
+  color: var(--muted);
+  background: var(--bg);
+}
+
+.msg.assistant .msg-copy {
+  top: -4px;
+  right: 0;
+}
+
+.msg:hover .msg-copy,
+.msg-copy:focus-visible {
+  opacity: 1;
+}
+
 .msg.user {
   align-self: flex-end;
   background: var(--surface-raised);
@@ -158,6 +186,95 @@ select:focus {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   margin-bottom: 3px;
+}
+
+/* Markdown body inside Darwin's messages: the markdown parser owns spacing,
+   so undo the .msg pre-wrap (it would double every blank line). */
+.msg .md {
+  white-space: normal;
+}
+
+.msg .md > :first-child {
+  margin-top: 0;
+}
+
+.msg .md > :last-child {
+  margin-bottom: 0;
+}
+
+.msg .md p,
+.msg .md ul,
+.msg .md ol,
+.msg .md blockquote,
+.msg .md table {
+  margin: 0 0 10px;
+}
+
+.msg .md ul,
+.msg .md ol {
+  padding-left: 22px;
+}
+
+.msg .md li {
+  margin-bottom: 3px;
+}
+
+.msg .md h1,
+.msg .md h2,
+.msg .md h3,
+.msg .md h4 {
+  font-size: 13.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 14px 0 6px;
+}
+
+.msg .md code {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  background: var(--surface-raised);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.msg .md pre {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.msg .md pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 12px;
+}
+
+.msg .md a {
+  color: var(--accent);
+}
+
+.msg .md blockquote {
+  border-left: 2px solid var(--line);
+  padding-left: 12px;
+  color: var(--muted);
+}
+
+.msg .md table {
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.msg .md th,
+.msg .md td {
+  border: 1px solid var(--line);
+  padding: 4px 10px;
+  text-align: left;
 }
 
 .msg.system-note {
@@ -332,6 +449,56 @@ select:focus {
 .queue-note {
   color: var(--attention);
   font-size: 12.5px;
+}
+
+/* Queued messages — visible, steerable, removable */
+.queue-list {
+  border-top: 1px solid var(--line);
+  padding: 10px 20px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px dashed color-mix(in srgb, var(--attention) 45%, var(--line));
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: color-mix(in srgb, var(--attention) 6%, var(--bg));
+}
+
+.queue-pos {
+  color: var(--attention);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+
+.queue-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.queue-steer {
+  flex-shrink: 0;
+  border-color: color-mix(in srgb, var(--attention) 55%, var(--line));
+  color: var(--attention);
+  font-size: 12px;
+}
+
+.queue-remove {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  padding: 4px 8px;
 }
 
 .hint {

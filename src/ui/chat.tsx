@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { ChatItem, DecisionView, RebriefView } from "./types";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import type { ChatItem, DecisionView, QueuedMessage, RebriefView } from "./types";
 
 /** Render a settled card's outcome as one scannable line. */
 function settledSummary(decision: DecisionView): string {
@@ -160,6 +162,25 @@ function DecisionPrompt({
   );
 }
 
+/** Hover affordance on a message bubble: copy its text, flash confirmation. */
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      className="msg-copy"
+      title="Copy message"
+      onClick={() => {
+        void navigator.clipboard.writeText(text).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1200);
+        });
+      }}
+    >
+      {copied ? "Copied" : "Copy"}
+    </button>
+  );
+}
+
 /** A friendly model name for the limit note; the raw id is the fallback. */
 function modelLabel(model: string): string {
   if (/fable/i.test(model)) {
@@ -221,18 +242,23 @@ export function Chat({
   answering,
   projectName,
   onSend,
+  onQueueSteer,
+  onQueueRemove,
   onClearRebrief,
   onAnswerDecision,
   onSwitchToOpus,
 }: {
   items: ChatItem[];
   working: boolean;
-  queued: string[];
+  queued: QueuedMessage[];
   disabled: boolean;
   /** A card is waiting — the composer becomes its free-text answer. */
   answering: boolean;
   projectName: string;
   onSend: (text: string) => void;
+  /** Interrupt the current turn and send this queued message next. */
+  onQueueSteer: (id: string) => void;
+  onQueueRemove: (id: string) => void;
   onClearRebrief: (rebrief: RebriefView) => void;
   onAnswerDecision: (
     decisionId: string,
@@ -271,6 +297,7 @@ export function Chat({
           if (item.kind === "user") {
             return (
               <div className="msg user" key={index}>
+                <CopyButton text={item.text} />
                 {item.text}
               </div>
             );
@@ -279,7 +306,10 @@ export function Chat({
             return (
               <div className="msg assistant" key={index}>
                 <div className="speaker">Darwin</div>
-                {item.text}
+                <CopyButton text={item.text} />
+                <div className="md">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.text}</ReactMarkdown>
+                </div>
               </div>
             );
           }
@@ -357,6 +387,32 @@ export function Chat({
         })}
         {working ? <div className="working">Darwin is working — Esc ×3 to stop</div> : null}
       </div>
+      {queued.length > 0 ? (
+        <div className="queue-list" aria-label="Queued messages">
+          {queued.map((message, index) => (
+            <div className="queue-item" key={message.id}>
+              <span className="queue-pos">{index + 1}</span>
+              <span className="queue-text">{message.text}</span>
+              {working ? (
+                <button
+                  className="queue-steer"
+                  onClick={() => onQueueSteer(message.id)}
+                  title="Interrupt Darwin's current turn and send this message now — he picks up with this as the new direction."
+                >
+                  Steer
+                </button>
+              ) : null}
+              <button
+                className="queue-remove"
+                onClick={() => onQueueRemove(message.id)}
+                title="Remove from the queue without sending"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
       <div className={`chat-compose${answering ? " answering" : ""}`}>
         <textarea
           value={draft}
@@ -381,8 +437,7 @@ export function Chat({
             <span className="hint">Your message answers the question above.</span>
           ) : queued.length > 0 ? (
             <span className="queue-note">
-              {queued.length} message{queued.length === 1 ? "" : "s"} queued — sending when Darwin
-              finishes this turn.
+              Queued — sending in order when Darwin finishes, or Steer to interrupt.
             </span>
           ) : (
             <span className="hint">Enter to send · Shift+Enter for a new line</span>

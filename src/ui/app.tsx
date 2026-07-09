@@ -9,6 +9,7 @@ import type {
   ManagerStreamEvent,
   ProjectConfidenceView,
   ProjectView,
+  QueuedMessage,
   RebriefView,
   SpecificView,
   ToolChip,
@@ -98,10 +99,10 @@ export function App() {
   const [attention, setAttention] = useState<AttentionView[] | null>(null);
   const [confidence, setConfidence] = useState<ProjectConfidenceView | null>(null);
   const [working, setWorking] = useState(false);
-  const [queued, setQueued] = useState<string[]>([]);
+  const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const [daemonDown, setDaemonDown] = useState(false);
   const [showAddProject, setShowAddProject] = useState(false);
-  const queueRef = useRef<string[]>([]);
+  const queueRef = useRef<QueuedMessage[]>([]);
   const selectedIdRef = useRef<string | null>(null);
   selectedIdRef.current = selectedId;
 
@@ -458,9 +459,40 @@ export function App() {
     const next = queueRef.current.shift();
     setQueued([...queueRef.current]);
     if (next) {
-      void sendNow(selectedId, next);
+      void sendNow(selectedId, next.text);
     }
   }, [working, selectedId, sendNow]);
+
+  // Steering a queued message: bump it to the head of the queue and interrupt
+  // the in-flight turn. The interrupt ends the turn → `working` flips false →
+  // the drain effect above sends the steered message as the next turn, with
+  // Darwin's context refreshed by whatever the interrupted turn got done.
+  const handleQueueSteer = useCallback(
+    (id: string) => {
+      const index = queueRef.current.findIndex((message) => message.id === id);
+      if (index === -1) {
+        return;
+      }
+      const [steered] = queueRef.current.splice(index, 1);
+      if (steered) {
+        queueRef.current.unshift(steered);
+      }
+      setQueued([...queueRef.current]);
+      if (working && selectedId) {
+        void fetch("/api/manager/interrupt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectId: selectedId }),
+        });
+      }
+    },
+    [working, selectedId],
+  );
+
+  const handleQueueRemove = useCallback((id: string) => {
+    queueRef.current = queueRef.current.filter((message) => message.id !== id);
+    setQueued([...queueRef.current]);
+  }, []);
 
   // "Change to Opus": switch this project's manager model and re-send the
   // message that hit Fable's limit. The daemon remembers the switch, so every
@@ -516,7 +548,7 @@ export function App() {
         return;
       }
       if (working) {
-        queueRef.current.push(text);
+        queueRef.current.push({ id: crypto.randomUUID(), text });
         setQueued([...queueRef.current]);
         return;
       }
@@ -628,6 +660,8 @@ export function App() {
             answering={pendingDecision !== null}
             projectName={selected?.name ?? ""}
             onSend={handleSend}
+            onQueueSteer={handleQueueSteer}
+            onQueueRemove={handleQueueRemove}
             onClearRebrief={handleClearRebrief}
             onAnswerDecision={handleAnswerDecision}
             onSwitchToOpus={handleSwitchToOpus}
