@@ -132,6 +132,8 @@ const MANAGER_ALLOWED_TOOLS = [
   "mcp__galapagos__resolve_attention",
   "mcp__galapagos__review_completion",
   "mcp__galapagos__ask_user",
+  "mcp__galapagos__ask_batch",
+  "mcp__galapagos__confirm_understanding",
   "Read",
   "Glob",
   "Grep",
