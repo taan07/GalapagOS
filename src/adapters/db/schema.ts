@@ -137,4 +137,19 @@ CREATE TABLE IF NOT EXISTS jobs (
   finished_at TEXT,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS worker_steps (
+  id TEXT PRIMARY KEY,
+  worker_id TEXT NOT NULL REFERENCES workers(id),
+  ordinal INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  detail TEXT,
+  status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN (
+    'planned', 'active', 'done', 'abandoned'
+  )),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_steps_worker_ordinal
+  ON worker_steps(worker_id, ordinal);
 `;

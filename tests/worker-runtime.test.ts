@@ -16,8 +16,10 @@ import {
   collectAuditFiles,
   createWorkerRuntime,
   type LaneViolationNotice,
+  type WorkerBroadcast,
   type WorkerRuntime,
 } from "../src/adapters/agent/worker-runtime";
+import { listWorkerSteps } from "../src/adapters/db/repos/worker-steps";
 import type {
   SpawnWorkerSessionInput,
   WorkerSession,
@@ -110,6 +112,7 @@ type Fixture = {
   runtime: WorkerRuntime;
   sessions: ReturnType<typeof fakeSession>[];
   spawnInputs: SpawnWorkerSessionInput[];
+  broadcasts: WorkerBroadcast[];
 };
 
 async function fixture(opts?: {
@@ -121,10 +124,12 @@ async function fixture(opts?: {
   const project = await registerProject(db, { rootPath: fixtureRepo() });
   const sessions: ReturnType<typeof fakeSession>[] = [];
   const spawnInputs: SpawnWorkerSessionInput[] = [];
+  const broadcasts: WorkerBroadcast[] = [];
   const runtime = createWorkerRuntime({
     db,
     config,
     onLaneViolation: opts?.onLaneViolation,
+    broadcast: (event) => broadcasts.push(event),
     sessionFactory: (input) => {
       spawnInputs.push(input);
       const fake = fakeSession();
@@ -132,7 +137,7 @@ async function fixture(opts?: {
       return fake.session;
     },
   });
-  return { db, config, project, runtime, sessions, spawnInputs };
+  return { db, config, project, runtime, sessions, spawnInputs, broadcasts };
 }
 
 const SPAWN_INPUT = {
@@ -1102,4 +1107,160 @@ test("collectAuditFiles excludes build/dependency output even when the repo did 
 
   const files = await collectAuditFiles(repo, baseSha);
   assert.deepEqual(files.sort(), ["stray.ts"]);
+});
+
+test("a galapagos-plan block in an assistant message becomes the checklist and broadcasts worker_plan", async () => {
+  const { db, project, runtime, sessions, broadcasts } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  sessions[0]?.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+
+  const plan = JSON.stringify({
+    goal: "Harden the login form",
+    steps: [{ title: "Add validation", detail: "empty + invalid" }, { title: "Unit tests" }],
+  });
+  sessions[0]?.emit({
+    kind: "assistant",
+    payload: { text: "Here is my plan.\n```galapagos-plan\n" + plan + "\n```" },
+  });
+  await waitFor(
+    () => listWorkerSteps(db, outcome.workerId).length === 2,
+    "plan steps persisted",
+  );
+  const steps = listWorkerSteps(db, outcome.workerId);
+  assert.deepEqual(
+    steps.map((s) => ({ ordinal: s.ordinal, title: s.title, status: s.status })),
+    [
+      { ordinal: 1, title: "Add validation", status: "planned" },
+      { ordinal: 2, title: "Unit tests", status: "planned" },
+    ],
+  );
+  assert.equal(steps[0]?.detail, "empty + invalid");
+  assert.equal(
+    broadcasts.filter((b) => b.type === "worker_plan").length,
+    1,
+    "one worker_plan broadcast for the plan",
+  );
+});
+
+test("step updates advance the checklist with the exactly-one-active invariant", async () => {
+  const { db, project, runtime, sessions, broadcasts } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  sessions[0]?.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  const plan = JSON.stringify({
+    goal: "g",
+    steps: [{ title: "one" }, { title: "two" }, { title: "three" }],
+  });
+  sessions[0]?.emit({
+    kind: "assistant",
+    payload: { text: "```galapagos-plan\n" + plan + "\n```" },
+  });
+  await waitFor(() => listWorkerSteps(db, outcome.workerId).length === 3, "plan persisted");
+
+  // Start step 1, then in one message finish it and start step 2.
+  sessions[0]?.emit({
+    kind: "assistant",
+    payload: { text: '```galapagos-step\n{ "step": 1, "status": "active" }\n```' },
+  });
+  await waitFor(
+    () => listWorkerSteps(db, outcome.workerId)[0]?.status === "active",
+    "step 1 active",
+  );
+  sessions[0]?.emit({
+    kind: "assistant",
+    payload: {
+      text:
+        'Done with one.\n```galapagos-step\n{ "step": 1, "status": "done" }\n```\n' +
+        '```galapagos-step\n{ "step": 2, "status": "active" }\n```',
+    },
+  });
+  await waitFor(
+    () => listWorkerSteps(db, outcome.workerId)[1]?.status === "active",
+    "step 2 active",
+  );
+  const statuses = listWorkerSteps(db, outcome.workerId).map((s) => s.status);
+  assert.deepEqual(statuses, ["done", "active", "planned"]);
+  assert.ok(
+    broadcasts.filter((b) => b.type === "worker_plan").length >= 3,
+    "each checklist move broadcasts",
+  );
+
+  // Activating step 3 demotes nothing done: 1 stays done, 2 -> planned.
+  sessions[0]?.emit({
+    kind: "assistant",
+    payload: { text: '```galapagos-step\n{ "step": 3, "status": "active" }\n```' },
+  });
+  await waitFor(
+    () => listWorkerSteps(db, outcome.workerId)[2]?.status === "active",
+    "step 3 active",
+  );
+  assert.deepEqual(
+    listWorkerSteps(db, outcome.workerId).map((s) => s.status),
+    ["done", "planned", "active"],
+  );
+});
+
+test("a re-plan replaces the checklist but preserves done steps by title; malformed blocks raise nothing", async () => {
+  const { db, project, runtime, sessions } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  sessions[0]?.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  const first = JSON.stringify({ goal: "g", steps: [{ title: "keep" }, { title: "drop" }] });
+  sessions[0]?.emit({
+    kind: "assistant",
+    payload: { text: "```galapagos-plan\n" + first + "\n```" },
+  });
+  await waitFor(() => listWorkerSteps(db, outcome.workerId).length === 2, "first plan");
+  sessions[0]?.emit({
+    kind: "assistant",
+    payload: { text: '```galapagos-step\n{ "step": 1, "status": "done" }\n```' },
+  });
+  await waitFor(
+    () => listWorkerSteps(db, outcome.workerId)[0]?.status === "done",
+    "step 'keep' done",
+  );
+
+  // Malformed plan block: tolerated silently — no attention item, checklist untouched.
+  sessions[0]?.emit({
+    kind: "assistant",
+    payload: { text: "```galapagos-plan\n{ goal: broken\n```" },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(listWorkerSteps(db, outcome.workerId).length, 2, "checklist untouched");
+  assert.equal(
+    listWorkerAttentionItems(db, outcome.workerId).length,
+    0,
+    "a botched plan block is not an attention item",
+  );
+
+  // Re-plan: 'keep' survives as done, 'drop' is gone, new steps are planned.
+  const second = JSON.stringify({
+    goal: "g",
+    steps: [{ title: "keep" }, { title: "new step" }],
+  });
+  sessions[0]?.emit({
+    kind: "assistant",
+    payload: { text: "Re-planning after steer.\n```galapagos-plan\n" + second + "\n```" },
+  });
+  await waitFor(
+    () => listWorkerSteps(db, outcome.workerId).some((s) => s.title === "new step"),
+    "re-plan applied",
+  );
+  assert.deepEqual(
+    listWorkerSteps(db, outcome.workerId).map((s) => ({ title: s.title, status: s.status })),
+    [
+      { title: "keep", status: "done" },
+      { title: "new step", status: "planned" },
+    ],
+  );
 });

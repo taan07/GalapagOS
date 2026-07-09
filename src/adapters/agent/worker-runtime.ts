@@ -7,6 +7,7 @@ import { existsSync } from "node:fs";
 import type { GalapagosConfig } from "../../config";
 import { checkLane, findLaneOverlap, type LaneContract } from "../../core/lanes/lane-check";
 import { parseCompletionReport } from "../../core/digests/completion";
+import { parsePlan, parseStepUpdates } from "../../core/plans/plan";
 import { artifactExcludePathspecs, isArtifactPath } from "../../core/git/artifact-dirs";
 import { parseStatusPorcelain } from "../../core/git/parsers";
 import { oneLine } from "../../core/text";
@@ -43,6 +44,11 @@ import {
   type CompletionDigestRow,
 } from "../db/repos/digests";
 import {
+  applyStepUpdate,
+  listWorkerSteps,
+  replacePlanSteps,
+} from "../db/repos/worker-steps";
+import {
   createAttentionItem,
   listWorkerAttentionItems,
   openAttentionItemExists,
@@ -74,6 +80,13 @@ export type WorkerBroadcast =
       workerId: string;
       status: WorkerStatus;
       lastSummary: string | null;
+    }
+  | {
+      // The worker's plan checklist changed (first plan, a re-plan, or a step
+      // marked active/done) — the /workers goal card re-fetches its steps.
+      type: "worker_plan";
+      projectId: string;
+      workerId: string;
     };
 
 export type SpawnWorkerInput = {
@@ -302,6 +315,30 @@ export function createWorkerRuntime(deps: {
     broadcastStatus(worker);
   };
 
+  /**
+   * Apply any plan/step blocks in a worker's assistant message: a fresh
+   * galapagos-plan block (re)writes the checklist (done steps preserved by
+   * title); galapagos-step blocks mark progress. Malformed blocks are
+   * tolerated silently — a botched progress note is not a completion claim, so
+   * it never raises attention. Broadcasts worker_plan when the checklist moved.
+   */
+  const applyPlanFromMessage = (worker: { id: string; project_id: string }, text: string) => {
+    let changed = false;
+    const plan = parsePlan(text);
+    if (plan.status === "parsed") {
+      replacePlanSteps(db, worker.id, plan.plan.steps);
+      changed = true;
+    }
+    for (const update of parseStepUpdates(text)) {
+      if (applyStepUpdate(db, worker.id, update.step, update.status)) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      deps.broadcast?.({ type: "worker_plan", projectId: worker.project_id, workerId: worker.id });
+    }
+  };
+
   const buildHoldMessage = (heldBy: string): string =>
     `HOLD (requested by ${heldBy}): pause now. Do not start anything new and do not write further changes. Reply with ONE short message stating exactly where you are and what remains, then wait for further instructions. Do not emit a completion block.`;
 
@@ -503,6 +540,7 @@ export function createWorkerRuntime(deps: {
           break;
         case "assistant":
           persistEvent(worker, "assistant", event.payload, oneLine(event.payload.text));
+          applyPlanFromMessage(worker, event.payload.text);
           drainReplyWaiters(workerId, oneLine(event.payload.text, 400));
           break;
         case "tool_use": {
@@ -998,8 +1036,9 @@ ${dirty}
 
 ${input.note?.trim() || "Continue toward the original brief's done-criteria."}
 
-Review the state first, then continue. End with your completion report as
-required.`;
+Review the state first, then continue. Your first reply must end with a
+fresh galapagos-plan block covering the REMAINING work (the predecessor's
+plan does not carry over). End with your completion report as required.`;
 
       reactivateLane(db, lane.id);
       const worker = createWorker(db, {
