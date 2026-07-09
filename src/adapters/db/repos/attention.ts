@@ -26,7 +26,11 @@ export type AttentionKind =
   | "integrity_alert"
   // Chunk 3 drills (loud-denial ruling): a worker repeatedly denied the
   // same tool may be improvising around the wall — surface it.
-  | "tool_denied";
+  | "tool_denied"
+  // Goal-progress chunk: a worker was deliberately stopped BEFORE its work
+  // passed the quality gate (stop_worker intent "abandon") — visible so
+  // unfinished work is never mistaken for retired-clean work.
+  | "worker_abandoned";
 
 export type AttentionStatus = "open" | "resolved" | "dismissed";
 

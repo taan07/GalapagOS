@@ -57,6 +57,13 @@ export type MonitorDeps = {
    */
   runWatchdog: (input: LegReviewInput) => Promise<unknown>;
   runCritic: (input: LegReviewInput) => Promise<unknown>;
+  /**
+   * Quality-gated retirement (user-confirmed 2026-07-08): invoked the moment
+   * the tick flips a digest to manager_reviewed — a completion the evidence
+   * proves clean both reviews AND retires in one place, keeping the LLM-free
+   * tick the single authority on "done".
+   */
+  retireWorker: (workerId: string, reason: string) => Promise<void>;
   broadcast?: (event: MonitorBroadcast) => void;
   now?: () => Date;
 };
@@ -429,6 +436,16 @@ export function createMonitor(deps: MonitorDeps) {
       if (report.state === "strong" && openItems.length === 0) {
         setDigestStatus(db, digest.id, "manager_reviewed");
         deps.broadcast?.({ type: "digest_reviewed", projectId: project.id, workerId: worker.id });
+        // Quality passed → the short-lived contract ends. Fires exactly once:
+        // a manager_reviewed digest leaves listUnreviewedDigests. A retire
+        // failure must not kill the tick — the item stays reviewable.
+        try {
+          await deps.retireWorker(worker.id, "retired: quality passed");
+        } catch (error) {
+          console.error(
+            `[monitor] auto-retire failed for ${worker.id}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       }
     }
     return changed;
