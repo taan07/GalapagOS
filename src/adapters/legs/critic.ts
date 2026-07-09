@@ -14,6 +14,7 @@ import {
   type CriticFinding,
 } from "../../core/legs/critic";
 import { isTestPath } from "../../core/legs/tripwires";
+import { ARTIFACT_DIR_SET } from "../../core/git/artifact-dirs";
 import { parseStatusPorcelain } from "../../core/git/parsers";
 import type { GalapagosDb } from "../db/db";
 import { createJob, failJob, finishJob, startJob } from "../db/repos/jobs";
@@ -42,7 +43,6 @@ const UNTRACKED_RENDER_LIMIT = 16 * 1024;
 const REFERENCE_TEST_LIMIT = 8 * 1024;
 const REFERENCE_TEST_MAX_FILES = 3;
 const WALK_MAX_ENTRIES = 500;
-const SKIP_DIRS = new Set([".git", "node_modules", "dist", "dist-node", "build", ".next", "vendor"]);
 
 /**
  * Unchanged test files that exercise the changed code (found live
@@ -79,7 +79,7 @@ function collectReferenceTests(
       scanned += 1;
       const relative = dir ? `${dir}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
-        if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith(".")) {
+        if (!ARTIFACT_DIR_SET.has(entry.name) && !entry.name.startsWith(".")) {
           walk(relative, depth + 1);
         }
       } else if (isTestPath(relative) && !changed.has(relative)) {

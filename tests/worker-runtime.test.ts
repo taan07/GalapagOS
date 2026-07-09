@@ -15,6 +15,7 @@ import { listWorkerAttentionItems } from "../src/adapters/db/repos/attention";
 import {
   collectAuditFiles,
   createWorkerRuntime,
+  type LaneViolationNotice,
   type WorkerRuntime,
 } from "../src/adapters/agent/worker-runtime";
 import type {
@@ -111,7 +112,9 @@ type Fixture = {
   spawnInputs: SpawnWorkerSessionInput[];
 };
 
-async function fixture(): Promise<Fixture> {
+async function fixture(opts?: {
+  onLaneViolation?: (notice: LaneViolationNotice) => void;
+}): Promise<Fixture> {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "glp-rt-state-"));
   const config = loadConfig({ ...process.env, GALAPAGOS_STATE_DIR: stateDir });
   const db = openDb(stateDir);
@@ -121,6 +124,7 @@ async function fixture(): Promise<Fixture> {
   const runtime = createWorkerRuntime({
     db,
     config,
+    onLaneViolation: opts?.onLaneViolation,
     sessionFactory: (input) => {
       spawnInputs.push(input);
       const fake = fakeSession();
@@ -426,6 +430,97 @@ test("stop audits the lane: an out-of-lane Bash-style edit raises a high-priorit
 
   assert.equal(runtime.list(project.id)[0]?.lane?.status, "retired");
   assert.ok(existsSync(outcome.worktreePath), "the worktree survives stop for review");
+});
+
+test("a Bash-written out-of-lane file freezes the worker, raises the violation, and wakes Darwin once", async () => {
+  const notices: LaneViolationNotice[] = [];
+  const { db, project, runtime, sessions } = await fixture({
+    onLaneViolation: (notice) => notices.push(notice),
+  });
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  sessions[0]?.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+
+  // The Bash bypass: a file appears outside the lane with no Edit/Write the
+  // canUseTool gate could catch. The guard fires when the Bash result lands.
+  mkdirSync(path.join(outcome.worktreePath, "src", "billing"), { recursive: true });
+  writeFileSync(path.join(outcome.worktreePath, "src", "billing", "sneaky.ts"), "// out\n");
+  sessions[0]?.emit({ kind: "tool_use", payload: { tool: "Bash", input: { command: "echo x" } } });
+  sessions[0]?.emit({ kind: "tool_result", payload: { content: "x", isError: false } });
+
+  await waitFor(() => notices.length === 1, "Darwin woken by the lane violation");
+  const notice = notices[0];
+  assert.equal(notice?.workerId, outcome.workerId);
+  assert.equal(notice?.laneName, "auth ui");
+  assert.deepEqual(
+    notice?.violations.map((v) => v.path),
+    ["src/billing/sneaky.ts"],
+  );
+
+  // The worker was frozen: a HOLD steer was enqueued to its session.
+  assert.equal(
+    sessions[0]?.sent.filter((m) => m.startsWith("HOLD")).length,
+    1,
+    "the worker is held exactly once",
+  );
+  const violation = listWorkerAttentionItems(db, outcome.workerId).find(
+    (item) => item.kind === "lane_violation",
+  );
+  assert.ok(violation, "a high-priority lane_violation item was raised");
+  assert.equal(violation?.priority, "high");
+
+  // Debounce: another Bash over the SAME stray set must not re-fire.
+  sessions[0]?.emit({ kind: "tool_use", payload: { tool: "Bash", input: { command: "ls" } } });
+  sessions[0]?.emit({ kind: "tool_result", payload: { content: "", isError: false } });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(notices.length, 1, "the same violation set does not wake Darwin twice");
+  assert.equal(
+    sessions[0]?.sent.filter((m) => m.startsWith("HOLD")).length,
+    1,
+    "the worker is not held again for the same stray",
+  );
+});
+
+test("Bash-written build artifacts never trip the lane guard", async () => {
+  const notices: LaneViolationNotice[] = [];
+  const { db, project, runtime, sessions } = await fixture({
+    onLaneViolation: (notice) => notices.push(notice),
+  });
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  sessions[0]?.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+
+  // `npm install` / a build leaves untracked node_modules + dist. In this
+  // fixture repo they are NOT gitignored — the exact flood scenario.
+  mkdirSync(path.join(outcome.worktreePath, "node_modules", "dep"), { recursive: true });
+  writeFileSync(path.join(outcome.worktreePath, "node_modules", "dep", "index.js"), "x\n");
+  mkdirSync(path.join(outcome.worktreePath, "dist"), { recursive: true });
+  writeFileSync(path.join(outcome.worktreePath, "dist", "bundle.js"), "x\n");
+  sessions[0]?.emit({
+    kind: "tool_use",
+    payload: { tool: "Bash", input: { command: "npm install" } },
+  });
+  sessions[0]?.emit({ kind: "tool_result", payload: { content: "added 1 package", isError: false } });
+
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(notices.length, 0, "generated output is not a lane violation");
+  assert.equal(
+    sessions[0]?.sent.filter((m) => m.startsWith("HOLD")).length,
+    0,
+    "the worker is not frozen for build output",
+  );
+  assert.equal(
+    listWorkerAttentionItems(db, outcome.workerId).filter((i) => i.kind === "lane_violation")
+      .length,
+    0,
+    "no lane_violation item is raised for build output",
+  );
 });
 
 test("stop on a clean, reported worker: no violations, digest acknowledged, lane retired", async () => {
@@ -761,6 +856,13 @@ test("hold sends the pause instruction and reports the worker's position", async
 
   const pending = runtime.hold(outcome.workerId, "the user, via the workers page");
   await waitFor(() => fake.sent.some((text) => text.startsWith("HOLD")), "hold delivered");
+  // Holding a RUNNING worker preempts its turn: the aborted turn's error
+  // result is the debris that clears the brake, and only the pause ack that
+  // follows it drains the waiter (see the dedicated preempt test below).
+  fake.emit({
+    kind: "result",
+    payload: { subtype: "error_during_execution", isError: true, resultText: null },
+  });
   fake.emit({ kind: "assistant", payload: { text: "Paused after the form markup; tests remain." } });
   const held = await pending;
   assert.ok(held.ok);
@@ -973,4 +1075,31 @@ test("collectAuditFiles unions committed diff with porcelain, handling renames",
     "dirty.ts",
     "newdir/deep/fresh.ts",
   ]);
+});
+
+test("collectAuditFiles excludes build/dependency output even when the repo did not .gitignore it", async () => {
+  const repo = fixtureRepo();
+  const git = (args: string[]) =>
+    execFileSync(
+      "git",
+      ["-c", "user.name=Galapagos Tests", "-c", "user.email=tests@galapagos.local", ...args],
+      { cwd: repo, encoding: "utf8" },
+    );
+  const baseSha = git(["rev-parse", "HEAD"]).trim();
+
+  // A worker that ran `npm install` / a build leaves these UNtracked and, in a
+  // repo that forgot to .gitignore them, they would otherwise flood the audit.
+  mkdirSync(path.join(repo, "node_modules", "@babel", "core", "lib"), { recursive: true });
+  writeFileSync(path.join(repo, "node_modules", "@babel", "core", "lib", "index.js"), "x\n");
+  mkdirSync(path.join(repo, "dist", "bodies"), { recursive: true });
+  writeFileSync(path.join(repo, "dist", "index.html"), "x\n");
+  writeFileSync(path.join(repo, "dist", "bodies", "earth.jpg"), "x\n");
+  // A nested workspace copy (monorepo) must be excluded by segment too.
+  mkdirSync(path.join(repo, "packages", "app", "node_modules"), { recursive: true });
+  writeFileSync(path.join(repo, "packages", "app", "node_modules", "dep.js"), "x\n");
+  // The one genuine out-of-lane change must still surface.
+  writeFileSync(path.join(repo, "stray.ts"), "real work\n");
+
+  const files = await collectAuditFiles(repo, baseSha);
+  assert.deepEqual(files.sort(), ["stray.ts"]);
 });

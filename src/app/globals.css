@@ -707,14 +707,16 @@ select:focus {
   color: var(--muted);
 }
 
-.decision-custom {
+.decision-actions {
   display: flex;
-  gap: 8px;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
-.decision-custom input {
-  flex: 1;
+.decision-submit {
   font-size: 13px;
+  font-weight: 600;
 }
 
 .decision-outcome {
@@ -725,6 +727,38 @@ select:focus {
 .decision-hint {
   font-size: 11.5px;
   color: var(--faint);
+}
+
+/* Batch card: 2-4 questions in one card, each its own option group. */
+.decision.batch {
+  gap: 14px;
+}
+
+.decision-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.decision-field-prompt {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+/* Confirm card: an understanding playback to confirm or correct. */
+.decision.confirm {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+}
+
+.decision.confirm .decision-question {
+  font-weight: 500;
+}
+
+/* The composer is answering a pending card — the "other" free-text channel. */
+.chat-compose.answering textarea {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
 }
 
 .stop-note {

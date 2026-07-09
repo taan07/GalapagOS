@@ -54,11 +54,14 @@ function turnsToChatItems(turns: TurnView[]): ChatItem[] {
             kind: "decision",
             decision: {
               decisionId: payload.decisionId,
+              cardKind: payload.cardKind ?? "decision",
               question: payload.question,
               options: payload.options,
               multiSelect: payload.multiSelect,
+              fields: payload.fields ?? [],
               status: payload.status,
               selections: payload.selections,
+              responses: payload.responses ?? {},
               custom: payload.custom,
             },
           },
@@ -101,6 +104,19 @@ export function App() {
   const queueRef = useRef<string[]>([]);
   const selectedIdRef = useRef<string | null>(null);
   selectedIdRef.current = selectedId;
+
+  // The latest still-pending card, if any. The chat composer routes free text
+  // to it instead of starting a new turn (2026-07-08 ruling).
+  let pendingDecision: DecisionView | null = null;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item && item.kind === "decision" && item.decision.status === "pending") {
+      pendingDecision = item.decision;
+      break;
+    }
+  }
+  const pendingDecisionRef = useRef<DecisionView | null>(null);
+  pendingDecisionRef.current = pendingDecision;
 
   const selected = projects?.find((project) => project.id === selectedId) ?? null;
 
@@ -318,11 +334,14 @@ export function App() {
                   kind: "decision",
                   decision: {
                     decisionId: event.decisionId,
+                    cardKind: event.cardKind,
                     question: event.question,
                     options: event.options,
                     multiSelect: event.multiSelect,
+                    fields: event.fields,
                     status: "pending",
                     selections: [],
+                    responses: {},
                     custom: "",
                   },
                 },
@@ -337,6 +356,7 @@ export function App() {
                           ...item.decision,
                           status: event.status,
                           selections: event.selections,
+                          responses: event.responses,
                           custom: event.custom,
                         },
                       }
@@ -455,29 +475,17 @@ export function App() {
     [selectedId, sendNow],
   );
 
-  const handleSend = useCallback(
-    (text: string) => {
-      if (!selectedId) {
-        return;
-      }
-      if (working) {
-        queueRef.current.push(text);
-        setQueued([...queueRef.current]);
-        return;
-      }
-      void sendNow(selectedId, text);
-    },
-    [selectedId, working, sendNow],
-  );
-
-  // Answer a chat decision: the daemon resolves Darwin's waiting tool call;
-  // the decision_settled event on the open stream stamps the final state.
-  const handleAnswerDecision = useCallback(
-    async (decisionId: string, selections: string[], custom: string) => {
+  // Post an answer to a pending chat card: the daemon resolves Darwin's
+  // waiting tool call; the decision_settled event stamps the final state.
+  const postDecisionAnswer = useCallback(
+    async (
+      decisionId: string,
+      answer: { selections: string[]; responses: Record<string, string[]>; custom: string },
+    ) => {
       const response = await fetch("/api/manager/decision", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decisionId, selections, custom }),
+        body: JSON.stringify({ decisionId, ...answer }),
       });
       if (!response.ok) {
         const payload = (await response.json().catch(() => ({}))) as { error?: string };
@@ -488,6 +496,45 @@ export function App() {
       }
     },
     [],
+  );
+
+  // The chat composer IS the free-text answer to a pending card: a typed
+  // message settles the waiting card as the custom answer instead of starting
+  // a new turn (2026-07-08 ruling — no embedded text fields).
+  const handleSend = useCallback(
+    (text: string) => {
+      if (!selectedId) {
+        return;
+      }
+      const pending = pendingDecisionRef.current;
+      if (pending) {
+        void postDecisionAnswer(pending.decisionId, {
+          selections: [],
+          responses: {},
+          custom: text,
+        });
+        return;
+      }
+      if (working) {
+        queueRef.current.push(text);
+        setQueued([...queueRef.current]);
+        return;
+      }
+      void sendNow(selectedId, text);
+    },
+    [selectedId, working, sendNow, postDecisionAnswer],
+  );
+
+  // Answer a card via its clickable options: single/confirm selections, or a
+  // batch's per-field responses.
+  const handleAnswerDecision = useCallback(
+    (
+      decisionId: string,
+      selections: string[],
+      responses: Record<string, string[]>,
+      custom: string,
+    ) => postDecisionAnswer(decisionId, { selections, responses, custom }),
+    [postDecisionAnswer],
   );
 
   const handleClearRebrief = useCallback(
@@ -578,6 +625,7 @@ export function App() {
             working={working}
             queued={queued}
             disabled={daemonDown || !selected}
+            answering={pendingDecision !== null}
             projectName={selected?.name ?? ""}
             onSend={handleSend}
             onClearRebrief={handleClearRebrief}
