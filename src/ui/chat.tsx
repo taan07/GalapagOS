@@ -170,31 +170,47 @@ function DecisionPrompt({
   );
 }
 
-// Matches the ::details-content transition in globals.css (240ms) — the
-// follow-up scroll waits for the expansion to finish growing.
-const DETAILS_EASE_MS = 260;
+// Covers the 240ms ::details-content ease plus a settle tail.
+const EXPANSION_FOLLOW_MS = 420;
 
 /**
- * After a disclosure opens, glide the revealed message into view — the user
- * clicked to read it, they shouldn't then have to scroll to it. A message
- * that fits the viewport settles fully visible (the common "take me down to
- * the bottom" case); one taller than the viewport aligns its top so reading
- * starts at the summary.
+ * While a disclosure eases open, the view rides the growth frame by frame —
+ * the scroll IS the expansion's own motion, not a second animation queued
+ * after it. Each frame nudges the scroller just enough to keep the revealed
+ * message's bottom in view (so the common last-message case lands at the
+ * chat's bottom); a message taller than the viewport pins to its top
+ * instead, and the view never yanks upward. Already-visible expansions
+ * don't move at all.
  */
-function easeOpenedIntoView(details: HTMLDetailsElement): void {
+function followExpansionIntoView(details: HTMLDetailsElement): void {
   if (!details.open) {
     return;
   }
-  window.setTimeout(() => {
+  const scroller = details.closest(".chat-scroll");
+  if (!scroller) {
+    return;
+  }
+  const target = details.closest(".msg") ?? details;
+  const start = performance.now();
+  const frame = (now: number) => {
     if (!details.isConnected || !details.open) {
       return;
     }
-    const target = details.closest(".msg") ?? details;
-    const scroller = details.closest(".chat-scroll");
-    const tallerThanView =
-      scroller !== null && target.getBoundingClientRect().height > scroller.clientHeight;
-    target.scrollIntoView({ behavior: "smooth", block: tallerThanView ? "start" : "nearest" });
-  }, DETAILS_EASE_MS);
+    const view = scroller.getBoundingClientRect();
+    const rect = target.getBoundingClientRect();
+    if (rect.height > view.height) {
+      const toTop = rect.top - view.top;
+      if (toTop > 0) {
+        scroller.scrollTop += toTop;
+      }
+    } else if (rect.bottom > view.bottom) {
+      scroller.scrollTop += rect.bottom - view.bottom;
+    }
+    if (now - start < EXPANSION_FOLLOW_MS) {
+      requestAnimationFrame(frame);
+    }
+  };
+  requestAnimationFrame(frame);
 }
 
 /** Hover affordance on a message bubble: copy its text, flash confirmation. */
@@ -331,7 +347,7 @@ const ChatMessage = memo(function ChatMessage({
         </div>
         <details
           className="fold"
-          onToggle={(event) => easeOpenedIntoView(event.currentTarget)}
+          onToggle={(event) => followExpansionIntoView(event.currentTarget)}
         >
           <summary>Details</summary>
           <div className="md">
@@ -512,7 +528,7 @@ const TurnBlock = memo(function TurnBlock({
       ) : null}
       {(plan ? plan.inline : group.body).map(renderEntry)}
       {plan && plan.rolledUp.length > 0 ? (
-        <details className="rollup" onToggle={(event) => easeOpenedIntoView(event.currentTarget)}>
+        <details className="rollup" onToggle={(event) => followExpansionIntoView(event.currentTarget)}>
           <summary>
             {plan.rolledUp.length} action{plan.rolledUp.length === 1 ? "" : "s"}
           </summary>
