@@ -43,11 +43,7 @@ import {
   latestDigestForWorker,
   type CompletionDigestRow,
 } from "../db/repos/digests";
-import {
-  applyStepUpdate,
-  listWorkerSteps,
-  replacePlanSteps,
-} from "../db/repos/worker-steps";
+import { applyStepUpdate, replacePlan } from "../db/repos/worker-steps";
 import {
   createAttentionItem,
   listWorkerAttentionItems,
@@ -326,7 +322,7 @@ export function createWorkerRuntime(deps: {
     let changed = false;
     const plan = parsePlan(text);
     if (plan.status === "parsed") {
-      replacePlanSteps(db, worker.id, plan.plan.steps);
+      replacePlan(db, worker.id, plan.plan);
       changed = true;
     }
     for (const update of parseStepUpdates(text)) {

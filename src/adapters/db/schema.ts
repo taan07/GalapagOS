@@ -152,4 +152,10 @@ CREATE TABLE IF NOT EXISTS worker_steps (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_steps_worker_ordinal
   ON worker_steps(worker_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS worker_plans (
+  worker_id TEXT PRIMARY KEY REFERENCES workers(id),
+  goal TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `;

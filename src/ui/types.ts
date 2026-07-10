@@ -134,6 +134,31 @@ export type WorkerView = {
   openAttentionCount: number;
   /** Predecessor worker id when this session continues stopped work. */
   resumedFrom: string | null;
+  /** The worker's own one-line objective from its plan block; null pre-plan. */
+  goal: string | null;
+  /** Plan progress for the card badge/bar; 0/0 means no plan yet. */
+  stepsDone: number;
+  stepsTotal: number;
+  /** Title of the single 'active' step, if the worker marked one. */
+  activeStepTitle: string | null;
+};
+
+/** One plan step as served in the drilldown — the checklist row. */
+export type WorkerStepView = {
+  ordinal: number;
+  title: string;
+  detail: string | null;
+  status: "planned" | "active" | "done" | "abandoned";
+  updatedAt: string;
+};
+
+/** GitHub links for a worker's work, all derived from the project's remote. */
+export type WorkerGithubView = {
+  webBase: string;
+  branchUrl: string;
+  baseCommitUrl: string | null;
+  /** Blob URL at the worker's branch, keyed by claim file path. */
+  fileUrls: Record<string, string>;
 };
 
 export type WorkerEventView = {
@@ -212,6 +237,10 @@ export type WorkerDetailView = {
   events: WorkerEventView[];
   digest: DigestView | null;
   attention: AttentionView[];
+  /** The plan checklist in ordinal order; empty means no plan yet. */
+  steps: WorkerStepView[];
+  /** GitHub links for this worker's branch/base/files; null without a remote. */
+  github: WorkerGithubView | null;
 };
 
 /**
@@ -236,7 +265,9 @@ export type DaemonStreamEvent =
   | { type: "attention_changed"; projectId: string }
   | { type: "digest_reviewed"; projectId: string; workerId: string }
   | { type: "monitor_tick"; projectId: string }
-  | { type: "manager_note"; projectId: string; text: string };
+  | { type: "manager_note"; projectId: string; text: string }
+  /** A worker's plan/steps changed — re-fetch its checklist (ids only). */
+  | { type: "worker_plan"; projectId: string; workerId: string };
 
 /** One durable record as served by /api/records — every field attributed. */
 export type RecordView = {

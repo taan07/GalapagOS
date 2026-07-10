@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { githubBlobUrl, githubBranchUrl, githubWebBase } from "../src/core/git/github-url";
+import {
+  githubBlobUrl,
+  githubBranchUrl,
+  githubCommitUrl,
+  githubWebBase,
+} from "../src/core/git/github-url";
 
 test("githubWebBase normalizes SSH, scp, and HTTPS remotes to one web base", () => {
   const expected = "https://github.com/taan07/GalapagOS";
@@ -35,5 +40,13 @@ test("branch and blob links encode path segments but keep slashes", () => {
   assert.equal(
     githubBlobUrl(base, "main", "docs/galapagos/briefs/with space.md"),
     `${base}/blob/main/docs/galapagos/briefs/with%20space.md`,
+  );
+});
+
+test("commit links point at the single-sha view", () => {
+  const base = "https://github.com/taan07/GalapagOS";
+  assert.equal(
+    githubCommitUrl(base, "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"),
+    `${base}/commit/0a1b2c3d4e5f60718293a4b5c6d7e8f901234567`,
   );
 });

@@ -783,6 +783,158 @@ select:focus {
   white-space: nowrap;
 }
 
+/* The worker's plan on the card and in the drilldown goal card. */
+.worker-goal {
+  color: var(--ink);
+  font-size: 13px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.worker-plan-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.plan-count {
+  color: var(--muted);
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+.plan-bar {
+  flex: 0 0 72px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+  display: inline-block;
+}
+
+.plan-bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--ok);
+}
+
+.plan-active {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.goal-card {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.goal-label {
+  color: var(--faint);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.goal-text {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.goal-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.goal-progress .plan-bar {
+  flex: 0 0 120px;
+}
+
+.goal-narrative {
+  color: var(--muted);
+  font-size: 12px;
+  min-width: 0;
+}
+
+.plan-details summary {
+  font-size: 12px;
+}
+
+.plan-steps {
+  list-style: none;
+  margin: 6px 0 2px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.plan-step {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink);
+}
+
+.plan-step .step-mark {
+  text-align: center;
+  color: var(--faint);
+}
+
+.plan-step.step-done .step-mark {
+  color: var(--ok);
+}
+
+.plan-step.step-done .step-title {
+  color: var(--muted);
+}
+
+.plan-step.step-active .step-mark,
+.plan-step.step-active .step-title {
+  color: var(--accent);
+}
+
+.plan-step.step-abandoned .step-title {
+  color: var(--faint);
+  text-decoration: line-through;
+}
+
+.plan-step .step-detail {
+  grid-column: 2;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.gh-link,
+.contract-value a,
+.claim-files a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.gh-link:hover,
+.contract-value a:hover,
+.claim-files a:hover {
+  text-decoration: underline;
+}
+
+.gh-link {
+  font-size: 12px;
+}
+
 .drilldown {
   min-width: 0;
   min-height: 0;

@@ -21,6 +21,16 @@ export type WorkerStepRow = {
 
 export type PlanStepInput = { title: string; detail?: string };
 
+export type PlanInput = { goal: string; steps: PlanStepInput[] };
+
+/** The worker's own one-line objective (from its plan block), or null pre-plan. */
+export function getWorkerPlanGoal(db: GalapagosDb, workerId: string): string | null {
+  const row = db.prepare("SELECT goal FROM worker_plans WHERE worker_id = ?").get(workerId) as
+    | { goal: string }
+    | undefined;
+  return row?.goal ?? null;
+}
+
 /** Steps in plan order — the checklist the UI renders top to bottom. */
 export function listWorkerSteps(db: GalapagosDb, workerId: string): WorkerStepRow[] {
   return db
@@ -98,6 +108,23 @@ export function replacePlanSteps(
     });
   });
   swap(steps);
+}
+
+/**
+ * Replace a worker's whole plan — goal and checklist together, atomically. The
+ * goal is plan-level state (a re-plan restates it), so it lives beside the
+ * steps and swaps in the same transaction; the checklist keeps the
+ * done-preserved-by-title semantics of replacePlanSteps.
+ */
+export function replacePlan(db: GalapagosDb, workerId: string, plan: PlanInput): void {
+  const apply = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO worker_plans (worker_id, goal, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(worker_id) DO UPDATE SET goal = excluded.goal, updated_at = excluded.updated_at`,
+    ).run(workerId, plan.goal, nowIso());
+    replacePlanSteps(db, workerId, plan.steps);
+  });
+  apply();
 }
 
 /** Append net-new steps after the current last ordinal, as 'planned'. */

@@ -33,6 +33,13 @@ import {
   listWorkerAttentionItems,
   resolveAttentionItem,
 } from "../src/adapters/db/repos/attention";
+import {
+  applyStepUpdate,
+  countStepsForWorker,
+  getWorkerPlanGoal,
+  listWorkerSteps,
+  replacePlan,
+} from "../src/adapters/db/repos/worker-steps";
 
 async function fixture(): Promise<{ db: GalapagosDb; project: ProjectRow }> {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "glp-state-"));
@@ -228,4 +235,46 @@ test("attention items open, list by project and worker, and resolve", async () =
   const resolved = listWorkerAttentionItems(db, worker.id)[0];
   assert.equal(resolved?.status, "resolved");
   assert.ok(resolved?.resolved_at);
+});
+
+test("replacePlan persists the goal beside the steps; a re-plan restates both", async () => {
+  const { db, project } = await fixture();
+  const lane = fixtureLane(db, project.id);
+  const worker = createWorker(db, {
+    projectId: project.id,
+    laneId: lane.id,
+    worktreePath: "/w",
+    branch: "galapagos/worker/auth-ui",
+    briefRecordId: "brief1",
+  });
+
+  // Pre-plan: the honest absence — no goal, no steps.
+  assert.equal(getWorkerPlanGoal(db, worker.id), null);
+  assert.deepEqual(countStepsForWorker(db, worker.id), { done: 0, total: 0 });
+
+  replacePlan(db, worker.id, {
+    goal: "Wire the auth UI to the session API",
+    steps: [{ title: "Model the session" }, { title: "Render the login form" }],
+  });
+  assert.equal(getWorkerPlanGoal(db, worker.id), "Wire the auth UI to the session API");
+  assert.deepEqual(countStepsForWorker(db, worker.id), { done: 0, total: 2 });
+
+  // A re-plan updates the goal in place and keeps done steps by title.
+  applyStepUpdate(db, worker.id, 1, "done");
+  replacePlan(db, worker.id, {
+    goal: "Wire the auth UI to the session API (with refresh tokens)",
+    steps: [{ title: "Model the session" }, { title: "Handle refresh" }],
+  });
+  assert.equal(
+    getWorkerPlanGoal(db, worker.id),
+    "Wire the auth UI to the session API (with refresh tokens)",
+  );
+  const steps = listWorkerSteps(db, worker.id);
+  assert.deepEqual(
+    steps.map((step) => [step.title, step.status]),
+    [
+      ["Model the session", "done"],
+      ["Handle refresh", "planned"],
+    ],
+  );
 });
