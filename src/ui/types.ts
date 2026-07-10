@@ -75,7 +75,10 @@ export type QueuedMessage = { id: string; text: string };
 
 export type ChatItem = (
   | { kind: "user"; text: string }
-  | { kind: "assistant"; text: string }
+  /** folded: loaded from history — the reply collapses to its summary
+   * paragraph so scrolled-back history scans, not walls of text. Replies
+   * streamed live in this session render in full. */
+  | { kind: "assistant"; text: string; folded?: boolean }
   | { kind: "chip"; chip: ToolChip }
   | { kind: "rebrief"; rebrief: RebriefView }
   | { kind: "decision"; decision: DecisionView }
