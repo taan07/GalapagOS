@@ -435,10 +435,15 @@ function itemKey(entry: IndexedItem): string | number {
 const DRAIN_MS = 400;
 const TICK_MS = 33;
 
+// How close to the bottom (px) still counts as "riding along" — scroll up
+// farther than this and the view stops following until you come back.
+const STICK_PX = 160;
+
 function LiveTail({ text }: { text: string }) {
   const [count, setCount] = useState(0);
   const textRef = useRef(text);
   textRef.current = text;
+  const selfRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let last = performance.now();
@@ -459,11 +464,27 @@ function LiveTail({ text }: { text: string }) {
   }, []);
 
   const shown = text.slice(0, Math.min(count, text.length));
+
+  // Ride the typing: each reveal tick nudges the scroller the few pixels the
+  // text just grew, so the view crawls smoothly with the typewriter instead
+  // of jumping per line — and only while the user is already at the bottom.
+  // Scrolling up to read stops the follow; coming back resumes it.
+  useEffect(() => {
+    const scroller = selfRef.current?.closest(".chat-scroll");
+    if (!scroller) {
+      return;
+    }
+    const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    if (distance > 0 && distance < STICK_PX) {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+  }, [shown]);
+
   if (!shown) {
     return null;
   }
   return (
-    <div className="msg assistant streaming">
+    <div className="msg assistant streaming" ref={selfRef}>
       <div className="speaker">Darwin</div>
       <div className="md">
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{shown}</ReactMarkdown>
@@ -686,20 +707,27 @@ export function Chat({
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // The scroll view deliberately does NOT follow the streaming tail — chasing
-  // every new line jitters. It moves only when something settles (a message
-  // lands, a chip/card appears, the turn ends): a smooth fall to the bottom
-  // that "locks in" the new message. First paint of a history stays instant —
-  // animating from the top of a long conversation would crawl.
+  // Settles (a message lands, a chip/card appears, the turn ends) smoothly
+  // fall to the bottom and "lock in" — but only when the user is riding the
+  // bottom; a deliberate scroll-up to read is never yanked back. The live
+  // stream itself is followed by LiveTail's own per-tick crawl, not here.
+  // First paint of a history stays instant — animating from the top of a
+  // long conversation would crawl.
   const scrolledOnceRef = useRef(false);
+  const stickRef = useRef(true);
   useEffect(() => {
     const node = scrollRef.current;
     if (!node) {
       return;
     }
-    const smooth = scrolledOnceRef.current && items.length > 0;
-    scrolledOnceRef.current = items.length > 0;
-    node.scrollTo({ top: node.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+    if (!scrolledOnceRef.current) {
+      scrolledOnceRef.current = items.length > 0;
+      node.scrollTo({ top: node.scrollHeight });
+      return;
+    }
+    if (stickRef.current) {
+      node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
+    }
   }, [items, working]);
 
   // Turn grouping recomputes only when items change — token deltas and
@@ -708,7 +736,17 @@ export function Chat({
 
   return (
     <section className="chat" aria-label="Darwin chat">
-      <div className="chat-scroll" ref={scrollRef}>
+      <div
+        className="chat-scroll"
+        ref={scrollRef}
+        onScroll={() => {
+          const node = scrollRef.current;
+          if (node) {
+            stickRef.current =
+              node.scrollHeight - node.scrollTop - node.clientHeight < 240;
+          }
+        }}
+      >
         {items.length === 0 && !working ? (
           <p className="empty-note">
             This is Darwin, your manager for {projectName || "this project"}. Tell him what you
