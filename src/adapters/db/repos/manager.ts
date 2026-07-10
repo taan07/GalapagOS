@@ -211,8 +211,19 @@ export function sweepPendingDecisionTurns(db: GalapagosDb): number {
   return swept;
 }
 
-/** Stamp every not-yet-distilled turn of a session as covered. */
-export function markTurnsDistilled(db: GalapagosDb, sessionId: string): void {
+/**
+ * Stamp every not-yet-distilled turn of a session as covered. `before` bounds
+ * the claim to turns that existed when the distill pass forked: a user turn
+ * persisted while the pass was still running was never in its fork, and a
+ * blanket stamp would silently exclude it from distillation forever.
+ */
+export function markTurnsDistilled(db: GalapagosDb, sessionId: string, before?: string): void {
+  if (before) {
+    db.prepare(
+      "UPDATE manager_turns SET distilled_at = ? WHERE session_id = ? AND distilled_at IS NULL AND created_at < ?",
+    ).run(nowIso(), sessionId, before);
+    return;
+  }
   db.prepare(
     "UPDATE manager_turns SET distilled_at = ? WHERE session_id = ? AND distilled_at IS NULL",
   ).run(nowIso(), sessionId);
