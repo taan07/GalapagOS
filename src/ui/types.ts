@@ -73,7 +73,7 @@ export type DecisionView = {
 /** A message waiting its turn while Darwin works — visible and steerable. */
 export type QueuedMessage = { id: string; text: string };
 
-export type ChatItem =
+export type ChatItem = (
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string }
   | { kind: "chip"; chip: ToolChip }
@@ -81,11 +81,26 @@ export type ChatItem =
   | { kind: "decision"; decision: DecisionView }
   | { kind: "note"; text: string }
   /** A usage-limit failure with a retry-on-Opus offer (see turn_error). */
-  | { kind: "limit"; message: string; failedText: string; model: string };
+  | { kind: "limit"; message: string; failedText: string; model: string }
+) & {
+  /** When this landed (ISO): turn created_at from history, stamped live. */
+  at?: string;
+};
+
+/** The status line of the in-flight turn — what Darwin is doing right now. */
+export type LiveTurnStatusView = {
+  status: "thinking" | "writing" | "tool";
+  tool?: string;
+  label: string;
+};
 
 export type ManagerStreamEvent =
   | { type: "turn_started"; sessionId: string }
   | { type: "assistant_text"; text: string }
+  /** Live status while Darwin works; label renders verbatim. */
+  | { type: "turn_status"; status: "thinking" | "writing" | "tool"; tool?: string; label: string }
+  /** Token delta of Darwin's prose — the following assistant_text settles it. */
+  | { type: "assistant_delta"; text: string }
   | { type: "tool_use"; tool: string; summary: string; detail: string }
   | { type: "rebrief"; reason: string; preamble: string | null; turnId: string | null }
   | { type: "turn_complete"; resultText: string; sdkSessionId: string | null }
@@ -267,7 +282,13 @@ export type DaemonStreamEvent =
   | { type: "monitor_tick"; projectId: string }
   | { type: "manager_note"; projectId: string; text: string }
   /** A worker's plan/steps changed — re-fetch its checklist (ids only). */
-  | { type: "worker_plan"; projectId: string; workerId: string };
+  | { type: "worker_plan"; projectId: string; workerId: string }
+  /** A decision card fired somewhere (any turn, any tab): drives the
+   * needs-you cue and lets non-initiating tabs render the card. */
+  | ({ projectId: string } & Extract<
+      ManagerStreamEvent,
+      { type: "decision_request" } | { type: "decision_settled" }
+    >);
 
 /** One durable record as served by /api/records — every field attributed. */
 export type RecordView = {

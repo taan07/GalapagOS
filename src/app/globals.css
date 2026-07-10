@@ -131,7 +131,115 @@ select:focus {
   padding: 20px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 22px;
+}
+
+/* One conversational turn: user message + everything Darwin did with it.
+   A flex column itself so bubbles keep their align-self behavior; the wider
+   chat-scroll gap between turns IS the quiet turn boundary. */
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* The user row: quiet local-time stamp beside the bubble. */
+.turn-row {
+  display: flex;
+  justify-content: flex-end;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.turn-time {
+  flex: none;
+  color: var(--faint);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.date-divider {
+  align-self: center;
+  color: var(--faint);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* Settled-turn rollup: the turn's routine activity as one quiet line. */
+.rollup {
+  align-self: flex-start;
+}
+
+.rollup > summary {
+  cursor: pointer;
+  list-style: none;
+  color: var(--faint);
+  font-size: 12px;
+}
+
+.rollup > summary::-webkit-details-marker {
+  display: none;
+}
+
+.rollup > summary::before {
+  content: "▸ ";
+}
+
+.rollup[open] > summary::before {
+  content: "▾ ";
+}
+
+.rollup-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 8px 0 0 14px;
+}
+
+/* Answer-first fold: the first paragraph stands, detail expands on demand. */
+.msg .fold {
+  margin-top: 8px;
+}
+
+.msg .fold > summary {
+  cursor: pointer;
+  list-style: none;
+  color: var(--faint);
+  font-size: 12px;
+}
+
+.msg .fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+.msg .fold > summary::before {
+  content: "▸ ";
+}
+
+.msg .fold[open] > summary::before {
+  content: "▾ ";
+}
+
+.msg .fold > .md {
+  margin-top: 8px;
+}
+
+/* Ride-along: chat rows skip offscreen render work (a long history would
+   otherwise re-parse and lay out every markdown bubble on load). */
+.turn,
+.date-divider {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 60px;
+}
+
+/* Darwin's prose streaming in: a soft caret marks the unsettled tail. */
+.msg.assistant.streaming .md > :last-child::after {
+  content: "▌";
+  margin-left: 2px;
+  color: var(--faint);
+  animation: pulse 1.4s infinite;
 }
 
 .msg {
@@ -412,13 +520,21 @@ select:focus {
 
 .working {
   align-self: flex-start;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
   color: var(--faint);
   font-size: 12.5px;
 }
 
-.working::after {
+.working-label::after {
   content: "…";
   animation: pulse 1.4s infinite;
+}
+
+.working-hint {
+  font-size: 11px;
+  opacity: 0.7;
 }
 
 @keyframes pulse {

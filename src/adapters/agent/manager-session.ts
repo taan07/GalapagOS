@@ -26,12 +26,23 @@ import type {
   DecisionOption,
   DecisionOutcome,
 } from "./decisions";
+import {
+  liveEventsFrom,
+  statusKey,
+  type AssistantDeltaEvent,
+  type TurnStatusEvent,
+} from "./live-status";
 import { baseQueryOptions } from "./spawn";
 import type { WorkerRuntime } from "./worker-runtime";
 
 export type ManagerTurnEvent =
   | { type: "turn_started"; sessionId: string }
   | { type: "assistant_text"; text: string }
+  /** Live status line while Darwin works — the tool_use chips' live shadow. */
+  | TurnStatusEvent
+  /** Token delta of Darwin's prose; the assistant_text that follows is the
+   * settled truth (deltas are never persisted). */
+  | AssistantDeltaEvent
   | { type: "tool_use"; tool: string; summary: string; detail: string }
   | {
       type: "rebrief";
@@ -410,10 +421,35 @@ export async function runManagerTurn(input: {
         mcpServers: { galapagos: toolServer },
         allowedTools: MANAGER_ALLOWED_TOOLS,
         maxTurns: 25,
+        // Live turn: raw stream events ride along so the UI can show what
+        // Darwin is doing and stream his prose token by token.
+        includePartialMessages: true,
       },
     });
 
+    // Dedupe the status line (a thinking block after message_start would
+    // otherwise emit "Thinking" twice in a row).
+    let lastStatus: string | null = null;
+
     for await (const message of stream) {
+      if (message.type === "stream_event") {
+        // Subagent streams (parent_tool_use_id set) are not Darwin's prose.
+        if (message.parent_tool_use_id !== null) {
+          continue;
+        }
+        for (const live of liveEventsFrom(message.event)) {
+          if (live.type === "turn_status") {
+            const key = statusKey(live);
+            if (key === lastStatus) {
+              continue;
+            }
+            lastStatus = key;
+          }
+          emit(live);
+        }
+        continue;
+      }
+
       if (message.type === "system" && message.subtype === "init") {
         sdkSessionId = message.session_id;
         if (resume && message.session_id !== resume) {

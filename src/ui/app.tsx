@@ -6,6 +6,7 @@ import type {
   ChatItem,
   DaemonStreamEvent,
   DecisionView,
+  LiveTurnStatusView,
   ManagerStreamEvent,
   ProjectConfidenceView,
   ProjectView,
@@ -17,6 +18,7 @@ import type {
 } from "./types";
 import { AttentionQueue } from "./attention-queue";
 import { Chat } from "./chat";
+import { createNeedsYouCue } from "./needs-you";
 import { ConfidenceGauge } from "./confidence";
 import { AddProjectForm, ProjectPicker } from "./project-picker";
 import { SpecificsPanel } from "./specifics-panel";
@@ -28,16 +30,17 @@ const OPUS_MODEL = "claude-opus-4-8";
 
 function turnsToChatItems(turns: TurnView[]): ChatItem[] {
   return turns.flatMap((turn): ChatItem[] => {
+    const at = turn.created_at;
     if (turn.role === "user") {
-      return [{ kind: "user", text: turn.content }];
+      return [{ kind: "user", text: turn.content, at }];
     }
     if (turn.role === "assistant") {
-      return [{ kind: "assistant", text: turn.content }];
+      return [{ kind: "assistant", text: turn.content, at }];
     }
     if (turn.role === "tool") {
       try {
         const chip = JSON.parse(turn.content) as ToolChip;
-        return [{ kind: "chip", chip }];
+        return [{ kind: "chip", chip, at }];
       } catch {
         return [];
       }
@@ -53,6 +56,7 @@ function turnsToChatItems(turns: TurnView[]): ChatItem[] {
         return [
           {
             kind: "decision",
+            at,
             decision: {
               decisionId: payload.decisionId,
               cardKind: payload.cardKind ?? "decision",
@@ -72,6 +76,7 @@ function turnsToChatItems(turns: TurnView[]): ChatItem[] {
         return [
           {
             kind: "rebrief",
+            at,
             rebrief: {
               turnId: turn.id,
               reason: payload.reason,
@@ -82,12 +87,12 @@ function turnsToChatItems(turns: TurnView[]): ChatItem[] {
         ];
       }
       if (payload.kind === "note") {
-        return [{ kind: "note", text: payload.text }];
+        return [{ kind: "note", text: payload.text, at }];
       }
     } catch {
       // fall through to plain text
     }
-    return [{ kind: "note", text: turn.content }];
+    return [{ kind: "note", text: turn.content, at }];
   });
 }
 
@@ -99,12 +104,18 @@ export function App() {
   const [attention, setAttention] = useState<AttentionView[] | null>(null);
   const [confidence, setConfidence] = useState<ProjectConfidenceView | null>(null);
   const [working, setWorking] = useState(false);
+  // The living turn: Darwin's prose streaming in (the unsettled tail below
+  // the item list) and the status line naming what he's doing right now.
+  const [liveText, setLiveText] = useState("");
+  const [liveStatus, setLiveStatus] = useState<LiveTurnStatusView | null>(null);
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const [daemonDown, setDaemonDown] = useState(false);
   const [showAddProject, setShowAddProject] = useState(false);
   const queueRef = useRef<QueuedMessage[]>([]);
   const selectedIdRef = useRef<string | null>(null);
   selectedIdRef.current = selectedId;
+
+  const now = () => new Date().toISOString();
 
   // The latest still-pending card, if any. The chat composer routes free text
   // to it instead of starting a new turn (2026-07-08 ruling).
@@ -198,6 +209,8 @@ export function App() {
     setItems([]);
     setQueued([]);
     queueRef.current = [];
+    setLiveText("");
+    setLiveStatus(null);
     setAttention(null);
     setConfidence(null);
     void (async () => {
@@ -241,13 +254,76 @@ export function App() {
         setItems((current) =>
           current.some((item) => item.kind === "note" && item.text === text)
             ? current
-            : [...current, { kind: "note", text }],
+            : [...current, { kind: "note", text, at: now() }],
         );
         void refreshAttention(projectId);
+      } else if (event.type === "decision_request") {
+        // Broadcast copy of a card. The initiating tab already appended it
+        // from its own stream — only tabs that DIDN'T see it add the card
+        // (autonomous turns, second windows). pendingDecision then drives
+        // the needs-you cue in every tab.
+        setItems((current) =>
+          current.some(
+            (item) => item.kind === "decision" && item.decision.decisionId === event.decisionId,
+          )
+            ? current
+            : [
+                ...current,
+                {
+                  kind: "decision",
+                  at: now(),
+                  decision: {
+                    decisionId: event.decisionId,
+                    cardKind: event.cardKind,
+                    question: event.question,
+                    options: event.options,
+                    multiSelect: event.multiSelect,
+                    fields: event.fields,
+                    status: "pending",
+                    selections: [],
+                    responses: {},
+                    custom: "",
+                  },
+                },
+              ],
+        );
+      } else if (event.type === "decision_settled") {
+        setItems((current) =>
+          current.map((item) =>
+            item.kind === "decision" && item.decision.decisionId === event.decisionId
+              ? {
+                  ...item,
+                  decision: {
+                    ...item.decision,
+                    status: event.status,
+                    selections: event.selections,
+                    responses: event.responses,
+                    custom: event.custom,
+                  },
+                }
+              : item,
+          ),
+        );
       }
     };
     return () => source.close();
   }, [refreshAttention, refreshConfidence]);
+
+  // The needs-you cue: a pending card + an unfocused tab = tab-title flash,
+  // favicon badge, and a macOS notification (permission asked lazily). The
+  // cue clears on focus or the moment the card settles. Same project only —
+  // the /events handler above already drops other projects' events.
+  const cueRef = useRef<ReturnType<typeof createNeedsYouCue> | null>(null);
+  const pendingCueId = pendingDecision?.decisionId ?? null;
+  const pendingCueQuestion = pendingDecision?.question ?? "";
+  useEffect(() => {
+    cueRef.current ??= createNeedsYouCue();
+    if (pendingCueId) {
+      cueRef.current.arm(pendingCueQuestion || "Darwin has a question for you.");
+    } else {
+      cueRef.current.disarm();
+    }
+  }, [pendingCueId, pendingCueQuestion]);
 
   const sendNow = useCallback(
     async (
@@ -256,10 +332,12 @@ export function App() {
       options?: { model?: string; echoUser?: boolean },
     ): Promise<void> => {
       setWorking(true);
+      setLiveText("");
+      setLiveStatus({ status: "thinking", label: "Thinking" });
       // The Opus retry doesn't re-echo the user bubble — the failed message is
       // already on screen above the limit note.
       if (options?.echoUser !== false) {
-        setItems((current) => [...current, { kind: "user", text }]);
+        setItems((current) => [...current, { kind: "user", text, at: now() }]);
       }
       try {
         const response = await fetch("/api/manager/message", {
@@ -306,18 +384,41 @@ export function App() {
               // open only to deliver the post-turn distillation note; the
               // daemon accepts the next message the moment this event fires.
               setWorking(false);
+              setLiveStatus(null);
+              setLiveText("");
+            } else if (event.type === "turn_status") {
+              setLiveStatus({
+                status: event.status,
+                label: event.label,
+                ...(event.tool ? { tool: event.tool } : {}),
+              });
+            } else if (event.type === "assistant_delta") {
+              setLiveText((current) => current + event.text);
             } else if (event.type === "assistant_text") {
-              setItems((current) => [...current, { kind: "assistant", text: event.text }]);
+              // The settled block replaces whatever streamed — deltas are a
+              // preview, the persisted turn is the truth.
+              setLiveText("");
+              setItems((current) => [
+                ...current,
+                { kind: "assistant", text: event.text, at: now() },
+              ]);
             } else if (event.type === "tool_use") {
-              setItems((current) => [...current, { kind: "chip", chip: event }]);
+              setItems((current) => [
+                ...current,
+                { kind: "chip", chip: { tool: event.tool, summary: event.summary, detail: event.detail }, at: now() },
+              ]);
               if (event.tool === "record_specific") {
                 void refreshSpecifics(projectId);
               }
             } else if (event.type === "rebrief") {
+              // A rebrief means the turn is being retried on a fresh session —
+              // whatever streamed from the failed attempt was never persisted.
+              setLiveText("");
               setItems((current) => [
                 ...current,
                 {
                   kind: "rebrief",
+                  at: now(),
                   rebrief: {
                     turnId: event.turnId,
                     reason: event.reason,
@@ -327,26 +428,40 @@ export function App() {
                 },
               ]);
             } else if (event.type === "interrupted") {
-              setItems((current) => [...current, { kind: "note", text: event.message }]);
+              // Mid-block partials were never persisted; drop the live tail so
+              // the screen matches what a reload would show.
+              setLiveText("");
+              setLiveStatus(null);
+              setItems((current) => [...current, { kind: "note", text: event.message, at: now() }]);
             } else if (event.type === "decision_request") {
-              setItems((current) => [
-                ...current,
-                {
-                  kind: "decision",
-                  decision: {
-                    decisionId: event.decisionId,
-                    cardKind: event.cardKind,
-                    question: event.question,
-                    options: event.options,
-                    multiSelect: event.multiSelect,
-                    fields: event.fields,
-                    status: "pending",
-                    selections: [],
-                    responses: {},
-                    custom: "",
-                  },
-                },
-              ]);
+              // The daemon also broadcasts cards (for other tabs); whichever
+              // copy lands first wins, the other is dropped by decisionId.
+              setItems((current) =>
+                current.some(
+                  (item) =>
+                    item.kind === "decision" && item.decision.decisionId === event.decisionId,
+                )
+                  ? current
+                  : [
+                      ...current,
+                      {
+                        kind: "decision",
+                        at: now(),
+                        decision: {
+                          decisionId: event.decisionId,
+                          cardKind: event.cardKind,
+                          question: event.question,
+                          options: event.options,
+                          multiSelect: event.multiSelect,
+                          fields: event.fields,
+                          status: "pending",
+                          selections: [],
+                          responses: {},
+                          custom: "",
+                        },
+                      },
+                    ],
+              );
             } else if (event.type === "decision_settled") {
               setItems((current) =>
                 current.map((item) =>
@@ -382,7 +497,7 @@ export function App() {
               if (notes.length > 0) {
                 setItems((current) => [
                   ...current,
-                  ...notes.map((text) => ({ kind: "note" as const, text })),
+                  ...notes.map((text) => ({ kind: "note" as const, text, at: now() })),
                 ]);
               }
               void refreshSpecifics(projectId);
@@ -395,6 +510,7 @@ export function App() {
                   ...current,
                   {
                     kind: "limit",
+                    at: now(),
                     message: event.message,
                     failedText: text,
                     model: event.model as string,
@@ -403,7 +519,7 @@ export function App() {
               } else {
                 setItems((current) => [
                   ...current,
-                  { kind: "note", text: `Turn failed: ${event.message}` },
+                  { kind: "note", text: `Turn failed: ${event.message}`, at: now() },
                 ]);
               }
             }
@@ -415,10 +531,13 @@ export function App() {
           {
             kind: "note",
             text: `Connection lost mid-turn: ${error instanceof Error ? error.message : String(error)}`,
+            at: now(),
           },
         ]);
       } finally {
         setWorking(false);
+        setLiveStatus(null);
+        setLiveText("");
       }
     },
     [refreshSpecifics],
@@ -655,6 +774,8 @@ export function App() {
           <Chat
             items={items}
             working={working}
+            liveText={liveText}
+            liveStatus={liveStatus}
             queued={queued}
             disabled={daemonDown || !selected}
             answering={pendingDecision !== null}
