@@ -35,7 +35,9 @@ function turnsToChatItems(turns: TurnView[]): ChatItem[] {
       return [{ kind: "user", text: turn.content, at }];
     }
     if (turn.role === "assistant") {
-      return [{ kind: "assistant", text: turn.content, at }];
+      // History folds; live replies don't (they get the folded flag only on
+      // the next reload, once they're something you scroll back to).
+      return [{ kind: "assistant", text: turn.content, at, folded: true }];
     }
     if (turn.role === "tool") {
       try {

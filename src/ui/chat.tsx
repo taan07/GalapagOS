@@ -278,10 +278,23 @@ const ChatMessage = memo(function ChatMessage({
     );
   }
   if (item.kind === "assistant") {
-    // Answer-first fold (Taan's ruling): the first paragraph is the answer
-    // and stands; substantial detail folds beneath it. Doctrine tells Darwin
-    // to write in exactly this shape.
-    const fold = splitAnswerFold(item.text);
+    // Answer-first fold, history only (Taan's ruling, revised 2026-07-10):
+    // a reply you just received renders in full; after a reload it collapses
+    // to its summary paragraph so scrolling back to find something is a scan,
+    // not a wall of text. Doctrine tells Darwin to write that paragraph as a
+    // self-contained summary.
+    const fold = item.folded ? splitAnswerFold(item.text) : null;
+    if (!fold || fold.rest === null) {
+      return (
+        <div className="msg assistant">
+          <div className="speaker">Darwin</div>
+          <CopyButton text={item.text} />
+          <div className="md">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.text}</ReactMarkdown>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="msg assistant">
         <div className="speaker">Darwin</div>
@@ -289,14 +302,12 @@ const ChatMessage = memo(function ChatMessage({
         <div className="md">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{fold.lead}</ReactMarkdown>
         </div>
-        {fold.rest !== null ? (
-          <details className="fold">
-            <summary>Details</summary>
-            <div className="md">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{fold.rest}</ReactMarkdown>
-            </div>
-          </details>
-        ) : null}
+        <details className="fold">
+          <summary>Details</summary>
+          <div className="md">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{fold.rest}</ReactMarkdown>
+          </div>
+        </details>
       </div>
     );
   }
@@ -365,6 +376,54 @@ const ChatMessage = memo(function ChatMessage({
 
 function itemKey(entry: IndexedItem): string | number {
   return entry.item.kind === "decision" ? entry.item.decision.decisionId : entry.index;
+}
+
+/**
+ * Darwin's prose streaming in, smoothed. The network delivers text in bursts;
+ * revealing each burst instantly reads as jarring pops. Instead the tail
+ * plays out like very fast typing: a ~30fps clock reveals a fraction of the
+ * outstanding backlog per tick (full drain in ~400ms), with a 1-char floor so
+ * a slow trickle still types steadily. Mounts fresh per streamed block (the
+ * buffer clears when a block settles), so the reveal always starts at zero.
+ */
+const DRAIN_MS = 400;
+const TICK_MS = 33;
+
+function LiveTail({ text }: { text: string }) {
+  const [count, setCount] = useState(0);
+  const textRef = useRef(text);
+  textRef.current = text;
+
+  useEffect(() => {
+    let last = performance.now();
+    const timer = setInterval(() => {
+      const now = performance.now();
+      const dt = now - last;
+      last = now;
+      setCount((current) => {
+        const backlog = textRef.current.length - current;
+        if (backlog <= 0) {
+          return current;
+        }
+        const step = Math.max(1, Math.ceil((backlog * dt) / DRAIN_MS));
+        return Math.min(textRef.current.length, current + step);
+      });
+    }, TICK_MS);
+    return () => clearInterval(timer);
+  }, []);
+
+  const shown = text.slice(0, Math.min(count, text.length));
+  if (!shown) {
+    return null;
+  }
+  return (
+    <div className="msg assistant streaming">
+      <div className="speaker">Darwin</div>
+      <div className="md">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{shown}</ReactMarkdown>
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -619,14 +678,7 @@ export function Chat({
             </Fragment>
           );
         })}
-        {liveText ? (
-          <div className="msg assistant streaming">
-            <div className="speaker">Darwin</div>
-            <div className="md">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{liveText}</ReactMarkdown>
-            </div>
-          </div>
-        ) : null}
+        {liveText ? <LiveTail text={liveText} /> : null}
         {working ? (
           <div className="working">
             <span className="working-label">{liveStatus?.label ?? "Darwin is working"}</span>

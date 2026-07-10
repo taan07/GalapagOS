@@ -242,6 +242,32 @@ select:focus {
   animation: pulse 1.4s infinite;
 }
 
+/* Disclosure widgets ease open instead of snapping. interpolate-size lets
+   block-size transition to auto (Chrome 129+); elsewhere this degrades to
+   the instant toggle. */
+:root {
+  interpolate-size: allow-keywords;
+}
+
+.fold::details-content,
+.rollup::details-content,
+.chip::details-content {
+  opacity: 0;
+  block-size: 0;
+  overflow-y: clip;
+  transition:
+    content-visibility 240ms allow-discrete,
+    opacity 240ms ease,
+    block-size 240ms ease;
+}
+
+.fold[open]::details-content,
+.rollup[open]::details-content,
+.chip[open]::details-content {
+  opacity: 1;
+  block-size: auto;
+}
+
 .msg {
   max-width: 72ch;
   white-space: pre-wrap;
