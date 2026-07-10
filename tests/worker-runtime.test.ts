@@ -884,6 +884,41 @@ test("hold sends the pause instruction and reports the worker's position", async
   assert.equal(deadHold.ok, false);
 });
 
+test("hold → steer resumes the SAME session: no new worker, no new SDK session, full context (2026-07-10 ruling)", async () => {
+  const { db, project, runtime, sessions } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  const fake = sessions[0];
+  assert.ok(fake);
+  fake.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "running", "running");
+
+  const pending = runtime.hold(outcome.workerId, "triage");
+  await waitFor(() => fake.sent.some((text) => text.startsWith("HOLD")), "hold delivered");
+  fake.emit({
+    kind: "result",
+    payload: { subtype: "error_during_execution", isError: true, resultText: null },
+  });
+  fake.emit({ kind: "assistant", payload: { text: "Paused mid-refactor; two files remain." } });
+  const held = await pending;
+  assert.ok(held.ok);
+
+  // Release: an ordinary steer lands in the SAME live session object — the
+  // whole point of hold over stop. No spawn, no fresh brief, no re-plan.
+  const released = await runtime.steer(outcome.workerId, "Continue where you paused.");
+  assert.ok(released.ok);
+  assert.ok(
+    fake.sent.includes("Continue where you paused."),
+    "the release reached the very session that was held",
+  );
+  assert.equal(sessions.length, 1, "no second session was ever spawned");
+  assert.equal(getWorker(db, outcome.workerId)?.status, "running");
+  assert.equal(getWorker(db, outcome.workerId)?.sdk_session_id, "sdk-w1");
+});
+
 test("hold preempts a busy worker: turn aborted, debris suppressed, ack is the pause reply", async () => {
   const { db, project, runtime, sessions } = await fixture();
   const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
