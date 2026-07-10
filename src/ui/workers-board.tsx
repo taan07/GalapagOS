@@ -11,6 +11,7 @@ import type {
   WorkerConfidenceView,
   WorkerDetailView,
   WorkerEventView,
+  WorkerStepView,
   WorkerView,
 } from "./types";
 import { ConfidenceGauge } from "./confidence";
@@ -48,6 +49,87 @@ const STATUS_LABEL: Record<WorkerView["status"], string> = {
 
 function StatusPill({ status }: { status: WorkerView["status"] }) {
   return <span className={`status-pill status-${status}`}>{STATUS_LABEL[status]}</span>;
+}
+
+/** Thin done/total bar — the same math on the card and in the goal card. */
+function PlanBar({ done, total }: { done: number; total: number }) {
+  if (total === 0) {
+    return null;
+  }
+  return (
+    <span className="plan-bar" role="img" aria-label={`${done} of ${total} steps done`}>
+      <span className="plan-bar-fill" style={{ width: `${(done / total) * 100}%` }} />
+    </span>
+  );
+}
+
+/**
+ * The plan as one narrative line (the user's taste call: goal statement +
+ * running narrative over a rigid checklist). The full checklist stays one
+ * click away in a collapsed details.
+ */
+function planNarrative(steps: WorkerStepView[]): string {
+  const done = steps.filter((step) => step.status === "done");
+  const active = steps.find((step) => step.status === "active");
+  const nextPlanned = steps.find((step) => step.status === "planned");
+  const parts: string[] = [];
+  if (done.length > 0) {
+    const latest = [...done].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+    parts.push(`${done.length} of ${steps.length} steps done — latest: ${latest?.title}`);
+  } else {
+    parts.push(`0 of ${steps.length} steps done`);
+  }
+  if (active) {
+    parts.push(`now: ${active.title}`);
+  } else if (nextPlanned) {
+    parts.push(`next: ${nextPlanned.title}`);
+  }
+  return parts.join(" · ");
+}
+
+const STEP_MARK: Record<WorkerStepView["status"], string> = {
+  done: "✓",
+  active: "▸",
+  planned: "·",
+  abandoned: "×",
+};
+
+/** Goal + narrative + collapsed full plan; honest absence when there's none. */
+function GoalCard({ goal, steps }: { goal: string | null; steps: WorkerStepView[] }) {
+  if (!goal && steps.length === 0) {
+    return (
+      <div className="no-digest">
+        No plan yet — the worker states its goal and steps in its first reply.
+      </div>
+    );
+  }
+  const done = steps.filter((step) => step.status === "done").length;
+  return (
+    <div className="goal-card">
+      <div className="goal-label">goal</div>
+      <div className="goal-text">{goal ?? "(steps without a stated goal)"}</div>
+      {steps.length > 0 ? (
+        <>
+          <div className="goal-progress">
+            <PlanBar done={done} total={steps.length} />
+            <span className="goal-narrative">{planNarrative(steps)}</span>
+          </div>
+          <details className="chip plan-details">
+            <summary>full plan · {done}/{steps.length}</summary>
+            <ol className="plan-steps">
+              {steps.map((step) => (
+                <li key={step.ordinal} className={`plan-step step-${step.status}`}>
+                  <span className="step-mark">{STEP_MARK[step.status]}</span>
+                  <span className="step-title">{step.title}</span>
+                  {step.detail ? <span className="step-detail">{step.detail}</span> : null}
+                </li>
+              ))}
+            </ol>
+          </details>
+        </>
+      ) : null}
+    </div>
+  );
 }
 
 const EventItem = memo(function EventItem({ event }: { event: WorkerEventView }) {
@@ -151,7 +233,7 @@ function Drilldown({
   onStop: () => void;
   onHold: () => void;
 }) {
-  const { worker, events, digest, attention } = detail;
+  const { worker, events, digest, attention, steps, github } = detail;
   const streamRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -166,6 +248,17 @@ function Drilldown({
         <span className="lane-name">{worker.laneName ?? "(lane missing)"}</span>
         <StatusPill status={worker.status} />
         <span className="liveness">{agoLabel(worker.lastMessageAt, now)}</span>
+        {github ? (
+          <a
+            className="gh-link"
+            href={github.branchUrl}
+            target="_blank"
+            rel="noreferrer"
+            title="This worker's branch on GitHub"
+          >
+            GitHub ↗
+          </a>
+        ) : null}
         {STOPPABLE.includes(worker.status) ? (
           <span className="worker-controls">
             <button
@@ -189,6 +282,8 @@ function Drilldown({
       </header>
       {stopNote ? <div className="stop-note">{stopNote}</div> : null}
 
+      <GoalCard goal={worker.goal} steps={steps} />
+
       {confidence ? (
         <ConfidenceGauge
           report={confidence.report}
@@ -209,8 +304,26 @@ function Drilldown({
         <div className="contract-row">
           <span className="contract-label">branch</span>
           <span className="contract-value mono">
-            {worker.branch}
-            {worker.baseSha ? ` (from ${worker.baseSha.slice(0, 8)})` : ""}
+            {github ? (
+              <a href={github.branchUrl} target="_blank" rel="noreferrer">
+                {worker.branch}
+              </a>
+            ) : (
+              worker.branch
+            )}
+            {worker.baseSha ? (
+              <>
+                {" (from "}
+                {github?.baseCommitUrl ? (
+                  <a href={github.baseCommitUrl} target="_blank" rel="noreferrer">
+                    {worker.baseSha.slice(0, 8)}
+                  </a>
+                ) : (
+                  worker.baseSha.slice(0, 8)
+                )}
+                {")"}
+              </>
+            ) : null}
           </span>
         </div>
         <div className="contract-row">
@@ -273,7 +386,21 @@ function Drilldown({
                     </span>
                     {claim.text}
                     {claim.files.length > 0 ? (
-                      <span className="claim-files mono"> — {claim.files.join(", ")}</span>
+                      <span className="claim-files mono">
+                        {" — "}
+                        {claim.files.map((file, fileIndex) => (
+                          <span key={file}>
+                            {fileIndex > 0 ? ", " : ""}
+                            {github?.fileUrls[file] ? (
+                              <a href={github.fileUrls[file]} target="_blank" rel="noreferrer">
+                                {file}
+                              </a>
+                            ) : (
+                              file
+                            )}
+                          </span>
+                        ))}
+                      </span>
                     ) : null}
                   </li>
                 );
@@ -489,6 +616,14 @@ export function WorkersBoard() {
           void refreshDetail(event.workerId);
         }
       }
+      if (event.type === "worker_plan" && event.projectId === projectId && projectId) {
+        // The checklist moved: the card's count/bar and the open goal card
+        // both re-fetch (the broadcast carries ids only, by design).
+        void refreshWorkers(projectId);
+        if (event.workerId === selectedWorkerRef.current) {
+          void refreshDetail(event.workerId);
+        }
+      }
       if (
         projectId &&
         (event.type === "monitor_tick" ||
@@ -608,6 +743,18 @@ export function WorkersBoard() {
                       <span className="lane-name">{worker.laneName ?? "(lane missing)"}</span>
                       <StatusPill status={worker.status} />
                     </div>
+                    {worker.goal ? <div className="worker-goal">{worker.goal}</div> : null}
+                    {worker.stepsTotal > 0 ? (
+                      <div className="worker-plan-line">
+                        <span className="plan-count mono">
+                          {worker.stepsDone}/{worker.stepsTotal}
+                        </span>
+                        <PlanBar done={worker.stepsDone} total={worker.stepsTotal} />
+                        {worker.activeStepTitle ? (
+                          <span className="plan-active">{worker.activeStepTitle}</span>
+                        ) : null}
+                      </div>
+                    ) : null}
                     <div className="worker-card-sub">
                       <span className="liveness">{agoLabel(worker.lastMessageAt, now)}</span>
                       {worker.openAttentionCount > 0 ? (
