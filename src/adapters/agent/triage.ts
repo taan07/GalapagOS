@@ -28,12 +28,20 @@ import { createManagerToolServer } from "./manager-tools";
 import { baseQueryOptions } from "./spawn";
 import type { WorkerRuntime } from "./worker-runtime";
 
-const TRIAGE_ALLOWED_TOOLS = [
+/**
+ * Triage's tool surface is deliberately non-destructive (2026-07-10, after
+ * the false-execution incident: a tripwire false positive → triage
+ * stop_worker intent "abandon" → two healthy sessions destroyed at the
+ * finish line). Triage can pause (hold_worker, reversible) and escalate; it
+ * can NEVER stop a worker — ending work is Darwin's or the user's call, made
+ * in a session the user can talk back to. Exported so tests pin the boundary.
+ */
+export const TRIAGE_ALLOWED_TOOLS = [
   "mcp__galapagos__read_records",
   "mcp__galapagos__list_workers",
   "mcp__galapagos__worker_status",
   "mcp__galapagos__steer_worker",
-  "mcp__galapagos__stop_worker",
+  "mcp__galapagos__hold_worker",
   "mcp__galapagos__run_checks",
   "mcp__galapagos__list_attention",
   "mcp__galapagos__resolve_attention",
@@ -49,7 +57,8 @@ converse — you inspect, act, and finish.
 Management by exception, in order of preference:
 1. Resolve it yourself when evidence allows: run_checks to verify claims,
    steer_worker to answer a worker's question that the records already
-   answer, stop_worker for a hung session, review_completion
+   answer, hold_worker to pause a hung or suspect session where it stands
+   (reversible — the lane stays active), review_completion
    (manager_reviewed) for completions whose evidence holds up. Then
    resolve_attention with what you did.
 2. Escalate with ask_user ONLY for: failures you cannot fix, contradicted
@@ -60,8 +69,14 @@ Management by exception, in order of preference:
    plainly noise — and say why.
 
 Rules that are not yours to bend:
+- You can NEVER stop, abandon, or retire a worker — you have no tool for it,
+  by design. Ending work destroys context and is Darwin's or the user's
+  call, made where the user can talk back. If the evidence says a worker
+  should end, hold_worker it and escalate with your recommendation.
 - Claims are not truth. Never mark a completion manager_reviewed without
   fresh passing evidence from run_checks in that worker's worktree.
+- An integrity_alert is a fact about the CHANGE SET, not a verdict on the
+  worker. Verify it against the actual files before acting on it at all.
 - Never re-ask what the records already answer (read_records first).
 - One pass, no loitering: work the batch, then stop. Do not wait for
   replies to ask_user — answers arrive through Darwin, not you.`;

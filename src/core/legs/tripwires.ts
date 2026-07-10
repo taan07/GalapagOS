@@ -44,6 +44,22 @@ const TEST_FILE_PATTERNS: RegExp[] = [
   /Tests?\.(java|kt|swift|cs)$/,
 ];
 
+/**
+ * Vendored/generated trees are NOT the worker's change set: every dependency
+ * ships its own package.json (with a "test" script), jest configs, and test
+ * suites, so one `npm install` in a repo that hasn't ignored node_modules
+ * used to fire the check-script tripwire thousands of times over — a false
+ * positive Darwin disproved by hand, 11+ times in one day (2026-07-10),
+ * before triage acted on it destructively. Nothing under these paths is
+ * evidence about the worker's integrity.
+ */
+const VENDORED_PATH_PATTERN =
+  /(^|\/)(node_modules|bower_components|vendor|dist|dist-node|build|out|coverage|\.git|\.next|\.venv|venv|__pycache__|site-packages)\//;
+
+export function isVendoredPath(path: string): boolean {
+  return VENDORED_PATH_PATTERN.test(path);
+}
+
 const SKIP_MARKER = /\b(it|test|describe|xit|xdescribe)\.skip\s*\(|\bx(it|describe|test)\s*\(|@unittest\.skip|pytest\.mark\.skip|@pytest\.mark\.skip|\bt\.Skip\s*\(|raise\s+(unittest\.)?SkipTest/;
 
 // Focus markers make the runner execute ONLY the focused test and silently
@@ -70,9 +86,16 @@ export function isCheckMachineryPath(path: string): boolean {
   return CHECK_MACHINERY_PATTERNS.some((pattern) => pattern.test(path));
 }
 
-/** Did a package.json change touch the scripts that run the checks? */
+/**
+ * Did a package.json change touch the scripts that run the checks? Only the
+ * WORKTREE-ROOT package.json counts: run-checks executes the root manifest's
+ * scripts and nothing else, so only the root manifest can fake a pass. Any
+ * deeper package.json (a workspace member, a vendored dependency) is not the
+ * judging machinery — matching them made every dependency manifest a false
+ * alert.
+ */
 function touchesCheckScripts(file: ChangedFileDiff): boolean {
-  if (!/(^|\/)package\.json$/.test(file.path)) {
+  if (file.path !== "package.json") {
     return false;
   }
   const scriptKey = /"(test|typecheck|lint|build)"\s*:/;
@@ -95,9 +118,11 @@ export type TripwireContext = {
  * critic clears it; a "warn" lowers and points the critic's attention.
  */
 export function detectTripwires(
-  files: ChangedFileDiff[],
+  changedFiles: ChangedFileDiff[],
   context: TripwireContext = {},
 ): TripwireFinding[] {
+  // Vendored trees never testify: see VENDORED_PATH_PATTERN.
+  const files = changedFiles.filter((file) => !isVendoredPath(file.path));
   const findings: TripwireFinding[] = [];
 
   const scriptTampered = files.filter(touchesCheckScripts);
