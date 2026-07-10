@@ -7,6 +7,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { GalapagosConfig } from "../../config";
 import type { GalapagosDb } from "../db/db";
+import { nowIso } from "../db/db";
 import { createJob, failJob, finishJob, startJob } from "../db/repos/jobs";
 import { markTurnsDistilled } from "../db/repos/manager";
 import type { ProjectRow } from "../db/repos/projects";
@@ -66,6 +67,10 @@ export async function runDistillJob(input: {
     sdkSessionId: input.sdkSessionId,
   });
   startJob(db, job.id);
+  // Coverage boundary: this pass forks the session as it exists NOW. A user
+  // turn that lands while the fork runs (a preempting message) is not in it
+  // and must stay undistilled for the next pass.
+  const coverageCutoff = nowIso();
 
   let recordsWritten = 0;
   let ran = false;
@@ -113,8 +118,9 @@ export async function runDistillJob(input: {
         }
       }
       if (ran) {
-        // Fork content is discarded by design; only coverage is stamped.
-        markTurnsDistilled(db, input.sessionId);
+        // Fork content is discarded by design; only coverage is stamped —
+        // and only for turns that existed when this pass began.
+        markTurnsDistilled(db, input.sessionId, coverageCutoff);
       }
     } catch (error) {
       // Auth or spawn failure: never retry on a fresh session (a fork without

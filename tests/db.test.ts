@@ -244,3 +244,38 @@ test("sessions and turns stay isolated between projects", async () => {
   assert.equal(listTurns(db, sessionB.id).length, 0);
   assert.equal(listTurns(db, sessionA.id).length, 1);
 });
+
+test("a coverage cutoff protects turns that landed while a distill pass ran (preempt race, 2026-07-10)", async () => {
+  const stateDir = tmpDir("glp-state-");
+  const projectDir = tmpDir("glp-proj-");
+  mkdirSync(path.join(projectDir, ".git"));
+  const db = openDb(stateDir);
+  const project = await registerProject(db, { rootPath: projectDir });
+  const session = getOrCreateActiveSession(db, project.id);
+
+  appendTurn(db, { sessionId: session.id, role: "user", content: "covered by the fork" });
+  appendTurn(db, { sessionId: session.id, role: "assistant", content: "also covered" });
+  // The pass forks HERE; a preempting user message lands after.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const cutoff = new Date().toISOString();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const preempting = appendTurn(db, {
+    sessionId: session.id,
+    role: "user",
+    content: "sent while the fork was running",
+  });
+
+  markTurnsDistilled(db, session.id, cutoff);
+  const turns = listTurns(db, session.id);
+  assert.ok(turns[0]?.distilled_at, "pre-fork turn stamped");
+  assert.ok(turns[1]?.distilled_at, "pre-fork turn stamped");
+  assert.equal(
+    turns.find((turn) => turn.id === preempting.id)?.distilled_at,
+    null,
+    "the preempting message stays uncovered — the NEXT pass owns it",
+  );
+
+  // The next (uncutoff) pass sweeps it.
+  markTurnsDistilled(db, session.id);
+  assert.ok(listTurns(db, session.id).every((turn) => turn.distilled_at !== null));
+});

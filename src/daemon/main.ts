@@ -50,6 +50,10 @@ const busyProjects = new Set<string>();
 // manager session must never be forked concurrently with a new turn, so the
 // NEXT turn awaits this promise instead of the user eating a 409.
 const distillsInFlight = new Map<string, Promise<void>>();
+// The pending distill's own kill switch, so a preempting user message can
+// abort the fork directly (activeTurnControllers may already belong to the
+// next phase by the time the preempt runs).
+const distillControllers = new Map<string, AbortController>();
 const eventClients = new Set<http.ServerResponse>();
 const activeTurnControllers = new Map<string, AbortController>();
 // Per-project manager-model override, set when the user hits "change to Opus"
@@ -274,12 +278,27 @@ async function handleManagerMessage(
   };
 
   try {
+    // Persist the message BEFORE any wait: until 2026-07-10 it lived only in
+    // this handler's memory through the distill gate, so a reload during the
+    // wait lost it without a trace. Persisted-but-unanswered is honest;
+    // vanished is not.
+    const session = getOrCreateActiveSession(db, projectId);
+    const userTurn = appendTurn(db, { sessionId: session.id, role: "user", content: text });
+
     // The previous turn's distillation may still be running. The fork
     // invariant stands — the manager session is never forked concurrently
-    // with a live turn — but the wait moved server-side: the message is
-    // accepted and queues here instead of bouncing off a 409.
+    // with a live turn — but the user outranks bookkeeping: abort the pending
+    // fork (its turns stay unmarked; the next pass sweeps them) instead of
+    // making the user wait out a 30–90s pass in silence. This was THE
+    // "Darwin takes forever to respond" delay (avg 31s, max 90s measured).
     const pendingDistill = distillsInFlight.get(projectId);
     if (pendingDistill) {
+      sseWrite(res, {
+        type: "turn_status",
+        status: "thinking",
+        label: "Setting aside the last turn's paperwork…",
+      });
+      distillControllers.get(projectId)?.abort();
       await pendingDistill;
     }
 
@@ -297,6 +316,7 @@ async function handleManagerMessage(
       abortController: turnController,
       workers,
       decisions,
+      persistedUserTurn: userTurn,
     });
 
     // Post-turn distillation no longer holds the input lock: the turn is
@@ -331,12 +351,16 @@ async function handleManagerMessage(
       // there is no instant where a new turn sees neither lock.
       const guard = distillPromise.catch(() => {});
       distillsInFlight.set(projectId, guard);
+      distillControllers.set(projectId, distillController);
       releaseBusy();
       try {
         await distillPromise;
       } finally {
         if (distillsInFlight.get(projectId) === guard) {
           distillsInFlight.delete(projectId);
+        }
+        if (distillControllers.get(projectId) === distillController) {
+          distillControllers.delete(projectId);
         }
       }
     }
