@@ -1,9 +1,17 @@
 "use client";
 
-import { memo, useEffect, useRef, useState } from "react";
+import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { ChatItem, DecisionView, QueuedMessage, RebriefView } from "./types";
+import type {
+  ChatItem,
+  DecisionView,
+  LiveTurnStatusView,
+  QueuedMessage,
+  RebriefView,
+} from "./types";
+import { localClockTime, localDate, localDateTime } from "./time";
+import { groupTurns, planSettledTurn, splitAnswerFold, type IndexedItem, type TurnGroup } from "./turns";
 
 /** Render a settled card's outcome as one scannable line. */
 function settledSummary(decision: DecisionView): string {
@@ -270,13 +278,25 @@ const ChatMessage = memo(function ChatMessage({
     );
   }
   if (item.kind === "assistant") {
+    // Answer-first fold (Taan's ruling): the first paragraph is the answer
+    // and stands; substantial detail folds beneath it. Doctrine tells Darwin
+    // to write in exactly this shape.
+    const fold = splitAnswerFold(item.text);
     return (
       <div className="msg assistant">
         <div className="speaker">Darwin</div>
         <CopyButton text={item.text} />
         <div className="md">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.text}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{fold.lead}</ReactMarkdown>
         </div>
+        {fold.rest !== null ? (
+          <details className="fold">
+            <summary>Details</summary>
+            <div className="md">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{fold.rest}</ReactMarkdown>
+            </div>
+          </details>
+        ) : null}
       </div>
     );
   }
@@ -341,6 +361,77 @@ const ChatMessage = memo(function ChatMessage({
     );
   }
   return <div className="msg system-note">{item.text}</div>;
+});
+
+function itemKey(entry: IndexedItem): string | number {
+  return entry.item.kind === "decision" ? entry.item.decision.decisionId : entry.index;
+}
+
+/**
+ * One conversational turn. Live (the in-flight one) renders every event
+ * chronologically as it lands; a settled turn reads as conversation — the
+ * user's message (timestamped), Darwin's reply and any first-class actions
+ * (worker spawns/steers/stops/resumes, merges, lane changes) inline, and the
+ * routine activity collapsed to one quiet "N actions" rollup at the end.
+ * Memoized: token deltas re-render only the live tail, never settled turns.
+ */
+const TurnBlock = memo(function TurnBlock({
+  group,
+  live,
+  disabled,
+  working,
+  onClearRebrief,
+  onAnswerDecision,
+  onSwitchToOpus,
+}: {
+  group: TurnGroup;
+  live: boolean;
+  disabled: boolean;
+  working: boolean;
+  onClearRebrief: (rebrief: RebriefView) => void;
+  onAnswerDecision: (
+    decisionId: string,
+    selections: string[],
+    responses: Record<string, string[]>,
+    custom: string,
+  ) => void;
+  onSwitchToOpus: (failedText: string) => void;
+}) {
+  const plan = live ? null : planSettledTurn(group.body);
+  const renderEntry = (entry: IndexedItem) => (
+    <ChatMessage
+      key={itemKey(entry)}
+      item={entry.item}
+      disabled={disabled}
+      working={working}
+      onClearRebrief={onClearRebrief}
+      onAnswerDecision={onAnswerDecision}
+      onSwitchToOpus={onSwitchToOpus}
+    />
+  );
+  return (
+    <div className="turn">
+      {group.user ? (
+        <div className="turn-row">
+          {group.at ? (
+            <span className="turn-time" title={localDateTime(group.at)}>
+              {localClockTime(group.at)}
+            </span>
+          ) : null}
+          {renderEntry(group.user)}
+        </div>
+      ) : null}
+      {(plan ? plan.inline : group.body).map(renderEntry)}
+      {plan && plan.rolledUp.length > 0 ? (
+        <details className="rollup">
+          <summary>
+            {plan.rolledUp.length} action{plan.rolledUp.length === 1 ? "" : "s"}
+          </summary>
+          <div className="rollup-body">{plan.rolledUp.map(renderEntry)}</div>
+        </details>
+      ) : null}
+    </div>
+  );
 });
 
 /**
@@ -448,6 +539,8 @@ function Composer({
 export function Chat({
   items,
   working,
+  liveText,
+  liveStatus,
   queued,
   disabled,
   answering,
@@ -462,6 +555,10 @@ export function Chat({
 }: {
   items: ChatItem[];
   working: boolean;
+  /** Darwin's prose streaming in — the unsettled tail under the last turn. */
+  liveText: string;
+  /** What Darwin is doing right now; null when no turn is in flight. */
+  liveStatus: LiveTurnStatusView | null;
   queued: QueuedMessage[];
   disabled: boolean;
   /** A card is waiting — the composer becomes its free-text answer. */
@@ -486,7 +583,11 @@ export function Chat({
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [items, working]);
+  }, [items, working, liveText, liveStatus]);
+
+  // Turn grouping recomputes only when items change — token deltas and
+  // status flips leave the groups (and every settled TurnBlock) untouched.
+  const groups = useMemo(() => groupTurns(items), [items]);
 
   return (
     <section className="chat" aria-label="Darwin chat">
@@ -497,18 +598,41 @@ export function Chat({
             want to build — and expect questions until the specifics are pinned down.
           </p>
         ) : null}
-        {items.map((item, index) => (
-          <ChatMessage
-            key={item.kind === "decision" ? item.decision.decisionId : index}
-            item={item}
-            disabled={disabled}
-            working={working}
-            onClearRebrief={onClearRebrief}
-            onAnswerDecision={onAnswerDecision}
-            onSwitchToOpus={onSwitchToOpus}
-          />
-        ))}
-        {working ? <div className="working">Darwin is working — Esc ×3 to stop</div> : null}
+        {groups.map((group, index) => {
+          const previous = index > 0 ? groups[index - 1] : undefined;
+          const newDay =
+            group.at && previous?.at && localDate(previous.at) !== localDate(group.at);
+          return (
+            <Fragment key={group.key}>
+              {newDay && group.at ? (
+                <div className="date-divider">{localDate(group.at)}</div>
+              ) : null}
+              <TurnBlock
+                group={group}
+                live={working && index === groups.length - 1}
+                disabled={disabled}
+                working={working}
+                onClearRebrief={onClearRebrief}
+                onAnswerDecision={onAnswerDecision}
+                onSwitchToOpus={onSwitchToOpus}
+              />
+            </Fragment>
+          );
+        })}
+        {liveText ? (
+          <div className="msg assistant streaming">
+            <div className="speaker">Darwin</div>
+            <div className="md">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{liveText}</ReactMarkdown>
+            </div>
+          </div>
+        ) : null}
+        {working ? (
+          <div className="working">
+            <span className="working-label">{liveStatus?.label ?? "Darwin is working"}</span>
+            <span className="working-hint">Esc ×3 to stop</span>
+          </div>
+        ) : null}
       </div>
       {queued.length > 0 ? (
         <div className="queue-list" aria-label="Queued messages">

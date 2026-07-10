@@ -268,7 +268,15 @@ async function handleManagerMessage(
   startSse(res);
   const emit = (event: ManagerTurnEvent) => {
     sseWrite(res, event);
-    if (event.type === "turn_complete" || event.type === "turn_error") {
+    // Decision cards ride the daemon broadcast too: the needs-you cue (tab
+    // badge + notification) must fire even when the asking turn's stream
+    // belongs to a tab the user isn't looking at.
+    if (
+      event.type === "turn_complete" ||
+      event.type === "turn_error" ||
+      event.type === "decision_request" ||
+      event.type === "decision_settled"
+    ) {
       broadcast({ ...event, projectId });
     }
   };
@@ -419,7 +427,14 @@ async function wakeManagerForLaneViolation(notice: LaneViolationNotice): Promise
       project,
       userText: seed,
       emit: (event) => {
-        if (event.type === "turn_complete" || event.type === "turn_error") {
+        // Autonomous turns have no chat stream — the broadcast is the ONLY
+        // path a decision card (e.g. the amend_lane gate) reaches the user.
+        if (
+          event.type === "turn_complete" ||
+          event.type === "turn_error" ||
+          event.type === "decision_request" ||
+          event.type === "decision_settled"
+        ) {
           broadcast({ ...event, projectId: project.id });
         }
       },
