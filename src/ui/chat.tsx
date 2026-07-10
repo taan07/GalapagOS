@@ -640,9 +640,21 @@ export function Chat({
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // The scroll view deliberately does NOT follow the streaming tail — chasing
+  // every new line jitters. It moves only when something settles (a message
+  // lands, a chip/card appears, the turn ends): a smooth fall to the bottom
+  // that "locks in" the new message. First paint of a history stays instant —
+  // animating from the top of a long conversation would crawl.
+  const scrolledOnceRef = useRef(false);
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [items, working, liveText, liveStatus]);
+    const node = scrollRef.current;
+    if (!node) {
+      return;
+    }
+    const smooth = scrolledOnceRef.current && items.length > 0;
+    scrolledOnceRef.current = items.length > 0;
+    node.scrollTo({ top: node.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+  }, [items, working]);
 
   // Turn grouping recomputes only when items change — token deltas and
   // status flips leave the groups (and every settled TurnBlock) untouched.
