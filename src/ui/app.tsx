@@ -658,6 +658,7 @@ export function App() {
             queued={queued}
             disabled={daemonDown || !selected}
             answering={pendingDecision !== null}
+            projectId={selected?.id ?? null}
             projectName={selected?.name ?? ""}
             onSend={handleSend}
             onQueueSteer={handleQueueSteer}

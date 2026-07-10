@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatItem, DecisionView, QueuedMessage, RebriefView } from "./types";
@@ -234,12 +234,224 @@ function LimitNote({
   );
 }
 
+/**
+ * One rendered chat item. Memoized so a keystroke in the composer — or a single
+ * streamed message appended to a long conversation — never re-renders (and, for
+ * assistant bubbles, never re-parses the markdown of) every prior message. The
+ * items array appends immutably, so each item keeps a stable reference and the
+ * memo bails out for everything but the changed row.
+ */
+const ChatMessage = memo(function ChatMessage({
+  item,
+  disabled,
+  working,
+  onClearRebrief,
+  onAnswerDecision,
+  onSwitchToOpus,
+}: {
+  item: ChatItem;
+  disabled: boolean;
+  working: boolean;
+  onClearRebrief: (rebrief: RebriefView) => void;
+  onAnswerDecision: (
+    decisionId: string,
+    selections: string[],
+    responses: Record<string, string[]>,
+    custom: string,
+  ) => void;
+  onSwitchToOpus: (failedText: string) => void;
+}) {
+  if (item.kind === "user") {
+    return (
+      <div className="msg user">
+        <CopyButton text={item.text} />
+        {item.text}
+      </div>
+    );
+  }
+  if (item.kind === "assistant") {
+    return (
+      <div className="msg assistant">
+        <div className="speaker">Darwin</div>
+        <CopyButton text={item.text} />
+        <div className="md">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.text}</ReactMarkdown>
+        </div>
+      </div>
+    );
+  }
+  if (item.kind === "chip") {
+    return (
+      <details className="chip">
+        <summary>{item.chip.summary}</summary>
+        {item.chip.detail ? <pre>{item.chip.detail}</pre> : null}
+      </details>
+    );
+  }
+  if (item.kind === "rebrief") {
+    // Quiet by default: a collapsed chip, full seed text on demand.
+    // No preamble means nothing was seeded — a plain note is honest.
+    if (!item.rebrief.preamble) {
+      return <div className="msg system-note">{item.rebrief.reason}</div>;
+    }
+    return (
+      <details className="chip rebrief">
+        <summary>
+          Darwin re-briefed from records{item.rebrief.cleared ? " (cleared)" : ""}
+        </summary>
+        <div className="rebrief-detail">
+          <p className="rebrief-reason">{item.rebrief.reason}</p>
+          <pre>{item.rebrief.preamble}</pre>
+          {item.rebrief.cleared ? (
+            <p className="rebrief-reason">
+              This re-brief was cleared — it is no longer in Darwin's context.
+            </p>
+          ) : (
+            <button
+              onClick={() => onClearRebrief(item.rebrief)}
+              disabled={disabled || working || !item.rebrief.turnId}
+              title="Retire this context entirely: Darwin's next turn starts blank. Records stay on disk."
+            >
+              Clear this re-brief — start Darwin blank
+            </button>
+          )}
+        </div>
+      </details>
+    );
+  }
+  if (item.kind === "decision") {
+    return (
+      <DecisionPrompt
+        decision={item.decision}
+        disabled={disabled}
+        onAnswer={(selections, responses, custom) =>
+          onAnswerDecision(item.decision.decisionId, selections, responses, custom)
+        }
+      />
+    );
+  }
+  if (item.kind === "limit") {
+    return (
+      <LimitNote
+        message={item.message}
+        model={item.model}
+        disabled={disabled || working}
+        onSwitch={() => onSwitchToOpus(item.failedText)}
+      />
+    );
+  }
+  return <div className="msg system-note">{item.text}</div>;
+});
+
+/**
+ * The message composer. Owns its own draft state so a keystroke re-renders only
+ * this component, never the (potentially long, markdown-heavy) message list
+ * above it. The draft is persisted per project in localStorage, so typed-but-
+ * unsent text survives a reload or a hop to /workers and back.
+ *
+ * The free-text answer to a pending card arrives here too (2026-07-08 ruling):
+ * `onSend` routes it to the waiting decision instead of starting a new turn.
+ */
+function Composer({
+  projectId,
+  disabled,
+  answering,
+  working,
+  queued,
+  onSend,
+}: {
+  projectId: string | null;
+  disabled: boolean;
+  answering: boolean;
+  working: boolean;
+  queued: QueuedMessage[];
+  onSend: (text: string) => void;
+}) {
+  const storageKey = projectId ? `galapagos.draft.${projectId}` : null;
+  const [draft, setDraft] = useState("");
+
+  // Load the persisted draft whenever the focused project changes. Reads run
+  // client-side only (this is a "use client" tree), so useState starts empty
+  // and the stored value lands on mount / project switch.
+  useEffect(() => {
+    if (!storageKey) {
+      setDraft("");
+      return;
+    }
+    setDraft(window.localStorage.getItem(storageKey) ?? "");
+  }, [storageKey]);
+
+  // Persist on edit (not via an effect, to avoid a project switch briefly
+  // writing the old draft under the new project's key).
+  const edit = (value: string) => {
+    setDraft(value);
+    if (!storageKey) {
+      return;
+    }
+    if (value) {
+      window.localStorage.setItem(storageKey, value);
+    } else {
+      window.localStorage.removeItem(storageKey);
+    }
+  };
+
+  const submit = () => {
+    const text = draft.trim();
+    if (!text || disabled) {
+      return;
+    }
+    setDraft("");
+    if (storageKey) {
+      window.localStorage.removeItem(storageKey);
+    }
+    onSend(text);
+  };
+
+  return (
+    <div className={`chat-compose${answering ? " answering" : ""}`}>
+      <textarea
+        value={draft}
+        placeholder={
+          disabled
+            ? "Chat unavailable — daemon offline."
+            : answering
+              ? "Pick above, or type your own answer here…"
+              : "Message Darwin…"
+        }
+        disabled={disabled}
+        onChange={(event) => edit(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            submit();
+          }
+        }}
+      />
+      <div className="compose-row">
+        {answering ? (
+          <span className="hint">Your message answers the question above.</span>
+        ) : queued.length > 0 ? (
+          <span className="queue-note">
+            Queued — sending in order when Darwin finishes, or Steer to interrupt.
+          </span>
+        ) : (
+          <span className="hint">Enter to send · Shift+Enter for a new line</span>
+        )}
+        <button onClick={submit} disabled={disabled || draft.trim().length === 0}>
+          {answering ? "Answer" : working ? "Queue" : "Send"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function Chat({
   items,
   working,
   queued,
   disabled,
   answering,
+  projectId,
   projectName,
   onSend,
   onQueueSteer,
@@ -254,6 +466,8 @@ export function Chat({
   disabled: boolean;
   /** A card is waiting — the composer becomes its free-text answer. */
   answering: boolean;
+  /** Focused project id — the key the composer persists its draft under. */
+  projectId: string | null;
   projectName: string;
   onSend: (text: string) => void;
   /** Interrupt the current turn and send this queued message next. */
@@ -268,21 +482,11 @@ export function Chat({
   ) => void;
   onSwitchToOpus: (failedText: string) => void;
 }) {
-  const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [items, working]);
-
-  const submit = () => {
-    const text = draft.trim();
-    if (!text || disabled) {
-      return;
-    }
-    setDraft("");
-    onSend(text);
-  };
 
   return (
     <section className="chat" aria-label="Darwin chat">
@@ -293,98 +497,17 @@ export function Chat({
             want to build — and expect questions until the specifics are pinned down.
           </p>
         ) : null}
-        {items.map((item, index) => {
-          if (item.kind === "user") {
-            return (
-              <div className="msg user" key={index}>
-                <CopyButton text={item.text} />
-                {item.text}
-              </div>
-            );
-          }
-          if (item.kind === "assistant") {
-            return (
-              <div className="msg assistant" key={index}>
-                <div className="speaker">Darwin</div>
-                <CopyButton text={item.text} />
-                <div className="md">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.text}</ReactMarkdown>
-                </div>
-              </div>
-            );
-          }
-          if (item.kind === "chip") {
-            return (
-              <details className="chip" key={index}>
-                <summary>{item.chip.summary}</summary>
-                {item.chip.detail ? <pre>{item.chip.detail}</pre> : null}
-              </details>
-            );
-          }
-          if (item.kind === "rebrief") {
-            // Quiet by default: a collapsed chip, full seed text on demand.
-            // No preamble means nothing was seeded — a plain note is honest.
-            if (!item.rebrief.preamble) {
-              return (
-                <div className="msg system-note" key={index}>
-                  {item.rebrief.reason}
-                </div>
-              );
-            }
-            return (
-              <details className="chip rebrief" key={index}>
-                <summary>
-                  Darwin re-briefed from records{item.rebrief.cleared ? " (cleared)" : ""}
-                </summary>
-                <div className="rebrief-detail">
-                  <p className="rebrief-reason">{item.rebrief.reason}</p>
-                  <pre>{item.rebrief.preamble}</pre>
-                  {item.rebrief.cleared ? (
-                    <p className="rebrief-reason">
-                      This re-brief was cleared — it is no longer in Darwin's context.
-                    </p>
-                  ) : (
-                    <button
-                      onClick={() => onClearRebrief(item.rebrief)}
-                      disabled={disabled || working || !item.rebrief.turnId}
-                      title="Retire this context entirely: Darwin's next turn starts blank. Records stay on disk."
-                    >
-                      Clear this re-brief — start Darwin blank
-                    </button>
-                  )}
-                </div>
-              </details>
-            );
-          }
-          if (item.kind === "decision") {
-            return (
-              <DecisionPrompt
-                key={item.decision.decisionId}
-                decision={item.decision}
-                disabled={disabled}
-                onAnswer={(selections, responses, custom) =>
-                  onAnswerDecision(item.decision.decisionId, selections, responses, custom)
-                }
-              />
-            );
-          }
-          if (item.kind === "limit") {
-            return (
-              <LimitNote
-                key={index}
-                message={item.message}
-                model={item.model}
-                disabled={disabled || working}
-                onSwitch={() => onSwitchToOpus(item.failedText)}
-              />
-            );
-          }
-          return (
-            <div className="msg system-note" key={index}>
-              {item.text}
-            </div>
-          );
-        })}
+        {items.map((item, index) => (
+          <ChatMessage
+            key={item.kind === "decision" ? item.decision.decisionId : index}
+            item={item}
+            disabled={disabled}
+            working={working}
+            onClearRebrief={onClearRebrief}
+            onAnswerDecision={onAnswerDecision}
+            onSwitchToOpus={onSwitchToOpus}
+          />
+        ))}
         {working ? <div className="working">Darwin is working — Esc ×3 to stop</div> : null}
       </div>
       {queued.length > 0 ? (
@@ -413,40 +536,14 @@ export function Chat({
           ))}
         </div>
       ) : null}
-      <div className={`chat-compose${answering ? " answering" : ""}`}>
-        <textarea
-          value={draft}
-          placeholder={
-            disabled
-              ? "Chat unavailable — daemon offline."
-              : answering
-                ? "Pick above, or type your own answer here…"
-                : "Message Darwin…"
-          }
-          disabled={disabled}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              submit();
-            }
-          }}
-        />
-        <div className="compose-row">
-          {answering ? (
-            <span className="hint">Your message answers the question above.</span>
-          ) : queued.length > 0 ? (
-            <span className="queue-note">
-              Queued — sending in order when Darwin finishes, or Steer to interrupt.
-            </span>
-          ) : (
-            <span className="hint">Enter to send · Shift+Enter for a new line</span>
-          )}
-          <button onClick={submit} disabled={disabled || draft.trim().length === 0}>
-            {answering ? "Answer" : working ? "Queue" : "Send"}
-          </button>
-        </div>
-      </div>
+      <Composer
+        projectId={projectId}
+        disabled={disabled}
+        answering={answering}
+        working={working}
+        queued={queued}
+        onSend={onSend}
+      />
     </section>
   );
 }
