@@ -170,6 +170,33 @@ function DecisionPrompt({
   );
 }
 
+// Matches the ::details-content transition in globals.css (240ms) — the
+// follow-up scroll waits for the expansion to finish growing.
+const DETAILS_EASE_MS = 260;
+
+/**
+ * After a disclosure opens, glide the revealed message into view — the user
+ * clicked to read it, they shouldn't then have to scroll to it. A message
+ * that fits the viewport settles fully visible (the common "take me down to
+ * the bottom" case); one taller than the viewport aligns its top so reading
+ * starts at the summary.
+ */
+function easeOpenedIntoView(details: HTMLDetailsElement): void {
+  if (!details.open) {
+    return;
+  }
+  window.setTimeout(() => {
+    if (!details.isConnected || !details.open) {
+      return;
+    }
+    const target = details.closest(".msg") ?? details;
+    const scroller = details.closest(".chat-scroll");
+    const tallerThanView =
+      scroller !== null && target.getBoundingClientRect().height > scroller.clientHeight;
+    target.scrollIntoView({ behavior: "smooth", block: tallerThanView ? "start" : "nearest" });
+  }, DETAILS_EASE_MS);
+}
+
 /** Hover affordance on a message bubble: copy its text, flash confirmation. */
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -302,7 +329,10 @@ const ChatMessage = memo(function ChatMessage({
         <div className="md">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{fold.lead}</ReactMarkdown>
         </div>
-        <details className="fold">
+        <details
+          className="fold"
+          onToggle={(event) => easeOpenedIntoView(event.currentTarget)}
+        >
           <summary>Details</summary>
           <div className="md">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{fold.rest}</ReactMarkdown>
@@ -482,7 +512,7 @@ const TurnBlock = memo(function TurnBlock({
       ) : null}
       {(plan ? plan.inline : group.body).map(renderEntry)}
       {plan && plan.rolledUp.length > 0 ? (
-        <details className="rollup">
+        <details className="rollup" onToggle={(event) => easeOpenedIntoView(event.currentTarget)}>
           <summary>
             {plan.rolledUp.length} action{plan.rolledUp.length === 1 ? "" : "s"}
           </summary>
