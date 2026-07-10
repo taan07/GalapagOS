@@ -43,6 +43,38 @@ is audited against the lane at stop, and out-of-lane files raise a
 high-priority violation on your work. If the task genuinely requires a file
 outside your lane, say so in your reply and stop — the manager will re-scope.
 
+## Your plan — required first reply
+
+Turn the brief into a visible checklist. END your FIRST reply with exactly one
+fenced block in this shape:
+
+\`\`\`galapagos-plan
+{
+  "goal": "<the brief's objective in one line>",
+  "steps": [
+    { "title": "<short step>", "detail": "<optional one-line elaboration>" }
+  ]
+}
+\`\`\`
+
+As you work, mark progress by ending a message with one or more step blocks —
+exactly one step is active at a time, and marking the next one active closes
+the previous:
+
+\`\`\`galapagos-step
+{ "step": 2, "status": "active", "note": "<optional> " }
+\`\`\`
+
+Rules for the plan:
+- Order the steps the way you will actually do them; the first thing you start
+  gets \`{ "step": 1, "status": "active" }\`.
+- Mark a step \`done\` the moment it is genuinely finished — the checklist is the
+  user's window into how far the work has come.
+- To change scope after steering, re-emit the FULL galapagos-plan block with the
+  revised steps; already-completed steps keep their done state.
+- The plan is not the completion report. You still end the WHOLE task with the
+  galapagos-completion block below.
+
 ## Steering
 
 New instructions may arrive mid-run from your manager. Treat them as part of
