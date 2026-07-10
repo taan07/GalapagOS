@@ -7,6 +7,11 @@ import { listWorkerAttentionItems } from "../adapters/db/repos/attention";
 import type { CompletionDigestRow } from "../adapters/db/repos/digests";
 import { latestDigestForWorker } from "../adapters/db/repos/digests";
 import { getLane, laneGlobs } from "../adapters/db/repos/lanes";
+import {
+  countStepsForWorker,
+  getWorkerPlanGoal,
+  listWorkerSteps,
+} from "../adapters/db/repos/worker-steps";
 import type { WorkerRow } from "../adapters/db/repos/workers";
 import type { WorkerView } from "../ui/types";
 
@@ -23,6 +28,8 @@ export function toWorkerView(
   const digest =
     preloaded.digest !== undefined ? preloaded.digest : (latestDigestForWorker(db, worker.id) ?? null);
   const attention = preloaded.attention ?? listWorkerAttentionItems(db, worker.id);
+  const stepCounts = countStepsForWorker(db, worker.id);
+  const activeStep = listWorkerSteps(db, worker.id).find((step) => step.status === "active");
   return {
     id: worker.id,
     status: worker.status,
@@ -38,5 +45,9 @@ export function toWorkerView(
     hasDigest: digest !== null,
     openAttentionCount: attention.filter((item) => item.status === "open").length,
     resumedFrom: worker.resumed_from,
+    goal: getWorkerPlanGoal(db, worker.id),
+    stepsDone: stepCounts.done,
+    stepsTotal: stepCounts.total,
+    activeStepTitle: activeStep?.title ?? null,
   };
 }
