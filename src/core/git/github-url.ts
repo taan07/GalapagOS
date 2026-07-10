@@ -35,3 +35,8 @@ export function githubBlobUrl(webBase: string, ref: string, filePath: string): s
   const pathPart = filePath.split("/").map(encodeURIComponent).join("/");
   return `${webBase}/blob/${refPart}/${pathPart}`;
 }
+
+/** Link to a single commit — a lane's base, an implementation checkpoint. */
+export function githubCommitUrl(webBase: string, sha: string): string {
+  return `${webBase}/commit/${encodeURIComponent(sha)}`;
+}
