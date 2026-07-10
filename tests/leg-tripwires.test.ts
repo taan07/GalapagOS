@@ -253,3 +253,24 @@ test("the adapter sees committed, uncommitted, and untracked changes alike", asy
   const broken = await runTripwires(dir, "not-a-sha");
   assert.ok(!broken.available, "an unreadable diff degrades to unavailable, never to clean");
 });
+
+test("vendored trees never testify: an npm install fires nothing (2026-07-10 false-execution incident)", () => {
+  // The exact false positive that abandoned two healthy workers: dependency
+  // manifests carry "test" scripts, configs, and test suites of their own.
+  const installNoise = [
+    file("node_modules/left-pad/package.json", ['  "test": "node test.js",']),
+    file("node_modules/some-lib/jest.config.js", ["module.exports = {};"]),
+    file("node_modules/some-lib/tests/a.test.js", ["it.only('x', () => {})", "process.exit(0)"]),
+    file("vendor/lib/package.json", ['  "test": "true",']),
+    file("dist-node/tests/old.test.js", ["it.skip('y', () => {})"]),
+  ];
+  assert.deepEqual(ids(installNoise), []);
+  // The real thing still fires beside the noise.
+  assert.deepEqual(ids([...installNoise, file("package.json", ['  "test": "true",'])]), [
+    "alert:check-script-modified",
+  ]);
+});
+
+test("only the worktree-root package.json is check machinery (run-checks executes nothing else)", () => {
+  assert.deepEqual(ids([file("packages/app/package.json", ['  "test": "vitest",'])]), []);
+});

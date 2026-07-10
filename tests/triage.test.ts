@@ -19,7 +19,11 @@ import { createCompletionDigest, listUnreviewedDigests } from "../src/adapters/d
 import { getOrCreateActiveSession, listTurns } from "../src/adapters/db/repos/manager";
 import { createWorkerRuntime } from "../src/adapters/agent/worker-runtime";
 import type { WorkerSession } from "../src/adapters/agent/worker-session";
-import { buildTriageSeed, createAskUserBridge } from "../src/adapters/agent/triage";
+import {
+  buildTriageSeed,
+  createAskUserBridge,
+  TRIAGE_ALLOWED_TOOLS,
+} from "../src/adapters/agent/triage";
 
 function fixtureRepo(): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), "glp-triage-repo-"));
@@ -144,4 +148,11 @@ test("createAskUserBridge lands the question in chat AND on the queue, and broad
 
   assert.ok(events.some((event) => (event as { type: string }).type === "manager_note"));
   assert.ok(events.some((event) => (event as { type: string }).type === "attention_changed"));
+});
+
+test("triage's tool surface is non-destructive: pause and escalate, never stop (2026-07-10 ruling)", () => {
+  assert.ok(!TRIAGE_ALLOWED_TOOLS.includes("mcp__galapagos__stop_worker"));
+  assert.ok(TRIAGE_ALLOWED_TOOLS.includes("mcp__galapagos__hold_worker"));
+  assert.ok(TRIAGE_ALLOWED_TOOLS.includes("mcp__galapagos__ask_user"));
+  assert.ok(TRIAGE_ALLOWED_TOOLS.includes("mcp__galapagos__steer_worker"));
 });

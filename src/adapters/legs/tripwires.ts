@@ -6,6 +6,7 @@ import path from "node:path";
 import type { TripwireFinding } from "../../core/confidence/types";
 import {
   detectTripwires,
+  isVendoredPath,
   parseUnifiedDiff,
   type ChangedFileDiff,
 } from "../../core/legs/tripwires";
@@ -36,6 +37,13 @@ export async function collectChangedFileDiffs(
 
   for (const entry of parseStatusPorcelain(porcelainOutput).untrackedFiles) {
     if (!entry.path || seen.has(entry.path)) {
+      continue;
+    }
+    // Vendored trees (an un-gitignored node_modules after an install) are
+    // not the worker's change set — and reading thousands of dependency
+    // manifests is pure waste. The detector filters too; skipping here
+    // avoids the reads entirely.
+    if (isVendoredPath(entry.path)) {
       continue;
     }
     try {
