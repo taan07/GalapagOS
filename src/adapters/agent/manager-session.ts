@@ -20,6 +20,7 @@ import {
   type ManagerTurnRow,
 } from "../db/repos/manager";
 import type { ProjectRow } from "../db/repos/projects";
+import { LIVE_WORKER_STATUSES } from "../db/repos/workers";
 import { buildManagerDoctrine } from "../../daemon/doctrine";
 import { createRecordsStore, type RecordDoc, type RecordsStore } from "../records/store";
 import { createManagerToolServer } from "./manager-tools";
@@ -219,6 +220,33 @@ const BASELINE_STYLE_CONTRACT: RebriefRecord = {
 };
 
 /**
+ * The newest UNCLEARED re-brief marker on a session — evidence its brief was
+ * already composed. A failed first attempt on a seeded session leaves this
+ * marker (plus its unanswered user turn) behind; the next turn must reuse the
+ * marker's preamble instead of compacting again. Exported for the db-level
+ * tests that pin exactly that sequence.
+ */
+export function findUnclearedRebriefMarker(
+  db: GalapagosDb,
+  sessionId: string,
+): RebriefTurnPayload | null {
+  const markers = listTurns(db, sessionId)
+    .filter((turn) => turn.role === "system")
+    .map((turn) => {
+      try {
+        return JSON.parse(turn.content) as RebriefTurnPayload;
+      } catch {
+        return null;
+      }
+    })
+    .filter(
+      (payload): payload is RebriefTurnPayload =>
+        payload !== null && payload.kind === "rebrief" && payload.clearedAt === null,
+    );
+  return markers.at(-1) ?? null;
+}
+
+/**
  * What the preamble composer may know beyond the record store. Optional and
  * degradable: a caller without a live runtime still gets a records-only brief.
  */
@@ -261,13 +289,12 @@ function rebriefPreamble(
 
   // 7c — the live fleet at compose time. Sessions survive compaction (and
   // daemon restarts); the new context must know who is out there working.
+  // Liveness is the canonical constant, not a re-derived exclusion — a future
+  // terminal status must never read as "running THIS INSTANT" here.
   const fleet: string[] = [];
   if (context.workers && context.projectId) {
     for (const { worker, lane } of context.workers.list(context.projectId)) {
-      if (
-        worker.status === "stopped" ||
-        worker.status === "failed"
-      ) {
+      if (!LIVE_WORKER_STATUSES.includes(worker.status)) {
         continue;
       }
       fleet.push(
@@ -609,35 +636,31 @@ export async function runManagerTurn(input: {
     }
   };
 
-  // A session with history but no resume pointer cannot be resumed at all —
-  // compact up front instead of pretending the fresh session remembers.
+  // Pre-flight, in precedence order:
+  // 1. A records-seeded session with an UNCLEARED re-brief marker: the brief
+  //    was already composed — a failed first attempt leaves its (unanswered)
+  //    user turn behind, so this check must come BEFORE the hasHistory
+  //    compaction or a transient failure would double-compact, stamp a second
+  //    chip, and misreport "resume pointer lost" for a deliberate compaction.
+  // 2. History but no resume pointer: genuinely unresumable — compact.
+  // 3. A virgin records-seeded session: compose the brief NOW — records,
+  //    style contract, thread tail, live fleet, all at use-time freshness.
+  //    (A deliberately blanked session — re-brief cleared — has
+  //    seeded_from_records_at null and starts blank.)
   let prompt = userText;
-  if (!resumeId && hasHistory) {
-    prompt = compactAndRebrief("The previous session's resume pointer was lost.");
-    resumeId = null;
-  } else if (!resumeId && !hasHistory && session.seeded_from_records_at) {
-    // A PROACTIVE compaction (distill-boundary trigger or the re-brief-now
-    // button) already swapped in this records-seeded session; its first turn
-    // composes the brief NOW — records, style contract, thread tail, live
-    // fleet, all at use-time freshness. A deliberately blanked session
-    // (re-brief cleared) has seeded_from_records_at null and starts blank.
-    // If a failed first attempt already persisted the re-brief marker, reuse
-    // its preamble instead of stamping a second chip into history.
-    const existing = listTurns(db, session.id)
-      .filter((turn) => turn.role === "system")
-      .map((turn) => {
-        try {
-          return JSON.parse(turn.content) as { kind?: string; preamble?: string | null };
-        } catch {
-          return null;
-        }
-      })
-      .find((payload) => payload?.kind === "rebrief");
-    let preamble: string | null;
-    if (existing) {
-      preamble = existing.preamble ?? null;
-    } else {
-      preamble = rebriefPreamble(store, project.name, {
+  if (!resumeId) {
+    const marker = session.seeded_from_records_at
+      ? findUnclearedRebriefMarker(db, session.id)
+      : null;
+    if (marker) {
+      if (marker.preamble) {
+        prompt = `${marker.preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${userText}`;
+      }
+    } else if (hasHistory) {
+      prompt = compactAndRebrief("The previous session's resume pointer was lost.");
+      resumeId = null;
+    } else if (session.seeded_from_records_at) {
+      const preamble = rebriefPreamble(store, project.name, {
         db,
         projectId: project.id,
         previousSessionId: latestCompactedSessionId(db, project.id),
@@ -653,9 +676,9 @@ export async function runManagerTurn(input: {
         content: JSON.stringify(payload),
       });
       emit({ type: "rebrief", reason, preamble, turnId: rebriefTurn.id });
-    }
-    if (preamble) {
-      prompt = `${preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${userText}`;
+      if (preamble) {
+        prompt = `${preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${userText}`;
+      }
     }
   }
 
