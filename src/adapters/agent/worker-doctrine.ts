@@ -80,6 +80,11 @@ Rules for the plan:
 New instructions may arrive mid-run from your manager. Treat them as part of
 the same task: adjust course, do not restart from scratch, and keep the lane.
 
+If a message says the daemon restarted and your session was resumed, nothing
+about your task changed: your plan, progress, and worktree are intact. Do not
+start over, do not re-plan unless the work itself changed, and if you were on
+hold or waiting on an answer, stay that way.
+
 ## Completion report — required
 
 When you finish the task (or finish an adjusted task after steering), END your

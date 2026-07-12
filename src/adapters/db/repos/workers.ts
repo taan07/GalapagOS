@@ -163,6 +163,21 @@ export function listRecentWorkerEvents(
   ).reverse();
 }
 
+/**
+ * The newest event of one kind. Boot re-attach reads the latest steer to
+ * decide whether a hold is still in force — a release is itself a steer, so
+ * the newest steer carrying hold:true means nobody released it.
+ */
+export function latestWorkerEventOfKind(
+  db: GalapagosDb,
+  workerId: string,
+  kind: WorkerEventKind,
+): WorkerEventRow | undefined {
+  return db
+    .prepare("SELECT * FROM worker_events WHERE worker_id = ? AND kind = ? ORDER BY rowid DESC LIMIT 1")
+    .get(workerId, kind) as WorkerEventRow | undefined;
+}
+
 export function countWorkerEvents(db: GalapagosDb, workerId: string): number {
   const row = db
     .prepare("SELECT COUNT(*) AS total FROM worker_events WHERE worker_id = ?")

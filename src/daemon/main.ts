@@ -931,9 +931,14 @@ void (async () => {
     console.log(`[decisions] expired ${staleDecisions} pending decision${staleDecisions === 1 ? "" : "s"} from before the restart`);
   }
   try {
-    const orphans = await workers.reconcileOrphans();
-    if (orphans > 0) {
-      console.log(`[workers] reconciled ${orphans} orphaned worker${orphans === 1 ? "" : "s"} after restart`);
+    const { reattached, finalized } = await workers.reconcileOrphans();
+    if (reattached > 0) {
+      console.log(
+        `[workers] re-attached ${reattached} live worker${reattached === 1 ? "" : "s"} after restart (sessions resumed in place)`,
+      );
+    }
+    if (finalized > 0) {
+      console.log(`[workers] reconciled ${finalized} orphaned worker${finalized === 1 ? "" : "s"} after restart`);
     }
   } catch (error) {
     console.error(
