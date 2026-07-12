@@ -27,9 +27,9 @@ import {
   countWorkerEvents,
   createWorker,
   getWorker,
-  latestWorkerEventOfKind,
   listLiveStatusWorkers,
   listRecentWorkerEvents,
+  listWorkerEventsOfKind,
   listWorkers,
   setWorkerBriefRecord,
   setWorkerSdkSessionId,
@@ -677,6 +677,14 @@ export function createWorkerRuntime(deps: {
           break;
         }
       }
+      if (resumeMismatch) {
+        // Stop CONSUMING, not just the switch: anything a blank session
+        // emits before its stream closes would be processed as real worker
+        // events — an assistant message rewrites the plan, a success result
+        // could mint a fabricated completion digest. Nothing after the
+        // mismatch is the worker's.
+        break;
+      }
     }
 
     const worker = getWorker(db, workerId);
@@ -684,14 +692,24 @@ export function createWorkerRuntime(deps: {
       // The re-attach failed — fall back to exactly what boot reconciliation
       // did before auto-resume existed: honest error event, at-stop safety
       // pass, `stopped` (never `failed` — the platform lost the session, the
-      // worker did nothing wrong). Wrapped in `stopping` so a racing user
-      // stop() cannot double-finalize.
+      // worker did nothing wrong).
+      persistEvent(worker, "error", {
+        message:
+          "Daemon restarted — resuming the worker session came back blank (session id mismatch). The live session was lost; work up to this point remains in the worktree.",
+      });
+      if (stopping.has(workerId)) {
+        // A stop() is already in flight: it holds the finalize baton and will
+        // run the at-stop pass the moment this loop resolves. Finalizing here
+        // too would double the stopped marker and the no-digest attention
+        // item — and deleting from `stopping` would strip stop()'s own
+        // membership mid-flight. Record the mismatch and get out of its way.
+        return;
+      }
+      // No await between the has-check and the add, so a stop() passing its
+      // own gates either landed in `stopping` before this check (handled
+      // above) or will be refused by it until the finalize completes.
       stopping.add(workerId);
       try {
-        persistEvent(worker, "error", {
-          message:
-            "Daemon restarted — resuming the worker session came back blank (session id mismatch). The live session was lost; work up to this point remains in the worktree.",
-        });
         await finalizeStop(worker, "the daemon (restart re-attach failed)");
         console.log(`[workers] re-attach of ${workerId} came back blank — finalized as stopped`);
       } finally {
@@ -792,28 +810,42 @@ export function createWorkerRuntime(deps: {
   };
 
   /**
-   * The restart notice a re-attached worker wakes up to. Three variants,
-   * because the wrong one silently rewrites fleet state: a held worker told
-   * to "continue" is a hold nobody released (worst case: the lane guard froze
-   * it mid-violation and the nudge un-freezes it straight back into the
-   * violation). A release is itself a steer, so the newest steer still
-   * carrying hold:true means the hold stands.
+   * The restart notice a re-attached worker wakes up to. The wrong variant
+   * silently rewrites fleet state: a held worker told to "continue" is a hold
+   * nobody released (worst case: the lane guard froze it mid-violation and
+   * the nudge un-freezes it straight back into the violation).
+   *
+   * Hold detection: a release IS an ordinary manager steer, so the newest
+   * INSTRUCTION-steer decides — but notice-steers are not instructions and
+   * must not read as releases: the re-attach marker itself (or a second
+   * consecutive restart would silently un-hold) and lane-amendment notices
+   * (amending a frozen worker's lane does not release the freeze).
    */
   const buildReattachNudge = (worker: WorkerRow): string => {
-    const latestSteer = latestWorkerEventOfKind(db, worker.id, "steer");
-    if (latestSteer) {
+    for (const steer of listWorkerEventsOfKind(db, worker.id, "steer")) {
+      let payload: { hold?: unknown; reattached?: unknown; laneAmendment?: unknown };
       try {
-        const payload = JSON.parse(latestSteer.payload) as { hold?: unknown };
-        if (payload.hold === true) {
-          return "The daemon restarted and your session was resumed — you are still ON HOLD. Do not start anything new and do not write further changes. Reply with ONE short message restating where you are and what remains, then keep waiting for further instructions. Do not emit a completion block.";
-        }
+        payload = JSON.parse(steer.payload) as typeof payload;
       } catch {
-        // Unreadable steer payload — treat as not held; the monitor and the
-        // manager still see the worker's real stream.
+        // Unreadable steer payload — not an instruction we can read; skip it
+        // rather than guess.
+        continue;
       }
+      if (payload.reattached === true || payload.laneAmendment !== undefined) {
+        continue;
+      }
+      if (payload.hold === true) {
+        return "The daemon restarted and your session was resumed — you are still ON HOLD. Do not start anything new and do not write further changes. Reply with ONE short message restating where you are and what remains, then keep waiting for further instructions. Do not emit a completion block.";
+      }
+      break; // newest instruction-steer is not a hold — the hold (if any) was released
     }
     if (worker.status === "awaiting_input") {
       return "The daemon restarted and your session was resumed — your plan and progress stand. If you were waiting on an answer from your manager, restate your question in ONE short message and keep waiting. Do not emit a new galapagos-plan unless the work itself changed.";
+    }
+    if (worker.status === "idle") {
+      // idle without a digest (digest-carriers never re-attach) means the
+      // worker claimed completion but its block did not parse.
+      return "The daemon restarted and your session was resumed — your plan and progress stand. Your last completion block did not parse; if the task is truly finished, re-emit a valid galapagos-completion block, otherwise continue from your current step. Do not emit a new galapagos-plan unless the work itself changed.";
     }
     return "The daemon restarted mid-run and your session was resumed — your plan and progress stand. Inspect your worktree state and continue from your current step. Do not emit a new galapagos-plan unless the work itself changed.";
   };
@@ -1614,7 +1646,18 @@ plan does not carry over). End with your completion report as required.`;
       let reattached = 0;
       let finalized = 0;
       for (const worker of orphans) {
-        if (reattachOrphan(worker)) {
+        // A re-attach attempt that THROWS (db read, records store) must cost
+        // only its own worker the fallback — never abort the loop and leave
+        // the remaining orphans wedged in a live status until the next boot.
+        let attached = false;
+        try {
+          attached = reattachOrphan(worker);
+        } catch (error) {
+          console.error(
+            `[workers] re-attach attempt failed for ${worker.id}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        if (attached) {
           reattached += 1;
           continue;
         }

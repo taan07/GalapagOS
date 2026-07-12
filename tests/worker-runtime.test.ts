@@ -964,6 +964,150 @@ test("a resume that comes back blank falls back to the honest finalize — stopp
   );
 });
 
+test("a held worker survives a SECOND consecutive restart still held — the re-attach notice is not a release", async () => {
+  const { db, config, project, runtime, sessions } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  const fake = sessions[0];
+  assert.ok(fake);
+  fake.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "running", "running");
+  const pending = runtime.hold(outcome.workerId, "the lane guard");
+  await waitFor(() => fake.sent.some((text) => text.startsWith("HOLD")), "hold delivered");
+  fake.emit({
+    kind: "result",
+    payload: { subtype: "error_during_execution", isError: true, resultText: null },
+  });
+  fake.emit({ kind: "assistant", payload: { text: "Paused." } });
+  await pending;
+
+  // Restart #1: re-attached held; the notice itself lands as a steer event.
+  const restart1 = restartedRuntime(db, config);
+  await restart1.runtime.reconcileOrphans();
+  assert.match(restart1.spawnInputs[0]?.briefText ?? "", /still ON HOLD/);
+
+  // Restart #2: the newest steer is now the re-attach notice — which must
+  // never read as a release.
+  const restart2 = restartedRuntime(db, config);
+  await restart2.runtime.reconcileOrphans();
+  assert.match(
+    restart2.spawnInputs[0]?.briefText ?? "",
+    /still ON HOLD/,
+    "a second restart must not silently un-hold the worker",
+  );
+});
+
+test("a lane amendment after a hold does not release the hold across a restart", async () => {
+  const { db, config, project, runtime, sessions } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  const fake = sessions[0];
+  assert.ok(fake);
+  fake.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "running", "running");
+  const pending = runtime.hold(outcome.workerId, "the lane guard");
+  await waitFor(() => fake.sent.some((text) => text.startsWith("HOLD")), "hold delivered");
+  fake.emit({
+    kind: "result",
+    payload: { subtype: "error_during_execution", isError: true, resultText: null },
+  });
+  fake.emit({ kind: "assistant", payload: { text: "Paused mid-violation." } });
+  await pending;
+
+  // The natural response to a lane-guard freeze: widen the lane. The
+  // amendment notice is a steer event — but not an instruction to continue.
+  const amended = await runtime.applyLaneAmendment({
+    project,
+    workerId: outcome.workerId,
+    addGlobs: ["src/extra/**"],
+    reason: "the frozen file genuinely belongs to the task",
+    approvedBy: "the user",
+  });
+  assert.ok(amended.ok);
+
+  const restarted = restartedRuntime(db, config);
+  await restarted.runtime.reconcileOrphans();
+  assert.match(
+    restarted.spawnInputs[0]?.briefText ?? "",
+    /still ON HOLD/,
+    "amending a frozen worker's lane must not release the freeze across a restart",
+  );
+});
+
+test("a blank resume cannot inject events: nothing after the mismatch is persisted or digested", async () => {
+  const { db, config, project, runtime, sessions } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  sessions[0]?.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "running", "running");
+
+  const restarted = restartedRuntime(db, config);
+  await restarted.runtime.reconcileOrphans();
+
+  // The blank session announces itself AND races fabricated work in before
+  // its stream closes: none of it belongs to the real worker.
+  const blank = restarted.sessions[0];
+  assert.ok(blank);
+  blank.emit({ kind: "session_started", sdkSessionId: "sdk-blank" });
+  blank.emit({ kind: "assistant", payload: { text: "fabricated narration" } });
+  blank.emit({
+    kind: "result",
+    payload: { subtype: "success", isError: false, resultText: VALID_COMPLETION },
+  });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "stopped", "fallback finalize");
+
+  assert.equal(latestDigestForWorker(db, outcome.workerId), undefined, "no fabricated digest");
+  const events = listWorkerEvents(db, outcome.workerId);
+  assert.ok(
+    !events.some((event) => /fabricated narration/.test(event.payload)),
+    "the blank session's narration never enters the worker's stream",
+  );
+});
+
+test("a stop during the blank-resume window finalizes exactly once", async () => {
+  const { db, config, project, runtime, sessions } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  sessions[0]?.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "running", "running");
+
+  const restarted = restartedRuntime(db, config);
+  await restarted.runtime.reconcileOrphans();
+
+  // The user stops the worker before the resumed session ever inits.
+  const stopped = await restarted.runtime.stop(outcome.workerId, "the user, via the workers page");
+  assert.ok(stopped.ok);
+  assert.equal(getWorker(db, outcome.workerId)?.status, "stopped");
+
+  const payloads = listWorkerEvents(db, outcome.workerId).map(
+    (event) => JSON.parse(event.payload) as Record<string, unknown>,
+  );
+  assert.equal(
+    payloads.filter((payload) => payload.subtype === "stopped").length,
+    1,
+    "exactly one stopped marker — no double finalize",
+  );
+  assert.equal(
+    listWorkerAttentionItems(db, outcome.workerId).filter(
+      (item) => item.kind === "unstructured_completion",
+    ).length,
+    1,
+    "exactly one no-digest attention item",
+  );
+});
+
 test("an orphan that already reported completion is finalized, not re-attached", async () => {
   const { db, config, project, runtime, sessions } = await fixture();
   const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
