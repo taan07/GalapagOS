@@ -10,8 +10,11 @@ import {
   validateStatusChange,
 } from "../src/core/records/schema";
 
-test("exactly eight record types, each with a type dir and a default open status", () => {
-  assert.equal(GLP_TYPES.length, 8);
+test("exactly nine record types, each with a type dir and a default open status", () => {
+  // style_contract joined 2026-07-13 (principle 7a: "how to work with me"
+  // survives every compaction). Growing this list is always a deliberate,
+  // test-updating act.
+  assert.equal(GLP_TYPES.length, 9);
   for (const type of GLP_TYPES) {
     assert.ok(TYPE_DIRS[type], `missing dir for ${type}`);
     const status = defaultStatus(type);
@@ -20,6 +23,7 @@ test("exactly eight record types, each with a type dir and a default open status
   }
   assert.equal(isGlpType("agreed_specific"), false);
   assert.equal(isGlpType("active_goal"), true);
+  assert.equal(isGlpType("style_contract"), true);
 });
 
 test("creating with a closed status is rejected", () => {

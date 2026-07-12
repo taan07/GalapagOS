@@ -1,5 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { GalapagosConfig } from "../../config";
+import { contextFillFromModelUsage } from "../../core/context-fill";
+import { oneLine } from "../../core/text";
 import { buildRebrief, type RebriefRecord } from "../../core/records/rebrief";
 import { isClosedStatus } from "../../core/records/schema";
 import type { GalapagosDb } from "../db/db";
@@ -8,8 +10,10 @@ import {
   compactSession,
   deleteTurns,
   getOrCreateActiveSession,
+  latestCompactedSessionId,
   latestSdkSessionId,
   listTurns,
+  listUndistilledTurns,
   markSessionResumed,
   updateTurnContent,
   updateTurnSdkSessionId,
@@ -120,6 +124,12 @@ export type ManagerTurnOutcome = {
   completed: boolean;
   /** True when the user force-stopped the turn (triple-Esc). */
   interrupted: boolean;
+  /**
+   * How full the context window ran this turn (0..1+, worst model), straight
+   * from the SDK result's usage block. Null when the turn never completed or
+   * usage wasn't reported — unknown pressure is NO pressure, never a trigger.
+   */
+  contextFill: number | null;
 };
 
 const MANAGER_ALLOWED_TOOLS = [
@@ -185,8 +195,47 @@ function toRebriefRecord(doc: RecordDoc): RebriefRecord {
   };
 }
 
+/**
+ * The built-in "how to work with me" baseline, used until a real
+ * style_contract record exists. Distilled from the user's signed product
+ * principles — a compaction must never reset how Darwin behaves, even on a
+ * project whose record store hasn't captured preferences yet.
+ */
+const BASELINE_STYLE_CONTRACT: RebriefRecord = {
+  type: "style_contract",
+  title: "Working baseline (built-in until a style_contract record exists)",
+  status: "active",
+  createdAt: "2026-07-13",
+  body: [
+    "- Answer first, details fold: lead every reply with a one-line,",
+    "  self-contained outcome; put the walkthrough below it.",
+    "- Ambiguity ALWAYS interrupts — ask instead of guessing, however",
+    "  autonomous the current run feels.",
+    "- Anything touching main, and every direction-level call (architecture,",
+    "  scope, dependencies), needs the user's explicit yes.",
+    "- Narrate worker events conversationally; you are the translation layer —",
+    "  every steer to a worker passes through your judgment, never a raw pipe.",
+  ].join("\n"),
+};
+
+/**
+ * What the preamble composer may know beyond the record store. Optional and
+ * degradable: a caller without a live runtime still gets a records-only brief.
+ */
+type RebriefContext = {
+  db?: GalapagosDb;
+  projectId?: string;
+  /** The just-compacted session whose undistilled tail is the thread state. */
+  previousSessionId?: string | null;
+  workers?: WorkerRuntime;
+};
+
 /** Seed for a fresh session, per architecture §5. Null = store is empty. */
-function rebriefPreamble(store: RecordsStore, projectName: string): string | null {
+function rebriefPreamble(
+  store: RecordsStore,
+  projectName: string,
+  context: RebriefContext = {},
+): string | null {
   const syntheses = store.list({ type: "manager_synthesis" });
   const synthesis =
     syntheses.filter((doc) => !isClosedStatus(doc.status)).at(-1) ?? syntheses.at(-1) ?? null;
@@ -195,12 +244,47 @@ function rebriefPreamble(store: RecordsStore, projectName: string): string | nul
     .list({ type: "open_question" })
     .filter((doc) => !isClosedStatus(doc.status));
   const recentAnswers = store.list({ type: "user_answer", status: "agreed" }).slice(-10);
+  const storedContracts = store
+    .list({ type: "style_contract" })
+    .filter((doc) => !isClosedStatus(doc.status));
+  const styleContracts =
+    storedContracts.length > 0 ? storedContracts.map(toRebriefRecord) : [BASELINE_STYLE_CONTRACT];
+
+  // 7b — where the thread stood: the compacted session's undistilled tail,
+  // one line per turn, newest last, bounded so the preamble stays a brief.
+  const threadState: string[] = [];
+  if (context.db && context.previousSessionId) {
+    for (const turn of listUndistilledTurns(context.db, context.previousSessionId).slice(-10)) {
+      threadState.push(`${turn.role === "user" ? "User" : "Darwin"}: ${oneLine(turn.content, 200)}`);
+    }
+  }
+
+  // 7c — the live fleet at compose time. Sessions survive compaction (and
+  // daemon restarts); the new context must know who is out there working.
+  const fleet: string[] = [];
+  if (context.workers && context.projectId) {
+    for (const { worker, lane } of context.workers.list(context.projectId)) {
+      if (
+        worker.status === "stopped" ||
+        worker.status === "failed"
+      ) {
+        continue;
+      }
+      fleet.push(
+        `${worker.id.slice(0, 8)} [${worker.status}] lane "${lane?.name ?? "(none)"}"${worker.last_summary ? ` — ${oneLine(worker.last_summary, 120)}` : ""}`,
+      );
+    }
+  }
+
   return buildRebrief({
     projectName,
     synthesis: synthesis ? toRebriefRecord(synthesis) : null,
     goals: goals.map(toRebriefRecord),
     openQuestions: openQuestions.map(toRebriefRecord),
     recentAnswers: recentAnswers.map(toRebriefRecord),
+    styleContracts,
+    threadState,
+    fleet,
   });
 }
 
@@ -251,6 +335,7 @@ export async function runManagerTurn(input: {
   let attemptTurnIds: string[] = [];
   let resultWasError = false;
   let completed = false;
+  let contextFill: number | null = null;
 
   /**
    * The chat decision channel: persist the question as a system turn (so it
@@ -396,9 +481,15 @@ export async function runManagerTurn(input: {
   const compactAndRebrief = (cause: string): string => {
     deleteTurns(db, [userTurn.id, ...attemptTurnIds]);
     attemptTurnIds = [];
+    const previousSessionId = session.id;
     session = compactSession(db, project.id, session.id);
 
-    const preamble = rebriefPreamble(store, project.name);
+    const preamble = rebriefPreamble(store, project.name, {
+      db,
+      projectId: project.id,
+      previousSessionId,
+      ...(input.workers ? { workers: input.workers } : {}),
+    });
     const reason = preamble
       ? `${cause} Darwin re-briefed himself from the committed records (goals, open questions, agreed answers are intact); recent conversational nuance may be lost.`
       : `${cause} No durable records exist yet to re-brief from — Darwin restarted with a blank slate.`;
@@ -509,6 +600,10 @@ export async function runManagerTurn(input: {
           updateTurnSdkSessionId(db, lastPersistedTurnId, message.session_id);
         }
         completed = true;
+        // Free context-pressure reading off the result's usage block — the
+        // daemon compacts at the next completed distill boundary when this
+        // crosses the configured threshold.
+        contextFill = contextFillFromModelUsage(message.modelUsage);
         emit({ type: "turn_complete", resultText: message.result, sdkSessionId: message.session_id });
       }
     }
@@ -520,6 +615,48 @@ export async function runManagerTurn(input: {
   if (!resumeId && hasHistory) {
     prompt = compactAndRebrief("The previous session's resume pointer was lost.");
     resumeId = null;
+  } else if (!resumeId && !hasHistory && session.seeded_from_records_at) {
+    // A PROACTIVE compaction (distill-boundary trigger or the re-brief-now
+    // button) already swapped in this records-seeded session; its first turn
+    // composes the brief NOW — records, style contract, thread tail, live
+    // fleet, all at use-time freshness. A deliberately blanked session
+    // (re-brief cleared) has seeded_from_records_at null and starts blank.
+    // If a failed first attempt already persisted the re-brief marker, reuse
+    // its preamble instead of stamping a second chip into history.
+    const existing = listTurns(db, session.id)
+      .filter((turn) => turn.role === "system")
+      .map((turn) => {
+        try {
+          return JSON.parse(turn.content) as { kind?: string; preamble?: string | null };
+        } catch {
+          return null;
+        }
+      })
+      .find((payload) => payload?.kind === "rebrief");
+    let preamble: string | null;
+    if (existing) {
+      preamble = existing.preamble ?? null;
+    } else {
+      preamble = rebriefPreamble(store, project.name, {
+        db,
+        projectId: project.id,
+        previousSessionId: latestCompactedSessionId(db, project.id),
+        ...(input.workers ? { workers: input.workers } : {}),
+      });
+      const reason = preamble
+        ? "Context was compacted at a clean distillation boundary — Darwin re-briefed himself from the committed records; the distilled memory is intact."
+        : "Context was compacted, and no durable records exist yet to re-brief from — Darwin starts fresh.";
+      const payload: RebriefTurnPayload = { kind: "rebrief", reason, preamble, clearedAt: null };
+      const rebriefTurn = appendTurn(db, {
+        sessionId: session.id,
+        role: "system",
+        content: JSON.stringify(payload),
+      });
+      emit({ type: "rebrief", reason, preamble, turnId: rebriefTurn.id });
+    }
+    if (preamble) {
+      prompt = `${preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${userText}`;
+    }
   }
 
   const outcome = (): ManagerTurnOutcome => ({
@@ -527,6 +664,7 @@ export async function runManagerTurn(input: {
     sdkSessionId,
     completed,
     interrupted: input.abortController?.signal.aborted ?? false,
+    contextFill,
   });
 
   try {

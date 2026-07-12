@@ -30,6 +30,12 @@ export type GalapagosConfig = {
   watchdogModel: string;
   /** Model for the blinded critic leg — the user can raise it for harder projects. */
   criticModel: string;
+  /**
+   * Context-fill ratio (0..1) past which the manager's session is compacted
+   * at the NEXT COMPLETED distillation boundary — records were just written,
+   * so the transcript's nuance is redundant by design at that instant.
+   */
+  rebriefFillThreshold: number;
   /** Monitor loop cadence. The tick makes zero LLM calls at any interval. */
   monitorIntervalMs: number;
   /** A running worker silent beyond this raises stale_worker attention. */
@@ -54,6 +60,17 @@ function expandHome(value: string): string {
   }
   if (value.startsWith("~/")) {
     return path.join(os.homedir(), value.slice(2));
+  }
+  return value;
+}
+
+function parseFillRatio(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") {
+    return fallback;
+  }
+  const value = Number.parseFloat(raw);
+  if (!Number.isFinite(value) || value <= 0 || value > 1) {
+    throw new Error(`Invalid GALAPAGOS_REBRIEF_FILL_THRESHOLD (expected 0 < ratio <= 1): ${raw}`);
   }
   return value;
 }
@@ -109,6 +126,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GalapagosConfi
     triageModel: env.GALAPAGOS_TRIAGE_MODEL ?? "claude-haiku-4-5",
     watchdogModel: env.GALAPAGOS_WATCHDOG_MODEL ?? "claude-haiku-4-5",
     criticModel: env.GALAPAGOS_CRITIC_MODEL ?? "claude-haiku-4-5",
+    rebriefFillThreshold: parseFillRatio(env.GALAPAGOS_REBRIEF_FILL_THRESHOLD, 0.75),
     monitorIntervalMs: parsePositiveInt(
       "GALAPAGOS_MONITOR_INTERVAL_MS",
       env.GALAPAGOS_MONITOR_INTERVAL_MS,

@@ -25,7 +25,12 @@ const DISTILL_PROMPT = `Post-turn distillation pass. Record any durable outcomes
 using write_record (or update_record to resolve/supersede an existing record —
 check read_records before writing to avoid duplicates). Durable means: an
 agreed answer, a goal, a plan the user accepted, an open or deferred
-question, a real decision the user made.
+question, a real decision the user made — and HOW THE USER WANTS TO BE
+WORKED WITH: when the exchange reveals a standing preference about tone,
+format, autonomy, or process ("always ask before X", "keep replies short",
+"never do Y without me"), capture it as a style_contract record (update the
+existing one rather than piling up new ones). Style contracts are seeded
+into every re-brief, so they are how behavior survives a compaction.
 A proposal the user has NOT yet accepted is none of those — record it as an
 open_question ("user has not yet decided: <the call to make>") so it keeps
 being re-raised, or write nothing; never write implementation_plan or
