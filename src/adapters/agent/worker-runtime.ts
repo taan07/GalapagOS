@@ -213,9 +213,16 @@ export function createWorkerRuntime(deps: {
    * so HE course-corrects — steer it back, amend the lane, or stop it.
    */
   onLaneViolation?: (notice: LaneViolationNotice) => void;
+  /**
+   * How long a resume-time reap waits for a dead-but-lingering session's
+   * stream to close before proceeding anyway (a truly hung process must not
+   * wedge the lane forever).
+   */
+  reapTimeoutMs?: number;
 }) {
   const { db, config } = deps;
   const sessionFactory = deps.sessionFactory ?? spawnWorkerSession;
+  const reapTimeoutMs = deps.reapTimeoutMs ?? 5_000;
   const live = new Map<string, LiveEntry>();
   // Workers whose stop/finalize pass is currently running: a second stop
   // (manager tool racing the HTTP route) must not run the audit twice and
@@ -594,6 +601,13 @@ export function createWorkerRuntime(deps: {
             failed = true;
             raiseWorkerFailure(worker, `The worker's turn ended in error (${event.payload.subtype}).`);
             setStatus(worker, "failed");
+            // The session cannot continue — never leave the dead process
+            // holding the live slot. A failed row + a lingering live entry
+            // wedged steer ("it failed") and resume ("it's live") into
+            // mutual rejection with the lane held hostage. Killing the
+            // session closes the stream, and consumeSession's finally
+            // clears the live map.
+            void session.stop().catch(() => {});
           } else {
             const parseStatus =
               event.payload.resultText !== null
@@ -623,6 +637,10 @@ export function createWorkerRuntime(deps: {
           failed = true;
           raiseWorkerFailure(worker, event.payload.message);
           setStatus(worker, "failed");
+          // Same zombie prevention as the error-result path: a stream error
+          // usually means the stream is ending anyway, but a process that
+          // lingers after one must not keep the live slot.
+          void session.stop().catch(() => {});
           break;
         }
       }
@@ -941,17 +959,44 @@ export function createWorkerRuntime(deps: {
       if (!predecessor) {
         return { ok: false, reason: `No worker with id ${input.workerId}.` };
       }
-      if (live.has(predecessor.id) || stopping.has(predecessor.id)) {
+      if (stopping.has(predecessor.id)) {
         return {
           ok: false,
-          reason: `Worker ${predecessor.id} is still live — steer it instead of resuming.`,
+          reason: `Worker ${predecessor.id} is being stopped right now — wait for the stop to finish, then resume.`,
         };
       }
       if (predecessor.status !== "stopped" && predecessor.status !== "failed") {
         return {
           ok: false,
-          reason: `Worker ${predecessor.id} is ${predecessor.status} — only stopped or failed workers can be resumed.`,
+          reason: live.has(predecessor.id)
+            ? `Worker ${predecessor.id} is still live — steer it instead of resuming.`
+            : `Worker ${predecessor.id} is ${predecessor.status} — only stopped or failed workers can be resumed.`,
         };
+      }
+      const lingering = live.get(predecessor.id);
+      if (lingering) {
+        // Zombie: the DB says this worker is over, but its dead session still
+        // holds the live slot — and with it, the lane. (The failure path now
+        // kills its session, but a hung process can survive that.) Reap it
+        // exactly as stop() would — end the session, wait bounded for the
+        // stream to close, run the at-stop audit — then continue with the
+        // resume instead of bouncing the caller between steer and resume.
+        stopping.add(predecessor.id);
+        try {
+          lingering.stopRequested = true;
+          await lingering.session.stop().catch(() => {});
+          await Promise.race([
+            lingering.loopDone,
+            new Promise((resolve) => setTimeout(resolve, reapTimeoutMs)),
+          ]);
+          live.delete(predecessor.id);
+          const zombieLane = getLane(db, predecessor.lane_id);
+          if (zombieLane && zombieLane.status !== "retired") {
+            await finalizeStop(predecessor, "the manager (reaping a dead session before resume)");
+          }
+        } finally {
+          stopping.delete(predecessor.id);
+        }
       }
       const lane = getLane(db, predecessor.lane_id);
       if (!lane) {
@@ -1117,9 +1162,16 @@ plan does not carry over). End with your completion report as required.`;
       if (worker.status === "failed" || worker.status === "stopped") {
         // A failed session may linger in the live map until its stream
         // closes; steering it would flip a dead worker back to "running".
+        // The advice must point somewhere that actually works: its lane may
+        // still be active, so "spawn a fresh worker" would be refused —
+        // resume_worker is the sanctioned continuation and reaps any
+        // lingering dead session itself.
         return {
           ok: false,
-          reason: `Worker ${workerId} is ${worker.status} — it cannot be steered. Spawn a fresh worker instead.`,
+          reason:
+            worker.status === "failed"
+              ? `Worker ${workerId} is failed — it cannot be steered. Use resume_worker to continue its task in the same worktree, or stop_worker to retire the work and free its lane.`
+              : `Worker ${workerId} is stopped — it cannot be steered. Use resume_worker to continue its task in the same worktree.`,
         };
       }
       const entry = live.get(workerId);

@@ -117,6 +117,7 @@ type Fixture = {
 
 async function fixture(opts?: {
   onLaneViolation?: (notice: LaneViolationNotice) => void;
+  reapTimeoutMs?: number;
 }): Promise<Fixture> {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "glp-rt-state-"));
   const config = loadConfig({ ...process.env, GALAPAGOS_STATE_DIR: stateDir });
@@ -129,6 +130,7 @@ async function fixture(opts?: {
     db,
     config,
     onLaneViolation: opts?.onLaneViolation,
+    reapTimeoutMs: opts?.reapTimeoutMs,
     broadcast: (event) => broadcasts.push(event),
     sessionFactory: (input) => {
       spawnInputs.push(input);
@@ -601,6 +603,77 @@ test("an error result marks the worker failed and is never retried", async () =>
     assert.match(again.reason, /already failed/);
   }
   assert.equal(listWorkerAttentionItems(db, outcome.workerId).length, attentionAfterFirstStop);
+});
+
+test("a fatal turn error kills the session — failed workers never linger as live", async () => {
+  const { db, project, runtime, sessions } = await fixture();
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  const fake = sessions[0];
+  assert.ok(fake);
+  fake.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "running", "running");
+
+  // The stream does NOT end on its own — the runtime must kill the session
+  // itself, or the dead worker stays in the live map (the zombie that wedged
+  // steer and resume into mutual rejection).
+  fake.emit({
+    kind: "result",
+    payload: { subtype: "error_during_execution", isError: true, resultText: null },
+  });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "failed", "worker failed");
+
+  // Steer refuses with advice that actually works…
+  const steered = await runtime.steer(outcome.workerId, "keep going");
+  assert.equal(steered.ok, false);
+  if (!steered.ok) {
+    assert.match(steered.reason, /resume_worker/);
+  }
+  // …and resume actually works — no "still live, steer it" runaround.
+  const resumed = await runtime.resume({ project, workerId: outcome.workerId });
+  assert.ok(resumed.ok, `resume must succeed after a fatal error: ${resumed.ok ? "" : resumed.reason}`);
+  if (resumed.ok) {
+    assert.equal(resumed.worktreePath, outcome.worktreePath, "same worktree, same work");
+    assert.notEqual(resumed.workerId, outcome.workerId, "a fresh session, not resurrection");
+  }
+});
+
+test("resume reaps a dead-but-lingering session instead of rejecting", async () => {
+  const { db, project, runtime, sessions } = await fixture({ reapTimeoutMs: 50 });
+  const outcome = await runtime.spawn({ project, ...SPAWN_INPUT });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) {
+    return;
+  }
+  const fake = sessions[0];
+  assert.ok(fake);
+  fake.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "running", "running");
+
+  // A truly hung process: it ignores the runtime's kill, so the dead worker
+  // lingers in the live map with the lane held hostage — the exact state
+  // Darwin reported ("resume says live, steer says failed").
+  fake.session.stop = async () => {};
+  fake.emit({
+    kind: "result",
+    payload: { subtype: "error_during_execution", isError: true, resultText: null },
+  });
+  await waitFor(() => getWorker(db, outcome.workerId)?.status === "failed", "worker failed");
+
+  const steered = await runtime.steer(outcome.workerId, "keep going");
+  assert.equal(steered.ok, false);
+
+  // Resume must reap the zombie (bounded wait) and proceed, not bounce back.
+  const resumed = await runtime.resume({ project, workerId: outcome.workerId });
+  assert.ok(resumed.ok, `resume must reap and proceed: ${resumed.ok ? "" : resumed.reason}`);
+  if (resumed.ok) {
+    assert.equal(resumed.worktreePath, outcome.worktreePath, "same worktree, same work");
+  }
+  // The lane belongs to the successor now — exactly one active lane.
+  assert.equal(listActiveLanes(db, project.id).length, 1);
 });
 
 test("an interrupt-induced error result during stop leaves the worker stopped, not failed", async () => {
