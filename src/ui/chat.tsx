@@ -1,9 +1,17 @@
 "use client";
 
-import { memo, useEffect, useRef, useState } from "react";
+import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { ChatItem, DecisionView, QueuedMessage, RebriefView } from "./types";
+import type {
+  ChatItem,
+  DecisionView,
+  LiveTurnStatusView,
+  QueuedMessage,
+  RebriefView,
+} from "./types";
+import { localClockTime, localDate, localDateTime } from "./time";
+import { groupTurns, planSettledTurn, splitAnswerFold, type IndexedItem, type TurnGroup } from "./turns";
 
 /** Render a settled card's outcome as one scannable line. */
 function settledSummary(decision: DecisionView): string {
@@ -162,6 +170,49 @@ function DecisionPrompt({
   );
 }
 
+// Covers the 240ms ::details-content ease plus a settle tail.
+const EXPANSION_FOLLOW_MS = 420;
+
+/**
+ * While a disclosure eases open, the view rides the growth frame by frame —
+ * the scroll IS the expansion's own motion, not a second animation queued
+ * after it. Each frame nudges the scroller just enough to keep the revealed
+ * message's bottom in view (so the common last-message case lands at the
+ * chat's bottom); a message taller than the viewport pins to its top
+ * instead, and the view never yanks upward. Already-visible expansions
+ * don't move at all.
+ */
+function followExpansionIntoView(details: HTMLDetailsElement): void {
+  if (!details.open) {
+    return;
+  }
+  const scroller = details.closest(".chat-scroll");
+  if (!scroller) {
+    return;
+  }
+  const target = details.closest(".msg") ?? details;
+  const start = performance.now();
+  const frame = (now: number) => {
+    if (!details.isConnected || !details.open) {
+      return;
+    }
+    const view = scroller.getBoundingClientRect();
+    const rect = target.getBoundingClientRect();
+    if (rect.height > view.height) {
+      const toTop = rect.top - view.top;
+      if (toTop > 0) {
+        scroller.scrollTop += toTop;
+      }
+    } else if (rect.bottom > view.bottom) {
+      scroller.scrollTop += rect.bottom - view.bottom;
+    }
+    if (now - start < EXPANSION_FOLLOW_MS) {
+      requestAnimationFrame(frame);
+    }
+  };
+  requestAnimationFrame(frame);
+}
+
 /** Hover affordance on a message bubble: copy its text, flash confirmation. */
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -270,13 +321,39 @@ const ChatMessage = memo(function ChatMessage({
     );
   }
   if (item.kind === "assistant") {
+    // Answer-first fold, history only (Taan's ruling, revised 2026-07-10):
+    // a reply you just received renders in full; after a reload it collapses
+    // to its summary paragraph so scrolling back to find something is a scan,
+    // not a wall of text. Doctrine tells Darwin to write that paragraph as a
+    // self-contained summary.
+    const fold = item.folded ? splitAnswerFold(item.text) : null;
+    if (!fold || fold.rest === null) {
+      return (
+        <div className="msg assistant">
+          <div className="speaker">Darwin</div>
+          <CopyButton text={item.text} />
+          <div className="md">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.text}</ReactMarkdown>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="msg assistant">
         <div className="speaker">Darwin</div>
         <CopyButton text={item.text} />
         <div className="md">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.text}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{fold.lead}</ReactMarkdown>
         </div>
+        <details
+          className="fold"
+          onToggle={(event) => followExpansionIntoView(event.currentTarget)}
+        >
+          <summary>Details</summary>
+          <div className="md">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{fold.rest}</ReactMarkdown>
+          </div>
+        </details>
       </div>
     );
   }
@@ -341,6 +418,146 @@ const ChatMessage = memo(function ChatMessage({
     );
   }
   return <div className="msg system-note">{item.text}</div>;
+});
+
+function itemKey(entry: IndexedItem): string | number {
+  return entry.item.kind === "decision" ? entry.item.decision.decisionId : entry.index;
+}
+
+/**
+ * Darwin's prose streaming in, smoothed. The network delivers text in bursts;
+ * revealing each burst instantly reads as jarring pops. Instead the tail
+ * plays out like very fast typing: a ~30fps clock reveals a fraction of the
+ * outstanding backlog per tick (full drain in ~400ms), with a 1-char floor so
+ * a slow trickle still types steadily. Mounts fresh per streamed block (the
+ * buffer clears when a block settles), so the reveal always starts at zero.
+ */
+const DRAIN_MS = 400;
+const TICK_MS = 33;
+
+// How close to the bottom (px) still counts as "riding along" — scroll up
+// farther than this and the view stops following until you come back.
+const STICK_PX = 160;
+
+function LiveTail({ text }: { text: string }) {
+  const [count, setCount] = useState(0);
+  const textRef = useRef(text);
+  textRef.current = text;
+  const selfRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let last = performance.now();
+    const timer = setInterval(() => {
+      const now = performance.now();
+      const dt = now - last;
+      last = now;
+      setCount((current) => {
+        const backlog = textRef.current.length - current;
+        if (backlog <= 0) {
+          return current;
+        }
+        const step = Math.max(1, Math.ceil((backlog * dt) / DRAIN_MS));
+        return Math.min(textRef.current.length, current + step);
+      });
+    }, TICK_MS);
+    return () => clearInterval(timer);
+  }, []);
+
+  const shown = text.slice(0, Math.min(count, text.length));
+
+  // Ride the typing: each reveal tick nudges the scroller the few pixels the
+  // text just grew, so the view crawls smoothly with the typewriter instead
+  // of jumping per line — and only while the user is already at the bottom.
+  // Scrolling up to read stops the follow; coming back resumes it.
+  useEffect(() => {
+    const scroller = selfRef.current?.closest(".chat-scroll");
+    if (!scroller) {
+      return;
+    }
+    const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    if (distance > 0 && distance < STICK_PX) {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+  }, [shown]);
+
+  if (!shown) {
+    return null;
+  }
+  return (
+    <div className="msg assistant streaming" ref={selfRef}>
+      <div className="speaker">Darwin</div>
+      <div className="md">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{shown}</ReactMarkdown>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One conversational turn. Live (the in-flight one) renders every event
+ * chronologically as it lands; a settled turn reads as conversation — the
+ * user's message (timestamped), Darwin's reply and any first-class actions
+ * (worker spawns/steers/stops/resumes, merges, lane changes) inline, and the
+ * routine activity collapsed to one quiet "N actions" rollup at the end.
+ * Memoized: token deltas re-render only the live tail, never settled turns.
+ */
+const TurnBlock = memo(function TurnBlock({
+  group,
+  live,
+  disabled,
+  working,
+  onClearRebrief,
+  onAnswerDecision,
+  onSwitchToOpus,
+}: {
+  group: TurnGroup;
+  live: boolean;
+  disabled: boolean;
+  working: boolean;
+  onClearRebrief: (rebrief: RebriefView) => void;
+  onAnswerDecision: (
+    decisionId: string,
+    selections: string[],
+    responses: Record<string, string[]>,
+    custom: string,
+  ) => void;
+  onSwitchToOpus: (failedText: string) => void;
+}) {
+  const plan = live ? null : planSettledTurn(group.body);
+  const renderEntry = (entry: IndexedItem) => (
+    <ChatMessage
+      key={itemKey(entry)}
+      item={entry.item}
+      disabled={disabled}
+      working={working}
+      onClearRebrief={onClearRebrief}
+      onAnswerDecision={onAnswerDecision}
+      onSwitchToOpus={onSwitchToOpus}
+    />
+  );
+  return (
+    <div className="turn">
+      {group.user ? (
+        <div className="turn-row">
+          {group.at ? (
+            <span className="turn-time" title={localDateTime(group.at)}>
+              {localClockTime(group.at)}
+            </span>
+          ) : null}
+          {renderEntry(group.user)}
+        </div>
+      ) : null}
+      {(plan ? plan.inline : group.body).map(renderEntry)}
+      {plan && plan.rolledUp.length > 0 ? (
+        <details className="rollup" onToggle={(event) => followExpansionIntoView(event.currentTarget)}>
+          <summary>
+            {plan.rolledUp.length} action{plan.rolledUp.length === 1 ? "" : "s"}
+          </summary>
+          <div className="rollup-body">{plan.rolledUp.map(renderEntry)}</div>
+        </details>
+      ) : null}
+    </div>
+  );
 });
 
 /**
@@ -448,6 +665,8 @@ function Composer({
 export function Chat({
   items,
   working,
+  liveText,
+  liveStatus,
   queued,
   disabled,
   answering,
@@ -462,6 +681,10 @@ export function Chat({
 }: {
   items: ChatItem[];
   working: boolean;
+  /** Darwin's prose streaming in — the unsettled tail under the last turn. */
+  liveText: string;
+  /** What Darwin is doing right now; null when no turn is in flight. */
+  liveStatus: LiveTurnStatusView | null;
   queued: QueuedMessage[];
   disabled: boolean;
   /** A card is waiting — the composer becomes its free-text answer. */
@@ -484,31 +707,105 @@ export function Chat({
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Settles (a message lands, a chip/card appears, the turn ends) smoothly
+  // fall to the bottom and "lock in" — but only when the user is riding the
+  // bottom; a deliberate scroll-up to read is never yanked back. The live
+  // stream itself is followed by LiveTail's own per-tick crawl, not here.
+  //
+  // A fresh history load (first paint, project switch) instead PINS the
+  // bottom for a few frames: content-visibility:auto reports estimated
+  // heights for offscreen turns, so a single scroll-to-bottom targets a
+  // scrollHeight that then shifts as real heights render in — on long
+  // conversations that landed the view mid-history. The pin re-asserts the
+  // bottom each frame until it stops moving.
+  const prevCountRef = useRef(0);
+  const stickRef = useRef(true);
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+    const node = scrollRef.current;
+    if (!node) {
+      return;
+    }
+    const freshLoad = prevCountRef.current === 0 && items.length > 0;
+    prevCountRef.current = items.length;
+    if (freshLoad) {
+      let stableFrames = 0;
+      let totalFrames = 0;
+      const pin = () => {
+        const scroller = scrollRef.current;
+        if (!scroller) {
+          return;
+        }
+        const bottom = scroller.scrollHeight - scroller.clientHeight;
+        if (Math.abs(scroller.scrollTop - bottom) > 1) {
+          scroller.scrollTop = bottom;
+          stableFrames = 0;
+        } else {
+          stableFrames += 1;
+        }
+        totalFrames += 1;
+        if (stableFrames < 3 && totalFrames < 60) {
+          requestAnimationFrame(pin);
+        }
+      };
+      pin();
+      return;
+    }
+    if (items.length > 0 && stickRef.current) {
+      node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
+    }
   }, [items, working]);
+
+  // Turn grouping recomputes only when items change — token deltas and
+  // status flips leave the groups (and every settled TurnBlock) untouched.
+  const groups = useMemo(() => groupTurns(items), [items]);
 
   return (
     <section className="chat" aria-label="Darwin chat">
-      <div className="chat-scroll" ref={scrollRef}>
+      <div
+        className="chat-scroll"
+        ref={scrollRef}
+        onScroll={() => {
+          const node = scrollRef.current;
+          if (node) {
+            stickRef.current =
+              node.scrollHeight - node.scrollTop - node.clientHeight < 240;
+          }
+        }}
+      >
         {items.length === 0 && !working ? (
           <p className="empty-note">
             This is Darwin, your manager for {projectName || "this project"}. Tell him what you
             want to build — and expect questions until the specifics are pinned down.
           </p>
         ) : null}
-        {items.map((item, index) => (
-          <ChatMessage
-            key={item.kind === "decision" ? item.decision.decisionId : index}
-            item={item}
-            disabled={disabled}
-            working={working}
-            onClearRebrief={onClearRebrief}
-            onAnswerDecision={onAnswerDecision}
-            onSwitchToOpus={onSwitchToOpus}
-          />
-        ))}
-        {working ? <div className="working">Darwin is working — Esc ×3 to stop</div> : null}
+        {groups.map((group, index) => {
+          const previous = index > 0 ? groups[index - 1] : undefined;
+          const newDay =
+            group.at && previous?.at && localDate(previous.at) !== localDate(group.at);
+          return (
+            <Fragment key={group.key}>
+              {newDay && group.at ? (
+                <div className="date-divider">{localDate(group.at)}</div>
+              ) : null}
+              <TurnBlock
+                group={group}
+                live={working && index === groups.length - 1}
+                disabled={disabled}
+                working={working}
+                onClearRebrief={onClearRebrief}
+                onAnswerDecision={onAnswerDecision}
+                onSwitchToOpus={onSwitchToOpus}
+              />
+            </Fragment>
+          );
+        })}
+        {liveText ? <LiveTail text={liveText} /> : null}
+        {working ? (
+          <div className="working">
+            <span className="working-label">{liveStatus?.label ?? "Darwin is working"}</span>
+            <span className="working-hint">Esc ×3 to stop</span>
+          </div>
+        ) : null}
       </div>
       {queued.length > 0 ? (
         <div className="queue-list" aria-label="Queued messages">
