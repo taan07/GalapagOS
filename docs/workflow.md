@@ -70,3 +70,6 @@ chat-composer-as-free-text), Fable-limit → Opus model switch, lane guard.
   `git branch -vv` before assuming GitHub is current.
 - The next big fronts (per the user): the user↔Darwin chat behaviour and
   the /workers page — both have dedicated-track work ahead.
+- The sidebar trio (confidence gauge · attention queue · specifics panel)
+  is consciously PARKED untouched (2026-07-10 ruling) — it needs its own
+  rework track later; nothing ships against it until then.

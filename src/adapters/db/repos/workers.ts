@@ -163,6 +163,22 @@ export function listRecentWorkerEvents(
   ).reverse();
 }
 
+/**
+ * All events of one kind, NEWEST first. Boot re-attach scans the steer
+ * history to decide whether a hold is still in force — a release is itself a
+ * steer, but notice-steers (re-attach markers, lane amendments) are not
+ * instructions and must not read as releases, so the caller filters.
+ */
+export function listWorkerEventsOfKind(
+  db: GalapagosDb,
+  workerId: string,
+  kind: WorkerEventKind,
+): WorkerEventRow[] {
+  return db
+    .prepare("SELECT * FROM worker_events WHERE worker_id = ? AND kind = ? ORDER BY rowid DESC")
+    .all(workerId, kind) as WorkerEventRow[];
+}
+
 export function countWorkerEvents(db: GalapagosDb, workerId: string): number {
   const row = db
     .prepare("SELECT COUNT(*) AS total FROM worker_events WHERE worker_id = ?")

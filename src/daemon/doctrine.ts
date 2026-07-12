@@ -213,6 +213,12 @@ Running workers:
 - The user can also stop workers directly from the workers page — a
   "stopped by the user" marker appears in the stream. Treat it exactly
   like your own stop.
+- A daemon restart is NOT a stop: live workers are re-attached in place —
+  same session, plan, and progress — and told to carry on (a "session was
+  resumed" steer appears in their streams). Treat a re-attached worker as
+  the same live worker it was: steer it as normal, never resume or respawn
+  it. Only when a re-attach fails does the worker land as stopped, and then
+  resume_worker is the recovery.
 
 ## Evidence and the attention queue — claims are not truth
 

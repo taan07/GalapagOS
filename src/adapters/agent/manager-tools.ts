@@ -415,7 +415,7 @@ export function createManagerToolServer(context: ManagerToolContext) {
       ),
       tool(
         "resume_worker",
-        "Continue a STOPPED (or failed) worker's task: a fresh session in the SAME worktree and branch, lane re-activated, briefed from the original worker_brief record plus the worktree's current git state and your continuation note. This is the ONLY way to continue stopped work — never reuse its lane name for a new spawn.",
+        "Continue a STOPPED (or failed) worker's task: a fresh session in the SAME worktree and branch, lane re-activated, briefed from the original worker_brief record plus the worktree's current git state and your continuation note. This is the ONLY way to continue stopped work — never reuse its lane name for a new spawn. Note: daemon restarts no longer stop workers (live sessions are re-attached in place — steer those as normal); resume is for workers that genuinely ended.",
         {
           id: z.string().describe("The stopped worker's id"),
           note: z

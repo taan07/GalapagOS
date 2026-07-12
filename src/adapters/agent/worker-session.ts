@@ -45,6 +45,14 @@ export type SpawnWorkerSessionInput = {
   lane: LaneContract;
   /** Called on every guard denial — feeds the loud-denial attention pattern. */
   onToolDenied?: (tool: string) => void;
+  /**
+   * Resume an existing SDK session by id instead of starting fresh (boot
+   * re-attach after a daemon restart). Resume is cwd-keyed, so worktreePath
+   * must be the same worktree the original session ran in. The caller is
+   * responsible for verifying the session_started id matches — a silent
+   * blank session is detectable only there.
+   */
+  resume?: string | null;
 };
 
 export type WorkerSessionFactory = (input: SpawnWorkerSessionInput) => WorkerSession;
@@ -232,6 +240,7 @@ export function spawnWorkerSession(input: SpawnWorkerSessionInput): WorkerSessio
         config: input.config,
         cwd: input.worktreePath,
         permissionMode: "default",
+        resume: input.resume,
       }),
       model: input.model,
       // Reasoning depth for implementation work (user-confirmed: high).
