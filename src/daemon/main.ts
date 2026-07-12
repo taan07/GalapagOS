@@ -35,6 +35,13 @@ import { runTriageJob } from "../adapters/agent/triage";
 import { runWatchdogReview } from "../adapters/legs/watchdog";
 import { runCriticReview } from "../adapters/legs/critic";
 import { getAttentionItem, resolveAttentionItem } from "../adapters/db/repos/attention";
+import { existsSync } from "node:fs";
+import { getLane } from "../adapters/db/repos/lanes";
+import { getWorker as getWorkerRow } from "../adapters/db/repos/workers";
+import { CHECK_KEYS, latestRunsByKey } from "../adapters/db/repos/evidence";
+import { parseStatusPorcelain } from "../core/git/parsers";
+import { LocalGitCommandRunner } from "../adapters/git/runner";
+import { observeWorkspaceEvidence } from "../adapters/evidence/workspace";
 import { commitRecords } from "../adapters/git/mutating-runner";
 import { ingestVaultSpecifics } from "../adapters/records/ingest";
 import { createRecordsStore } from "../adapters/records/store";
@@ -898,6 +905,91 @@ async function handleDecisionAnswer(
   sendJson(res, 200, { ok: true });
 }
 
+// The diff patch is capped so one runaway worktree cannot flood the wire;
+// the truncation is announced, never silent.
+const WORKER_DIFF_CAP = 200_000;
+
+/**
+ * The work itself, on demand (track F): commits since the lane base, the
+ * unified diff, and the check evidence beside it — freshness computed against
+ * the worktree's LIVE key, because a passing run against a stale key is not a
+ * green check. Read-only git in the worktree the daemon owns.
+ */
+async function handleWorkerChanges(res: http.ServerResponse, workerId: string): Promise<void> {
+  const worker = getWorkerRow(db, workerId);
+  if (!worker) {
+    sendJson(res, 404, { error: `No worker with id ${workerId}.` });
+    return;
+  }
+  if (!existsSync(worker.worktree_path)) {
+    sendJson(res, 200, {
+      gone: true,
+      commits: [],
+      diff: "",
+      diffTruncated: false,
+      dirtyFiles: [],
+      checks: [],
+    });
+    return;
+  }
+  const lane = getLane(db, worker.lane_id);
+  const baseSha = lane?.base_sha ?? null;
+  const runner = new LocalGitCommandRunner();
+
+  let commits: { sha: string; subject: string }[] = [];
+  let diff = "";
+  let dirtyFiles: string[] = [];
+  if (baseSha) {
+    const [logOutput, diffOutput, porcelainOutput] = await Promise.all([
+      runner.runGit(
+        ["log", "--no-decorate", "--format=%h%x00%s", `${baseSha}..HEAD`],
+        worker.worktree_path,
+      ),
+      runner.runGit(["diff", `${baseSha}...HEAD`], worker.worktree_path),
+      runner.runGit(["status", "--porcelain=v1", "-z", "-uall"], worker.worktree_path),
+    ]);
+    commits = logOutput
+      .split("\n")
+      .filter((line) => line.includes("\0"))
+      .map((line) => {
+        const [sha = "", subject = ""] = line.split("\0");
+        return { sha, subject };
+      });
+    diff = diffOutput;
+    const status = parseStatusPorcelain(porcelainOutput);
+    dirtyFiles = [...status.stagedFiles, ...status.dirtyFiles, ...status.untrackedFiles]
+      .map((entry) => entry.path)
+      .filter(Boolean);
+  }
+  const diffTruncated = diff.length > WORKER_DIFF_CAP;
+  if (diffTruncated) {
+    diff = `${diff.slice(0, WORKER_DIFF_CAP)}\n… (diff truncated at ${WORKER_DIFF_CAP.toLocaleString()} chars — the worktree holds the real content)`;
+  }
+
+  // Check evidence with honest freshness: latest run per key, compared to the
+  // workspace's key RIGHT NOW — a passing run against a stale key is not a
+  // green check.
+  const workspace = await observeWorkspaceEvidence(worker.worktree_path);
+  const latest = latestRunsByKey(db, { projectId: worker.project_id, workerId: worker.id });
+  const checks = CHECK_KEYS.flatMap((key) => {
+    const run = latest.get(key);
+    if (!run) {
+      return [];
+    }
+    return [
+      {
+        key,
+        status: run.status,
+        summary: run.summary,
+        fresh: run.head_sha === workspace.key,
+        createdAt: run.created_at,
+      },
+    ];
+  });
+
+  sendJson(res, 200, { gone: false, commits, diff, diffTruncated, dirtyFiles, checks });
+}
+
 async function handleStopWorker(res: http.ServerResponse, workerId: string): Promise<void> {
   // The user's Stop button is the ungated escape hatch — never quality-gated.
   const outcome = await workers.stop(workerId, "the user, via the workers page", {
@@ -1051,6 +1143,13 @@ const server = http.createServer((req, res) => {
   }
   if (route === "POST /manager/decision") {
     void handleDecisionAnswer(req, res).catch((error) => {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    });
+    return;
+  }
+  const workerChanges = /^\/workers\/([^/]+)\/changes$/.exec(url.pathname);
+  if (req.method === "GET" && workerChanges?.[1]) {
+    void handleWorkerChanges(res, workerChanges[1]).catch((error) => {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     });
     return;

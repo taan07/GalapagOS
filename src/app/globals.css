@@ -1356,6 +1356,109 @@ select:focus {
   color: var(--muted);
 }
 
+/* Track F: the work itself — commits, diff, and check evidence. */
+.changes-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.changes-label {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.changes-refresh {
+  font-family: var(--mono);
+  font-size: 10px;
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 7px;
+  color: var(--faint);
+  cursor: pointer;
+}
+
+.changes-refresh:hover {
+  color: var(--fg);
+}
+
+.checks-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.check-badge {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.check-badge.check-passed {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--line));
+}
+
+.check-badge.check-failed {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+}
+
+.check-badge.check-stale {
+  color: var(--faint);
+  border-style: dashed;
+}
+
+.commit-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12.5px;
+}
+
+.dirty-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--attention);
+}
+
+.diff-pre {
+  max-height: 420px;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.steer-worker {
+  font-family: var(--mono);
+  font-size: 11px;
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 3px 9px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.steer-worker:hover {
+  color: var(--fg);
+}
+
 .claim-badge.evidence-manual {
   color: var(--attention);
   border-color: color-mix(in srgb, var(--attention) 45%, var(--line));

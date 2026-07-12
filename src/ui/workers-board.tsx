@@ -8,9 +8,11 @@ import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type {
   DaemonStreamEvent,
   ProjectConfidenceView,
+  WorkerChangesView,
   WorkerConfidenceView,
   WorkerDetailView,
   WorkerEventView,
+  WorkerGithubView,
   WorkerStepView,
   WorkerView,
 } from "./types";
@@ -212,6 +214,130 @@ const STOPPABLE: readonly WorkerView["status"][] = [
   "idle",
 ];
 
+/**
+ * The work itself (track F): commits since the lane base, the diff, and the
+ * check evidence beside it. Fetched on demand per worker; the refresh button
+ * re-reads the worktree — running workers commit continuously and a live
+ * auto-refetch per event would hammer git for nothing.
+ */
+function ChangesCard({
+  workerId,
+  github,
+  now,
+}: {
+  workerId: string;
+  github: WorkerGithubView | null;
+  now: number;
+}) {
+  const [changes, setChanges] = useState<WorkerChangesView | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [refreshToken, setRefreshToken] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFailed(false);
+    void fetch(`/api/workers/changes?workerId=${encodeURIComponent(workerId)}`, {
+      cache: "no-store",
+    })
+      .then(async (response) =>
+        response.ok ? ((await response.json()) as WorkerChangesView) : null,
+      )
+      .then((payload) => {
+        if (!cancelled) {
+          if (payload) {
+            setChanges(payload);
+          } else {
+            setFailed(true);
+          }
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFailed(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workerId, refreshToken]);
+
+  return (
+    <div className="changes-card">
+      <div className="changes-label">
+        the work
+        <button
+          className="changes-refresh"
+          onClick={() => setRefreshToken((token) => token + 1)}
+          title="Re-read the worktree: commits, diff, and check freshness"
+        >
+          refresh
+        </button>
+      </div>
+      {failed ? <p className="empty-note">Could not read the worktree.</p> : null}
+      {!failed && changes === null ? <p className="empty-note">Reading the worktree…</p> : null}
+      {changes?.gone ? (
+        <p className="empty-note">The worktree no longer exists — its branch holds the work.</p>
+      ) : null}
+      {changes && !changes.gone ? (
+        <>
+          {changes.checks.length > 0 ? (
+            <div className="checks-row">
+              {changes.checks.map((check) => (
+                <span
+                  key={check.key}
+                  className={`check-badge check-${check.status}${check.fresh ? "" : " check-stale"}`}
+                  title={`${check.summary} (${agoLabel(check.createdAt, now)})${check.fresh ? "" : " — the worktree changed since this run; re-run to trust it"}`}
+                >
+                  {check.status === "passed" ? "✓" : "✗"} {check.key}
+                  {check.fresh ? "" : " (stale)"}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <p className="empty-note">No checks have run in this worktree yet.</p>
+          )}
+          {changes.commits.length > 0 ? (
+            <ul className="commit-list">
+              {changes.commits.map((commit) => (
+                <li key={commit.sha} className="commit-row">
+                  {github ? (
+                    <a
+                      className="mono"
+                      href={`${github.webBase}/commit/${commit.sha}`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {commit.sha}
+                    </a>
+                  ) : (
+                    <span className="mono">{commit.sha}</span>
+                  )}{" "}
+                  {commit.subject}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="empty-note">No commits since the lane base yet.</p>
+          )}
+          {changes.dirtyFiles.length > 0 ? (
+            <p className="dirty-note">
+              uncommitted: <span className="mono">{changes.dirtyFiles.join("  ")}</span>
+            </p>
+          ) : null}
+          {changes.diff ? (
+            <details className="chip">
+              <summary>
+                diff vs base{changes.diffTruncated ? " (truncated)" : ""}
+              </summary>
+              <pre className="diff-pre">{changes.diff}</pre>
+            </details>
+          ) : null}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
 function Drilldown({
   detail,
   confidence,
@@ -222,6 +348,7 @@ function Drilldown({
   stopNote,
   onStop,
   onHold,
+  projectId,
 }: {
   detail: WorkerDetailView;
   confidence: WorkerConfidenceView | null;
@@ -232,6 +359,7 @@ function Drilldown({
   stopNote: string | null;
   onStop: () => void;
   onHold: () => void;
+  projectId: string | null;
 }) {
   const { worker, events, digest, attention, steps, github } = detail;
   const streamRef = useRef<HTMLDivElement>(null);
@@ -241,6 +369,21 @@ function Drilldown({
   }, [events.length]);
 
   const openAttention = attention.filter((item) => item.status === "open");
+
+  // Principle 2: even "direct" steers route through Darwin — he translates
+  // intent into an effective worker prompt. The workers page never pipes text
+  // to a worker; it prefills the chat composer (the per-project draft the
+  // composer already persists) and hands the user to the conversation.
+  const steerViaDarwin = () => {
+    if (!projectId) {
+      return;
+    }
+    const key = `galapagos.draft.${projectId}`;
+    const existing = window.localStorage.getItem(key);
+    const crafted = `About the worker on lane "${worker.laneName ?? "(unnamed)"}" (${worker.id.slice(0, 8)}): `;
+    window.localStorage.setItem(key, existing?.trim() ? `${existing}\n${crafted}` : crafted);
+    window.location.href = "/";
+  };
 
   return (
     <section className="drilldown" aria-label="Worker drilldown">
@@ -261,6 +404,14 @@ function Drilldown({
         ) : null}
         {STOPPABLE.includes(worker.status) ? (
           <span className="worker-controls">
+            <button
+              className="steer-worker"
+              onClick={steerViaDarwin}
+              disabled={!projectId}
+              title="Steer through Darwin: opens the chat with this worker named in the composer — he translates your intent into an effective worker prompt. Never a raw pipe."
+            >
+              Steer via Darwin
+            </button>
             <button
               className="hold-worker"
               onClick={onHold}
@@ -339,6 +490,8 @@ function Drilldown({
           </div>
         ) : null}
       </div>
+
+      <ChangesCard workerId={worker.id} github={github} now={now} />
 
       {openAttention.length > 0 ? (
         <div className="attention-list">
@@ -793,6 +946,7 @@ export function WorkersBoard() {
                 }
                 onStop={() => void stopWorker(detailForSelection.worker.id)}
                 onHold={() => void holdWorker(detailForSelection.worker.id)}
+                projectId={selectedProjectId}
               />
             ) : (
               <p className="empty-note pad">
