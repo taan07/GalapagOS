@@ -1431,6 +1431,10 @@ select:focus {
   font-size: 12.5px;
 }
 
+.commit-row {
+  line-height: 1.5;
+}
+
 .dirty-note {
   margin: 0;
   font-size: 12px;

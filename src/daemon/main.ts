@@ -40,6 +40,7 @@ import { getLane } from "../adapters/db/repos/lanes";
 import { getWorker as getWorkerRow } from "../adapters/db/repos/workers";
 import { CHECK_KEYS, latestRunsByKey } from "../adapters/db/repos/evidence";
 import { parseStatusPorcelain } from "../core/git/parsers";
+import { checkViewsFrom, parseCommitLog } from "../core/worker-changes";
 import { LocalGitCommandRunner } from "../adapters/git/runner";
 import { observeWorkspaceEvidence } from "../adapters/evidence/workspace";
 import { commitRecords } from "../adapters/git/mutating-runner";
@@ -938,32 +939,37 @@ async function handleWorkerChanges(res: http.ServerResponse, workerId: string): 
 
   let commits: { sha: string; subject: string }[] = [];
   let diff = "";
+  let diffTruncated = false;
   let dirtyFiles: string[] = [];
   if (baseSha) {
-    const [logOutput, diffOutput, porcelainOutput] = await Promise.all([
+    const [logOutput, porcelainOutput] = await Promise.all([
       runner.runGit(
         ["log", "--no-decorate", "--format=%h%x00%s", `${baseSha}..HEAD`],
         worker.worktree_path,
       ),
-      runner.runGit(["diff", `${baseSha}...HEAD`], worker.worktree_path),
       runner.runGit(["status", "--porcelain=v1", "-z", "-uall"], worker.worktree_path),
     ]);
-    commits = logOutput
-      .split("\n")
-      .filter((line) => line.includes("\0"))
-      .map((line) => {
-        const [sha = "", subject = ""] = line.split("\0");
-        return { sha, subject };
-      });
-    diff = diffOutput;
+    commits = parseCommitLog(logOutput);
     const status = parseStatusPorcelain(porcelainOutput);
     dirtyFiles = [...status.stagedFiles, ...status.dirtyFiles, ...status.untrackedFiles]
       .map((entry) => entry.path)
       .filter(Boolean);
-  }
-  const diffTruncated = diff.length > WORKER_DIFF_CAP;
-  if (diffTruncated) {
-    diff = `${diff.slice(0, WORKER_DIFF_CAP)}\n… (diff truncated at ${WORKER_DIFF_CAP.toLocaleString()} chars — the worktree holds the real content)`;
+    try {
+      diff = await runner.runGit(["diff", `${baseSha}...HEAD`], worker.worktree_path);
+    } catch {
+      // A patch past the runner's read buffer (~10MB) rejects outright —
+      // degrade to the diffstat instead of failing the whole card. Announced,
+      // never silent.
+      const stat = await runner
+        .runGit(["diff", "--stat", `${baseSha}...HEAD`], worker.worktree_path)
+        .catch(() => "(the diff could not be read)");
+      diff = `(patch too large to render — file summary instead)\n\n${stat}`;
+      diffTruncated = true;
+    }
+    if (diff.length > WORKER_DIFF_CAP) {
+      diff = `${diff.slice(0, WORKER_DIFF_CAP)}\n… (diff truncated at ${WORKER_DIFF_CAP.toLocaleString()} chars — the worktree holds the real content)`;
+      diffTruncated = true;
+    }
   }
 
   // Check evidence with honest freshness: latest run per key, compared to the
@@ -971,21 +977,7 @@ async function handleWorkerChanges(res: http.ServerResponse, workerId: string): 
   // green check.
   const workspace = await observeWorkspaceEvidence(worker.worktree_path);
   const latest = latestRunsByKey(db, { projectId: worker.project_id, workerId: worker.id });
-  const checks = CHECK_KEYS.flatMap((key) => {
-    const run = latest.get(key);
-    if (!run) {
-      return [];
-    }
-    return [
-      {
-        key,
-        status: run.status,
-        summary: run.summary,
-        fresh: run.head_sha === workspace.key,
-        createdAt: run.created_at,
-      },
-    ];
-  });
+  const checks = checkViewsFrom(CHECK_KEYS, latest, workspace.key);
 
   sendJson(res, 200, { gone: false, commits, diff, diffTruncated, dirtyFiles, checks });
 }
