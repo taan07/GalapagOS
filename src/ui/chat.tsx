@@ -711,21 +711,46 @@ export function Chat({
   // fall to the bottom and "lock in" — but only when the user is riding the
   // bottom; a deliberate scroll-up to read is never yanked back. The live
   // stream itself is followed by LiveTail's own per-tick crawl, not here.
-  // First paint of a history stays instant — animating from the top of a
-  // long conversation would crawl.
-  const scrolledOnceRef = useRef(false);
+  //
+  // A fresh history load (first paint, project switch) instead PINS the
+  // bottom for a few frames: content-visibility:auto reports estimated
+  // heights for offscreen turns, so a single scroll-to-bottom targets a
+  // scrollHeight that then shifts as real heights render in — on long
+  // conversations that landed the view mid-history. The pin re-asserts the
+  // bottom each frame until it stops moving.
+  const prevCountRef = useRef(0);
   const stickRef = useRef(true);
   useEffect(() => {
     const node = scrollRef.current;
     if (!node) {
       return;
     }
-    if (!scrolledOnceRef.current) {
-      scrolledOnceRef.current = items.length > 0;
-      node.scrollTo({ top: node.scrollHeight });
+    const freshLoad = prevCountRef.current === 0 && items.length > 0;
+    prevCountRef.current = items.length;
+    if (freshLoad) {
+      let stableFrames = 0;
+      let totalFrames = 0;
+      const pin = () => {
+        const scroller = scrollRef.current;
+        if (!scroller) {
+          return;
+        }
+        const bottom = scroller.scrollHeight - scroller.clientHeight;
+        if (Math.abs(scroller.scrollTop - bottom) > 1) {
+          scroller.scrollTop = bottom;
+          stableFrames = 0;
+        } else {
+          stableFrames += 1;
+        }
+        totalFrames += 1;
+        if (stableFrames < 3 && totalFrames < 60) {
+          requestAnimationFrame(pin);
+        }
+      };
+      pin();
       return;
     }
-    if (stickRef.current) {
+    if (items.length > 0 && stickRef.current) {
       node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
     }
   }, [items, working]);
