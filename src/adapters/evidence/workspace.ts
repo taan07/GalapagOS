@@ -12,7 +12,7 @@
 // content hash of every untracked file: no byte changes without the key
 // changing.
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { parseStatusPorcelain } from "../../core/git/parsers";
 import type { GitCommandRunner } from "../../core/git/types";
@@ -51,12 +51,15 @@ export async function observeWorkspaceEvidence(
   hash.update(stagedPatch);
   hash.update("\0");
   // Untracked content is invisible to git diff — hash every file's bytes so
-  // rewriting an untracked file always moves the key.
+  // rewriting an untracked file always moves the key. Reads are ASYNC: this
+  // runs on the daemon's interactive path now (the /workers changes card),
+  // and a blocking read of one fat artifact would stall every SSE stream in
+  // the process (adversarial review 2026-07-13).
   for (const entry of [...status.untrackedFiles].sort((a, b) => a.path.localeCompare(b.path))) {
     hash.update(entry.path);
     hash.update("\0");
     try {
-      hash.update(readFileSync(path.join(cwd, entry.path)));
+      hash.update(await readFile(path.join(cwd, entry.path)));
     } catch {
       hash.update("unreadable"); // deletion/permission change still moves the key
     }

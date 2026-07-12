@@ -179,6 +179,31 @@ export type WorkerGithubView = {
   fileUrls: Record<string, string>;
 };
 
+/** One commit a worker made since its lane base. */
+export type WorkerChangeCommit = { sha: string; subject: string };
+
+/** The latest run of one check, with HONEST freshness: `fresh` is true only
+ * when the run's evidence key matches the worktree's state right now — a
+ * passing run against code that has since changed is not a green check. */
+export type WorkerCheckView = {
+  key: "typecheck" | "lint" | "test" | "build";
+  status: "passed" | "failed";
+  summary: string;
+  fresh: boolean;
+  createdAt: string;
+};
+
+/** Per-worker commits + diff + check evidence, served on demand (track F). */
+export type WorkerChangesView = {
+  /** The worktree no longer exists — nothing to show, honestly. */
+  gone: boolean;
+  commits: WorkerChangeCommit[];
+  diff: string;
+  diffTruncated: boolean;
+  dirtyFiles: string[];
+  checks: WorkerCheckView[];
+};
+
 export type WorkerEventView = {
   id: string;
   kind: "assistant" | "tool_use" | "tool_result" | "result" | "error" | "steer";
