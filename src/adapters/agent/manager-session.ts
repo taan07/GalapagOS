@@ -216,6 +216,12 @@ export async function runManagerTurn(input: {
   workers?: WorkerRuntime;
   /** The daemon's decision broker — chat accept/deny and questionnaires. */
   decisions?: DecisionBroker;
+  /**
+   * A user turn the caller already persisted (before any distill-preempt
+   * wait, so a page reload or handler death cannot lose the message).
+   * Adopted instead of appending a duplicate.
+   */
+  persistedUserTurn?: ManagerTurnRow;
 }): Promise<ManagerTurnOutcome> {
   const { db, config, project, userText, emit } = input;
   const store = createRecordsStore(project.root_path, project.slug);
@@ -225,14 +231,20 @@ export async function runManagerTurn(input: {
   // Only conversation counts as lost context. System turns (re-brief markers,
   // the "re-brief cleared" note) carry no SDK state — a deliberately blanked
   // session must start blank, not trigger another records-seeded re-brief.
-  const hasHistory = listTurns(db, session.id).some((turn) => turn.role !== "system");
+  // The pre-persisted user turn is THIS turn's message, not history — counting
+  // it would make a virgin project's first message look like a lost session.
+  const hasHistory = listTurns(db, session.id).some(
+    (turn) => turn.role !== "system" && turn.id !== input.persistedUserTurn?.id,
+  );
   emit({ type: "turn_started", sessionId: session.id });
 
-  let userTurn: ManagerTurnRow = appendTurn(db, {
-    sessionId: session.id,
-    role: "user",
-    content: userText,
-  });
+  let userTurn: ManagerTurnRow =
+    input.persistedUserTurn ??
+    appendTurn(db, {
+      sessionId: session.id,
+      role: "user",
+      content: userText,
+    });
 
   let sdkSessionId: string | null = null;
   let lastPersistedTurnId: string | null = null;
