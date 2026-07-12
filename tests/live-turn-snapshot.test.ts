@@ -37,18 +37,19 @@ test("a turn's lifecycle accumulates the live tail and drops it on settle", () =
   });
 });
 
-test("turn_complete and turn_error end the snapshot — the entry must not outlive the turn", () => {
+test("turn_complete, turn_error, AND interrupted end the snapshot — the entry must not outlive the turn", () => {
   assert.equal(fold([{ type: "turn_started" }, { type: "turn_complete" }]), null);
   assert.equal(fold([{ type: "turn_started" }, { type: "turn_error" }]), null);
-});
-
-test("an interrupt erases the tail exactly as the reload would", () => {
-  const after = fold([
-    { type: "turn_started" },
-    { type: "assistant_delta", text: "half a thou" },
-    { type: "interrupted" },
-  ]);
-  assert.deepEqual(after, { status: null, text: "" });
+  // The interrupt path emits neither complete nor error (busy releases right
+  // after it) — without ending here, every interrupted turn leaked an entry.
+  assert.equal(
+    fold([
+      { type: "turn_started" },
+      { type: "assistant_delta", text: "half a thou" },
+      { type: "interrupted" },
+    ]),
+    null,
+  );
 });
 
 test("turn_started resets whatever a prior turn left behind", () => {

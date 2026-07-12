@@ -22,7 +22,11 @@ export async function GET(request: Request) {
       headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
     });
   } catch {
-    // Daemon down = certainly not mid-turn; the client falls back to idle.
+    // A daemon that is DOWN cannot be mid-turn (a restart kills the turn), so
+    // idle is honest there. A merely TRANSIENT failure while a turn is live
+    // briefly renders idle too — accepted: the next turn_status broadcast
+    // re-arms working within a tick, and erring busy would lock the composer
+    // on a genuinely dead daemon.
     return NextResponse.json({ busy: false, status: null, text: "" }, { status: 200 });
   }
 }
