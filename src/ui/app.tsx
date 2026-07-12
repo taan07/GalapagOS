@@ -934,6 +934,39 @@ export function App() {
     [postDecisionAnswer],
   );
 
+  // The manual mirror of the boundary compaction: compact NOW, re-brief on
+  // the next turn. The daemon broadcasts the confirmation note (deduped by
+  // text in the /events handler), so success needs no local echo.
+  const handleRebriefNow = useCallback(async () => {
+    if (!selectedId) {
+      return;
+    }
+    const response = await fetch("/api/manager/rebrief/now", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: selectedId }),
+    });
+    const payload = (await response.json().catch(() => ({}))) as {
+      error?: string;
+      note?: string;
+    };
+    if (!response.ok) {
+      setItems((current) => [
+        ...current,
+        { kind: "note", text: payload.error ?? `Re-brief failed (${response.status}).`, at: now() },
+      ]);
+      return;
+    }
+    if (payload.note) {
+      const text = payload.note;
+      setItems((current) =>
+        current.some((item) => item.kind === "note" && item.text === text)
+          ? current
+          : [...current, { kind: "note", text, at: now() }],
+      );
+    }
+  }, [selectedId]);
+
   const handleClearRebrief = useCallback(
     async (rebrief: RebriefView) => {
       if (!selectedId || !rebrief.turnId) {
@@ -987,6 +1020,15 @@ export function App() {
             <a className="nav-link" href={`/records?projectId=${encodeURIComponent(selected.id)}`}>
               Records
             </a>
+            <button
+              type="button"
+              className="nav-link"
+              disabled={working || daemonDown}
+              title="Compact Darwin's context now and re-brief him from the committed records on his next turn — the manual mirror of the automatic boundary compaction."
+              onClick={handleRebriefNow}
+            >
+              Re-brief
+            </button>
           </>
         ) : null}
         {projects.length > 0 ? (

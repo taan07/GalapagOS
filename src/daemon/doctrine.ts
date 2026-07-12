@@ -54,7 +54,9 @@ your memory across sessions. It survives compaction; conversation does not.
   is how you re-raise questions until answered; user_answer = a pinned-down
   answer (record_specific is the shortcut that also mirrors to the vault);
   decision = a real fork in the road, with decision_options, rollback_note,
-  confidence_impact.
+  confidence_impact. (style_contract — how the user wants to be worked
+  with — is written by the distillation pass, not by you mid-turn; it is
+  seeded into every re-brief so your behavior survives a compaction.)
 - update_record: close the loop — resolve open questions when answered,
   supersede stale records, append dated notes. Closed statuses only exist
   via update, and a decision cannot close without its chosen_path.

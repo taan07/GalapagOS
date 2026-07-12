@@ -22,6 +22,7 @@ import {
   compactSession,
   getOrCreateActiveSession,
   getTurn,
+  listTurns,
   updateTurnContent,
 } from "../adapters/db/repos/manager";
 import { createDecisionBroker } from "../adapters/agent/decisions";
@@ -270,6 +271,49 @@ async function ingestProjectVault(project: ProjectRow): Promise<void> {
   }
 }
 
+const COMPACTED_NOTE =
+  "Darwin's context was compacted at a clean boundary — he re-briefs himself from the committed records (plus the live thread tail and worker fleet) on his next turn.";
+
+/**
+ * The proactive re-brief trigger (principle 7): when a completed turn ran its
+ * context past the configured fill AND the distill pass that followed
+ * COMPLETED (an aborted pass marks nothing — its records are not written, so
+ * the transcript is not yet redundant), compact the session at that boundary.
+ * The next turn's pre-flight composes the re-brief at use-time freshness.
+ * Skipped whenever the session moved on: a live turn owns it (unless the
+ * caller still holds busy itself), or it is no longer the active session.
+ */
+function compactAtBoundaryIfPressured(input: {
+  projectId: string;
+  sessionId: string;
+  contextFill: number | null;
+  distillRan: boolean;
+  /** The autonomous turn holds busy through its own distill — its boundary is still quiet. */
+  callerHoldsBusy?: boolean;
+}): void {
+  if (!input.distillRan || input.contextFill === null) {
+    return;
+  }
+  if (input.contextFill < config.rebriefFillThreshold) {
+    return;
+  }
+  if (!input.callerHoldsBusy && busyProjects.has(input.projectId)) {
+    // A new turn is already running on this session — compacting under it
+    // would strand its turns on a retired session. The next completed
+    // boundary catches the pressure.
+    return;
+  }
+  const active = getOrCreateActiveSession(db, input.projectId);
+  if (active.id !== input.sessionId) {
+    return;
+  }
+  compactSession(db, input.projectId, input.sessionId);
+  broadcast({ type: "manager_note", projectId: input.projectId, text: COMPACTED_NOTE });
+  console.log(
+    `[manager] proactive compaction for ${input.projectId} at ${Math.round(input.contextFill * 100)}% context fill`,
+  );
+}
+
 async function handleManagerMessage(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -397,6 +441,14 @@ async function handleManagerMessage(
             : {}),
           ...(distill.error ? { error: distill.error } : {}),
         });
+        // The completed distillation boundary — the one moment the transcript
+        // is redundant by design. Compact here when the turn ran hot.
+        compactAtBoundaryIfPressured({
+          projectId,
+          sessionId: outcome.sessionId,
+          contextFill: outcome.contextFill,
+          distillRan: distill.ran,
+        });
       })();
       // Register the guard (swallowed copy — a distill failure must not
       // reject the next turn's wait) BEFORE releasing the busy flag, so
@@ -513,13 +565,22 @@ async function wakeManagerForLaneViolation(notice: LaneViolationNotice): Promise
     if (outcome.completed || outcome.interrupted) {
       const distillController = new AbortController();
       activeTurnControllers.set(project.id, distillController);
-      await runDistillJob({
+      const distill = await runDistillJob({
         db,
         config,
         project,
         sessionId: outcome.sessionId,
         sdkSessionId: outcome.sdkSessionId,
         abortController: distillController,
+      });
+      // Autonomous turns hit the same completed-distill boundary; busy is
+      // still ours here, so the session is provably quiet.
+      compactAtBoundaryIfPressured({
+        projectId: project.id,
+        sessionId: outcome.sessionId,
+        contextFill: outcome.contextFill,
+        distillRan: distill.ran,
+        callerHoldsBusy: true,
       });
     }
   } catch (error) {
@@ -572,6 +633,47 @@ async function handleInterrupt(
  * starts from a truly blank session (records stay on disk; Darwin only knows
  * them again if he reads them with his tools).
  */
+/**
+ * The manual mirror of the boundary trigger: the user asks for a fresh,
+ * records-seeded context NOW. Route-only, like clear-rebrief — Darwin never
+ * calls this; the compaction happens between turns and the next turn's
+ * pre-flight composes the re-brief.
+ */
+async function handleRebriefNow(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const body = await readBody(req);
+  const projectId = asString(body.projectId);
+  if (!projectId) {
+    sendJson(res, 400, { error: "projectId is required." });
+    return;
+  }
+  const project = getProject(db, projectId);
+  if (!project) {
+    sendJson(res, 404, { error: `Unknown project: ${projectId}` });
+    return;
+  }
+  if (busyProjects.has(projectId)) {
+    sendJson(res, 409, { error: "Darwin is mid-turn — wait for it to finish before re-briefing." });
+    return;
+  }
+  const session = getOrCreateActiveSession(db, projectId);
+  const hasConversation = listTurns(db, session.id).some((turn) => turn.role !== "system");
+  if (!hasConversation && session.seeded_from_records_at) {
+    // Already a virgin records-seeded session: compacting again would just
+    // churn rows for an identical outcome.
+    sendJson(res, 200, {
+      compacted: false,
+      note: "Darwin's context is already fresh — the next turn re-briefs from records.",
+    });
+    return;
+  }
+  compactSession(db, projectId, session.id);
+  broadcast({ type: "manager_note", projectId, text: COMPACTED_NOTE });
+  sendJson(res, 200, { compacted: true });
+}
+
 async function handleClearRebrief(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -898,6 +1000,12 @@ const server = http.createServer((req, res) => {
   }
   if (route === "POST /manager/interrupt") {
     void handleInterrupt(req, res).catch((error) => {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    });
+    return;
+  }
+  if (route === "POST /manager/rebrief/now") {
+    void handleRebriefNow(req, res).catch((error) => {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     });
     return;
