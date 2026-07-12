@@ -286,12 +286,13 @@ export type DaemonStreamEvent =
   | { type: "manager_note"; projectId: string; text: string }
   /** A worker's plan/steps changed — re-fetch its checklist (ids only). */
   | { type: "worker_plan"; projectId: string; workerId: string }
-  /** A decision card fired somewhere (any turn, any tab): drives the
-   * needs-you cue and lets non-initiating tabs render the card. */
-  | ({ projectId: string } & Extract<
-      ManagerStreamEvent,
-      { type: "decision_request" } | { type: "decision_settled" }
-    >);
+  /** Every turn event now rides the broadcast wrapped with its project
+   * (turn-attach): decision cards drive the needs-you cue in every tab, and
+   * the full lifecycle (turn_started … turn_complete) lets a tab that loaded
+   * mid-turn re-attach to the living turn instead of orphaning. The tab that
+   * owns the initiating POST stream ignores this traffic — its own stream is
+   * authoritative. */
+  | ({ projectId: string } & ManagerStreamEvent);
 
 /** One durable record as served by /api/records — every field attributed. */
 export type RecordView = {

@@ -39,6 +39,11 @@ import { ingestVaultSpecifics } from "../adapters/records/ingest";
 import { createRecordsStore } from "../adapters/records/store";
 import { chooseFolder, revealFolder } from "../adapters/system/dialogs";
 import { createMonitor } from "./monitor";
+import {
+  EMPTY_LIVE_SNAPSHOT,
+  updateLiveSnapshot,
+  type LiveTurnSnapshot,
+} from "./live-turn-snapshot";
 
 const db = openDb(config.stateDir);
 // The only module-level state: live SSE clients, per-project busy flags, the
@@ -64,6 +69,11 @@ const managerModelOverrides = new Map<string, string>();
 // already frozen, so we hold the latest stray here and wake Darwin the instant
 // the turn lock frees — never forking his session.
 const pendingLaneWakes = new Map<string, LaneViolationNotice>();
+// What an in-flight turn looks like RIGHT NOW, per project — so a client that
+// loads mid-turn (reload, second tab) can arm working=true and render the
+// live tail it never streamed. Served by GET /manager/live, gated on the busy
+// flag there, so a stale entry is never rendered.
+const liveTurnSnapshots = new Map<string, LiveTurnSnapshot>();
 const workers = createWorkerRuntime({
   db,
   config,
@@ -159,6 +169,47 @@ function broadcast(event: unknown): void {
   for (const client of eventClients) {
     sseWrite(client, event);
   }
+}
+
+/** Everything a turn writes to the wire: turn events plus the distill note. */
+type OutboundTurnEvent =
+  | ManagerTurnEvent
+  | {
+      type: "distilled";
+      recordsWritten: number;
+      committed: boolean;
+      commitSkippedReason?: string;
+      error?: string;
+    };
+
+/**
+ * The one way turn events leave the daemon: down the initiating POST stream
+ * (when there is one — autonomous turns have none) AND onto /events wrapped
+ * with the projectId, folding the live snapshot along the way. Full parity on
+ * the broadcast is the point of turn-attach: a tab that loads mid-turn
+ * (reload, second window) re-attaches from /events instead of orphaning, and
+ * the attached tab dedupes by ignoring /events turn traffic while its own
+ * POST stream is live.
+ */
+function makeTurnEmit(
+  projectId: string,
+  sink?: http.ServerResponse,
+): (event: OutboundTurnEvent) => void {
+  return (event) => {
+    if (sink) {
+      sseWrite(sink, event);
+    }
+    const next = updateLiveSnapshot(
+      liveTurnSnapshots.get(projectId) ?? EMPTY_LIVE_SNAPSHOT,
+      event,
+    );
+    if (next === null) {
+      liveTurnSnapshots.delete(projectId);
+    } else {
+      liveTurnSnapshots.set(projectId, next);
+    }
+    broadcast({ ...event, projectId });
+  };
 }
 
 async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
@@ -270,20 +321,13 @@ async function handleManagerMessage(
     activeTurnControllers.set(projectId, controller);
   };
   startSse(res);
-  const emit = (event: ManagerTurnEvent) => {
-    sseWrite(res, event);
-    // Decision cards ride the daemon broadcast too: the needs-you cue (tab
-    // badge + notification) must fire even when the asking turn's stream
-    // belongs to a tab the user isn't looking at.
-    if (
-      event.type === "turn_complete" ||
-      event.type === "turn_error" ||
-      event.type === "decision_request" ||
-      event.type === "decision_settled"
-    ) {
-      broadcast({ ...event, projectId });
-    }
-  };
+  const emit = makeTurnEmit(projectId, res);
+  // A reload during the pre-turn distill gate must already read as working:
+  // the snapshot exists from the first instant the busy flag does.
+  liveTurnSnapshots.set(projectId, {
+    status: { status: "thinking", label: "Thinking" },
+    text: "",
+  });
 
   try {
     // Persist the message BEFORE any wait: until 2026-07-10 it lived only in
@@ -301,7 +345,7 @@ async function handleManagerMessage(
     // "Darwin takes forever to respond" delay (avg 31s, max 90s measured).
     const pendingDistill = distillsInFlight.get(projectId);
     if (pendingDistill) {
-      sseWrite(res, {
+      emit({
         type: "turn_status",
         status: "thinking",
         label: "Setting aside the last turn's paperwork…",
@@ -344,7 +388,7 @@ async function handleManagerMessage(
           sdkSessionId: outcome.sdkSessionId,
           abortController: distillController,
         });
-        sseWrite(res, {
+        emit({
           type: "distilled",
           recordsWritten: distill.recordsWritten,
           committed: distill.commit.status === "committed",
@@ -374,7 +418,9 @@ async function handleManagerMessage(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    sseWrite(res, {
+    // Through emit, not sseWrite: a re-attached tab (no POST stream) must
+    // learn the turn died too, or its composer never unlocks.
+    emit({
       type: "turn_error",
       message,
       limitReached: isUsageLimitError(message),
@@ -427,6 +473,12 @@ async function wakeManagerForLaneViolation(notice: LaneViolationNotice): Promise
   }
 
   busyProjects.add(project.id);
+  // Autonomous turns arm the same mid-turn surface as user turns: a tab that
+  // loads while Darwin course-corrects sees him working, not a dead page.
+  liveTurnSnapshots.set(project.id, {
+    status: { status: "thinking", label: "Thinking" },
+    text: "",
+  });
   broadcast({ type: "manager_note", projectId: project.id, text: noteText });
   try {
     // Respect the fork invariant: never start a turn while the previous turn's
@@ -450,18 +502,10 @@ async function wakeManagerForLaneViolation(notice: LaneViolationNotice): Promise
       config: effectiveConfig,
       project,
       userText: seed,
-      emit: (event) => {
-        // Autonomous turns have no chat stream — the broadcast is the ONLY
-        // path a decision card (e.g. the amend_lane gate) reaches the user.
-        if (
-          event.type === "turn_complete" ||
-          event.type === "turn_error" ||
-          event.type === "decision_request" ||
-          event.type === "decision_settled"
-        ) {
-          broadcast({ ...event, projectId: project.id });
-        }
-      },
+      // Autonomous turns have no chat stream — the /events broadcast is the
+      // ONLY path anything (decision cards, live status, prose) reaches the
+      // user. Full parity with user turns via the shared emit.
+      emit: makeTurnEmit(project.id),
       abortController: turnController,
       workers,
       decisions,
@@ -485,6 +529,9 @@ async function wakeManagerForLaneViolation(notice: LaneViolationNotice): Promise
   } finally {
     activeTurnControllers.delete(project.id);
     busyProjects.delete(project.id);
+    // No user POST turn can own this project's snapshot while autonomous busy
+    // was held, so dropping it here can never clobber a successor's.
+    liveTurnSnapshots.delete(project.id);
     // Another worker may have strayed during this turn — drain it.
     drainPendingLaneWake(project.id);
   }
@@ -865,6 +912,20 @@ const server = http.createServer((req, res) => {
     void handleManagerMessage(req, res).catch((error) => {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     });
+    return;
+  }
+  if (route === "GET /manager/live") {
+    // What a client loading MID-TURN needs to re-attach: the busy flag and
+    // the live tail its POST-less page never streamed. Snapshot only served
+    // while busy, so a stale entry is never rendered as a ghost turn.
+    const projectId = url.searchParams.get("projectId");
+    if (!projectId) {
+      sendJson(res, 400, { error: "projectId is required." });
+      return;
+    }
+    const busy = busyProjects.has(projectId);
+    const snapshot = busy ? liveTurnSnapshots.get(projectId) ?? EMPTY_LIVE_SNAPSHOT : EMPTY_LIVE_SNAPSHOT;
+    sendJson(res, 200, { busy, status: snapshot.status, text: snapshot.text });
     return;
   }
   if (route === "POST /workers") {

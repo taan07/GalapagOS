@@ -18,6 +18,7 @@ import type {
 } from "./types";
 import { AttentionQueue } from "./attention-queue";
 import { Chat } from "./chat";
+import { loadQueue, saveQueue } from "./queue-store";
 import { createNeedsYouCue } from "./needs-you";
 import { ConfidenceGauge } from "./confidence";
 import { AddProjectForm, ProjectPicker } from "./project-picker";
@@ -116,6 +117,18 @@ export function App() {
   const queueRef = useRef<QueuedMessage[]>([]);
   const selectedIdRef = useRef<string | null>(null);
   selectedIdRef.current = selectedId;
+  // The POST stream is authoritative while attached: the tab that owns an
+  // in-flight /manager/message stream ignores /events turn traffic (it sees
+  // the same events firsthand); only a tab WITHOUT a live POST stream — a
+  // reload mid-turn, a second window — consumes the broadcast copies.
+  // A COUNT, not a boolean: turn N's stream stays open through its post-turn
+  // distill while turn N+1 already streams (the drain path), and the earliest
+  // finally must not disarm the gate under the later turn.
+  const postStreamCountRef = useRef(0);
+  // Turn events from /events are held off until this project's history has
+  // loaded — applying a broadcast onto an empty item list would be wiped by
+  // the history fetch resolving a moment later.
+  const historyLoadedForRef = useRef<string | null>(null);
 
   const now = () => new Date().toISOString();
 
@@ -209,12 +222,16 @@ export function App() {
       return;
     }
     setItems([]);
-    setQueued([]);
-    queueRef.current = [];
     setLiveText("");
     setLiveStatus(null);
     setAttention(null);
     setConfidence(null);
+    historyLoadedForRef.current = null;
+    // The queue survives reloads and project hops (turn-attach): same
+    // per-project localStorage contract as the composer draft.
+    queueRef.current = loadQueue(window.localStorage, selectedId);
+    setQueued([...queueRef.current]);
+    setWorking(false);
     void (async () => {
       const response = await fetch(
         `/api/manager/history?projectId=${encodeURIComponent(selectedId)}`,
@@ -223,6 +240,30 @@ export function App() {
       if (response.ok) {
         const payload = (await response.json()) as { turns: TurnView[] };
         setItems(turnsToChatItems(payload.turns));
+      }
+      historyLoadedForRef.current = selectedId;
+      // Re-attach to a turn already in flight: the daemon's live snapshot
+      // arms working=true and seeds the tail this page never streamed. From
+      // here /events carries the rest of the turn.
+      try {
+        const live = await fetch(
+          `/api/manager/live?projectId=${encodeURIComponent(selectedId)}`,
+          { cache: "no-store" },
+        );
+        if (live.ok && selectedIdRef.current === selectedId) {
+          const payload = (await live.json()) as {
+            busy: boolean;
+            status: LiveTurnStatusView | null;
+            text: string;
+          };
+          if (payload.busy) {
+            setWorking(true);
+            setLiveStatus(payload.status ?? { status: "thinking", label: "Thinking" });
+            setLiveText(payload.text);
+          }
+        }
+      } catch {
+        // Daemon unreachable — the health poll surfaces it; load stays idle.
       }
       await refreshSpecifics(selectedId);
       await refreshAttention(selectedId);
@@ -235,6 +276,26 @@ export function App() {
   // re-pull the queue, and triage's escalated questions land in the chat.
   useEffect(() => {
     const source = new EventSource("/api/events");
+    // SSE has no replay: a turn_complete broadcast during a reconnect gap is
+    // gone for good, and a tab relying on it (the busyElsewhere path) would
+    // stay locked forever. Every (re)open re-syncs working from the daemon's
+    // live state — skipped while a POST stream is attached (it is the truth).
+    source.onopen = () => {
+      const projectId = selectedIdRef.current;
+      if (!projectId || postStreamCountRef.current > 0) {
+        return;
+      }
+      void fetch(`/api/manager/live?projectId=${encodeURIComponent(projectId)}`, {
+        cache: "no-store",
+      })
+        .then((live) => (live.ok ? (live.json() as Promise<{ busy: boolean }>) : null))
+        .then((payload) => {
+          if (payload && !payload.busy && selectedIdRef.current === projectId) {
+            setWorking(false);
+          }
+        })
+        .catch(() => {});
+    };
     source.onmessage = (message) => {
       let event: DaemonStreamEvent;
       try {
@@ -306,10 +367,116 @@ export function App() {
               : item,
           ),
         );
+      } else if (
+        event.type === "turn_started" ||
+        event.type === "turn_status" ||
+        event.type === "assistant_delta" ||
+        event.type === "assistant_text" ||
+        event.type === "tool_use" ||
+        event.type === "rebrief" ||
+        event.type === "interrupted" ||
+        event.type === "distilled" ||
+        event.type === "turn_complete" ||
+        event.type === "turn_error"
+      ) {
+        // The re-attach path (turn-attach): a tab WITHOUT the initiating POST
+        // stream follows the living turn from the broadcast. The initiating
+        // tab drops these — its own stream already delivered them — and
+        // nothing applies until history has loaded, or the fetch resolving
+        // would wipe what we appended.
+        if (postStreamCountRef.current > 0 || historyLoadedForRef.current !== projectId) {
+          return;
+        }
+        if (event.type === "turn_started") {
+          setWorking(true);
+          setLiveText("");
+          setLiveStatus({ status: "thinking", label: "Thinking" });
+        } else if (event.type === "turn_status") {
+          setWorking(true);
+          setLiveStatus({
+            status: event.status,
+            label: event.label,
+            ...(event.tool ? { tool: event.tool } : {}),
+          });
+        } else if (event.type === "assistant_delta") {
+          setLiveText((current) => current + event.text);
+        } else if (event.type === "assistant_text") {
+          const text = event.text;
+          setLiveText("");
+          // The same settled block may already be in the items when the
+          // history fetch raced the broadcast — content-match the tail
+          // instead of trusting order.
+          setItems((current) =>
+            current
+              .slice(-5)
+              .some((item) => item.kind === "assistant" && item.text === text)
+              ? current
+              : [...current, { kind: "assistant", text, at: now() }],
+          );
+        } else if (event.type === "tool_use") {
+          // Same fetch-races-broadcast straddle as assistant_text: a chip
+          // persisted before the history DB-read whose broadcast lands after
+          // the load would double-render without a content match on the tail.
+          const chip = { tool: event.tool, summary: event.summary, detail: event.detail };
+          setItems((current) =>
+            current
+              .slice(-5)
+              .some(
+                (item) =>
+                  item.kind === "chip" &&
+                  item.chip.tool === chip.tool &&
+                  item.chip.summary === chip.summary &&
+                  item.chip.detail === chip.detail,
+              )
+              ? current
+              : [...current, { kind: "chip", chip, at: now() }],
+          );
+          if (event.tool === "record_specific") {
+            void refreshSpecifics(projectId);
+          }
+        } else if (event.type === "rebrief") {
+          setLiveText("");
+          setItems((current) => [
+            ...current,
+            {
+              kind: "rebrief",
+              at: now(),
+              rebrief: {
+                turnId: event.turnId,
+                reason: event.reason,
+                preamble: event.preamble,
+                cleared: false,
+              },
+            },
+          ]);
+        } else if (event.type === "interrupted") {
+          setLiveText("");
+          setLiveStatus(null);
+          setItems((current) => [...current, { kind: "note", text: event.message, at: now() }]);
+        } else if (event.type === "distilled") {
+          if (event.recordsWritten > 0 || event.commitSkippedReason || event.error) {
+            void refreshSpecifics(projectId);
+          }
+        } else if (event.type === "turn_complete") {
+          setWorking(false);
+          setLiveStatus(null);
+          setLiveText("");
+        } else if (event.type === "turn_error") {
+          // No failedText here (the message belongs to whichever context sent
+          // it), so the limit-retry card stays with the initiating tab; a
+          // re-attached tab gets the honest note and an unlocked composer.
+          setWorking(false);
+          setLiveStatus(null);
+          setLiveText("");
+          setItems((current) => [
+            ...current,
+            { kind: "note", text: `Turn failed: ${event.message}`, at: now() },
+          ]);
+        }
       }
     };
     return () => source.close();
-  }, [refreshAttention, refreshConfidence]);
+  }, [refreshAttention, refreshConfidence, refreshSpecifics]);
 
   // The needs-you cue: a pending card + an unfocused tab = tab-title flash,
   // favicon badge, and a macOS notification (permission asked lazily). The
@@ -331,11 +498,18 @@ export function App() {
     async (
       projectId: string,
       text: string,
-      options?: { model?: string; echoUser?: boolean },
+      options?: { model?: string; echoUser?: boolean; requeueAtHead?: boolean },
     ): Promise<void> => {
       setWorking(true);
       setLiveText("");
       setLiveStatus({ status: "thinking", label: "Thinking" });
+      // While this fetch streams, /events turn traffic is a duplicate feed —
+      // armed before the request so the first broadcast can never race it.
+      postStreamCountRef.current += 1;
+      // A 409 hands the turn lock to someone else (another tab, an autonomous
+      // turn): the message queues instead of dying, and `working` must stay
+      // armed past the finally — /events drives it from here.
+      let busyElsewhere = false;
       // The Opus retry doesn't re-echo the user bubble — the failed message is
       // already on screen above the limit note.
       if (options?.echoUser !== false) {
@@ -353,7 +527,60 @@ export function App() {
         });
 
         if (!response.ok || !response.body) {
-          const payload = (await response.json().catch(() => ({}))) as { error?: string };
+          const payload = (await response.json().catch(() => ({}))) as {
+            error?: string;
+            busy?: boolean;
+          };
+          if (response.status === 409 && payload.busy) {
+            // Darwin is mid-turn (a re-attached page raced the drain, or a
+            // second tab owns the turn): queue the message instead of
+            // rendering a dead error note. The optimistic bubble comes back
+            // when the queue drains and the send re-echoes it.
+            busyElsewhere = true;
+            const queuedMessage = { id: crypto.randomUUID(), text };
+            if (options?.requeueAtHead) {
+              // A drained message that bounced goes back to the FRONT — it
+              // was the head of the queue; re-queuing it behind later
+              // messages would violate FIFO on contention.
+              queueRef.current.unshift(queuedMessage);
+            } else {
+              queueRef.current.push(queuedMessage);
+            }
+            saveQueue(window.localStorage, projectId, queueRef.current);
+            setQueued([...queueRef.current]);
+            // The unlock normally arrives as a /events turn_complete — but a
+            // 409 can land in the daemon's tiny post-complete window where
+            // busy is still held and THAT event was already consumed by our
+            // own POST stream. One delayed live-state check heals the stuck
+            // case; if busy is genuinely held, /events keeps driving.
+            setTimeout(() => {
+              if (selectedIdRef.current !== projectId || postStreamCountRef.current > 0) {
+                return;
+              }
+              void fetch(`/api/manager/live?projectId=${encodeURIComponent(projectId)}`, {
+                cache: "no-store",
+              })
+                .then((live) => (live.ok ? (live.json() as Promise<{ busy: boolean }>) : null))
+                .then((payload) => {
+                  if (payload && !payload.busy && selectedIdRef.current === projectId) {
+                    setWorking(false);
+                  }
+                })
+                .catch(() => {});
+            }, 2000);
+            if (options?.echoUser !== false) {
+              setItems((current) => {
+                for (let i = current.length - 1; i >= 0; i--) {
+                  const item = current[i];
+                  if (item && item.kind === "user" && item.text === text) {
+                    return [...current.slice(0, i), ...current.slice(i + 1)];
+                  }
+                }
+                return current;
+              });
+            }
+            return;
+          }
           setItems((current) => [
             ...current,
             { kind: "note", text: payload.error ?? `Send failed (${response.status}).` },
@@ -537,9 +764,12 @@ export function App() {
           },
         ]);
       } finally {
-        setWorking(false);
-        setLiveStatus(null);
-        setLiveText("");
+        postStreamCountRef.current -= 1;
+        if (!busyElsewhere) {
+          setWorking(false);
+          setLiveStatus(null);
+          setLiveText("");
+        }
       }
     },
     [refreshSpecifics],
@@ -572,17 +802,21 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [working, selectedId]);
 
-  // Drain the queue whenever Darwin finishes a turn.
+  // Drain the queue whenever Darwin finishes a turn — and on load, when a
+  // reload restored a persisted queue against an idle daemon. `queued` in the
+  // deps is what makes the on-load drain fire; a drain that races a turn
+  // someone else started comes back as a 409 and re-queues.
   useEffect(() => {
-    if (working || !selectedId) {
+    if (working || !selectedId || queueRef.current.length === 0) {
       return;
     }
     const next = queueRef.current.shift();
+    saveQueue(window.localStorage, selectedId, queueRef.current);
     setQueued([...queueRef.current]);
     if (next) {
-      void sendNow(selectedId, next.text);
+      void sendNow(selectedId, next.text, { requeueAtHead: true });
     }
-  }, [working, selectedId, sendNow]);
+  }, [working, selectedId, sendNow, queued]);
 
   // Steering a queued message: bump it to the head of the queue and interrupt
   // the in-flight turn. The interrupt ends the turn → `working` flips false →
@@ -598,6 +832,9 @@ export function App() {
       if (steered) {
         queueRef.current.unshift(steered);
       }
+      if (selectedId) {
+        saveQueue(window.localStorage, selectedId, queueRef.current);
+      }
       setQueued([...queueRef.current]);
       if (working && selectedId) {
         void fetch("/api/manager/interrupt", {
@@ -610,10 +847,16 @@ export function App() {
     [working, selectedId],
   );
 
-  const handleQueueRemove = useCallback((id: string) => {
-    queueRef.current = queueRef.current.filter((message) => message.id !== id);
-    setQueued([...queueRef.current]);
-  }, []);
+  const handleQueueRemove = useCallback(
+    (id: string) => {
+      queueRef.current = queueRef.current.filter((message) => message.id !== id);
+      if (selectedId) {
+        saveQueue(window.localStorage, selectedId, queueRef.current);
+      }
+      setQueued([...queueRef.current]);
+    },
+    [selectedId],
+  );
 
   // "Change to Opus": switch this project's manager model and re-send the
   // message that hit Fable's limit. The daemon remembers the switch, so every
@@ -670,6 +913,7 @@ export function App() {
       }
       if (working) {
         queueRef.current.push({ id: crypto.randomUUID(), text });
+        saveQueue(window.localStorage, selectedId, queueRef.current);
         setQueued([...queueRef.current]);
         return;
       }
