@@ -18,6 +18,7 @@ import type {
 } from "./types";
 import { AttentionQueue } from "./attention-queue";
 import { Chat } from "./chat";
+import { loadQueue, saveQueue } from "./queue-store";
 import { createNeedsYouCue } from "./needs-you";
 import { ConfidenceGauge } from "./confidence";
 import { AddProjectForm, ProjectPicker } from "./project-picker";
@@ -116,6 +117,15 @@ export function App() {
   const queueRef = useRef<QueuedMessage[]>([]);
   const selectedIdRef = useRef<string | null>(null);
   selectedIdRef.current = selectedId;
+  // The POST stream is authoritative while attached: the tab that owns the
+  // in-flight /manager/message stream ignores /events turn traffic (it sees
+  // the same events firsthand); only a tab WITHOUT a live POST stream — a
+  // reload mid-turn, a second window — consumes the broadcast copies.
+  const postStreamActiveRef = useRef(false);
+  // Turn events from /events are held off until this project's history has
+  // loaded — applying a broadcast onto an empty item list would be wiped by
+  // the history fetch resolving a moment later.
+  const historyLoadedForRef = useRef<string | null>(null);
 
   const now = () => new Date().toISOString();
 
@@ -209,12 +219,16 @@ export function App() {
       return;
     }
     setItems([]);
-    setQueued([]);
-    queueRef.current = [];
     setLiveText("");
     setLiveStatus(null);
     setAttention(null);
     setConfidence(null);
+    historyLoadedForRef.current = null;
+    // The queue survives reloads and project hops (turn-attach): same
+    // per-project localStorage contract as the composer draft.
+    queueRef.current = loadQueue(window.localStorage, selectedId);
+    setQueued([...queueRef.current]);
+    setWorking(false);
     void (async () => {
       const response = await fetch(
         `/api/manager/history?projectId=${encodeURIComponent(selectedId)}`,
@@ -223,6 +237,30 @@ export function App() {
       if (response.ok) {
         const payload = (await response.json()) as { turns: TurnView[] };
         setItems(turnsToChatItems(payload.turns));
+      }
+      historyLoadedForRef.current = selectedId;
+      // Re-attach to a turn already in flight: the daemon's live snapshot
+      // arms working=true and seeds the tail this page never streamed. From
+      // here /events carries the rest of the turn.
+      try {
+        const live = await fetch(
+          `/api/manager/live?projectId=${encodeURIComponent(selectedId)}`,
+          { cache: "no-store" },
+        );
+        if (live.ok && selectedIdRef.current === selectedId) {
+          const payload = (await live.json()) as {
+            busy: boolean;
+            status: LiveTurnStatusView | null;
+            text: string;
+          };
+          if (payload.busy) {
+            setWorking(true);
+            setLiveStatus(payload.status ?? { status: "thinking", label: "Thinking" });
+            setLiveText(payload.text);
+          }
+        }
+      } catch {
+        // Daemon unreachable — the health poll surfaces it; load stays idle.
       }
       await refreshSpecifics(selectedId);
       await refreshAttention(selectedId);
@@ -306,10 +344,107 @@ export function App() {
               : item,
           ),
         );
+      } else if (
+        event.type === "turn_started" ||
+        event.type === "turn_status" ||
+        event.type === "assistant_delta" ||
+        event.type === "assistant_text" ||
+        event.type === "tool_use" ||
+        event.type === "rebrief" ||
+        event.type === "interrupted" ||
+        event.type === "distilled" ||
+        event.type === "turn_complete" ||
+        event.type === "turn_error"
+      ) {
+        // The re-attach path (turn-attach): a tab WITHOUT the initiating POST
+        // stream follows the living turn from the broadcast. The initiating
+        // tab drops these — its own stream already delivered them — and
+        // nothing applies until history has loaded, or the fetch resolving
+        // would wipe what we appended.
+        if (postStreamActiveRef.current || historyLoadedForRef.current !== projectId) {
+          return;
+        }
+        if (event.type === "turn_started") {
+          setWorking(true);
+          setLiveText("");
+          setLiveStatus({ status: "thinking", label: "Thinking" });
+        } else if (event.type === "turn_status") {
+          setWorking(true);
+          setLiveStatus({
+            status: event.status,
+            label: event.label,
+            ...(event.tool ? { tool: event.tool } : {}),
+          });
+        } else if (event.type === "assistant_delta") {
+          setLiveText((current) => current + event.text);
+        } else if (event.type === "assistant_text") {
+          const text = event.text;
+          setLiveText("");
+          // The same settled block may already be in the items when the
+          // history fetch raced the broadcast — content-match the tail
+          // instead of trusting order.
+          setItems((current) =>
+            current
+              .slice(-5)
+              .some((item) => item.kind === "assistant" && item.text === text)
+              ? current
+              : [...current, { kind: "assistant", text, at: now() }],
+          );
+        } else if (event.type === "tool_use") {
+          setItems((current) => [
+            ...current,
+            {
+              kind: "chip",
+              chip: { tool: event.tool, summary: event.summary, detail: event.detail },
+              at: now(),
+            },
+          ]);
+          if (event.tool === "record_specific") {
+            void refreshSpecifics(projectId);
+          }
+        } else if (event.type === "rebrief") {
+          setLiveText("");
+          setItems((current) => [
+            ...current,
+            {
+              kind: "rebrief",
+              at: now(),
+              rebrief: {
+                turnId: event.turnId,
+                reason: event.reason,
+                preamble: event.preamble,
+                cleared: false,
+              },
+            },
+          ]);
+        } else if (event.type === "interrupted") {
+          setLiveText("");
+          setLiveStatus(null);
+          setItems((current) => [...current, { kind: "note", text: event.message, at: now() }]);
+        } else if (event.type === "distilled") {
+          if (event.recordsWritten > 0 || event.commitSkippedReason || event.error) {
+            void refreshSpecifics(projectId);
+          }
+        } else if (event.type === "turn_complete") {
+          setWorking(false);
+          setLiveStatus(null);
+          setLiveText("");
+        } else if (event.type === "turn_error") {
+          // No failedText here (the message belongs to whichever context sent
+          // it), so the limit-retry card stays with the initiating tab; a
+          // re-attached tab gets the honest note and an unlocked composer.
+          setWorking(false);
+          setLiveStatus(null);
+          setLiveText("");
+          setItems((current) => [
+            ...current,
+            { kind: "note", text: `Turn failed: ${event.message}`, at: now() },
+          ]);
+        }
       }
     };
     return () => source.close();
-  }, [refreshAttention, refreshConfidence]);
+  }, [refreshAttention, refreshConfidence, refreshSpecifics]);
 
   // The needs-you cue: a pending card + an unfocused tab = tab-title flash,
   // favicon badge, and a macOS notification (permission asked lazily). The
@@ -336,6 +471,13 @@ export function App() {
       setWorking(true);
       setLiveText("");
       setLiveStatus({ status: "thinking", label: "Thinking" });
+      // While this fetch streams, /events turn traffic is a duplicate feed —
+      // armed before the request so the first broadcast can never race it.
+      postStreamActiveRef.current = true;
+      // A 409 hands the turn lock to someone else (another tab, an autonomous
+      // turn): the message queues instead of dying, and `working` must stay
+      // armed past the finally — /events drives it from here.
+      let busyElsewhere = false;
       // The Opus retry doesn't re-echo the user bubble — the failed message is
       // already on screen above the limit note.
       if (options?.echoUser !== false) {
@@ -353,7 +495,33 @@ export function App() {
         });
 
         if (!response.ok || !response.body) {
-          const payload = (await response.json().catch(() => ({}))) as { error?: string };
+          const payload = (await response.json().catch(() => ({}))) as {
+            error?: string;
+            busy?: boolean;
+          };
+          if (response.status === 409 && payload.busy) {
+            // Darwin is mid-turn (a re-attached page raced the drain, or a
+            // second tab owns the turn): queue the message instead of
+            // rendering a dead error note. The optimistic bubble comes back
+            // when the queue drains and the send re-echoes it.
+            busyElsewhere = true;
+            const queuedMessage = { id: crypto.randomUUID(), text };
+            queueRef.current.push(queuedMessage);
+            saveQueue(window.localStorage, projectId, queueRef.current);
+            setQueued([...queueRef.current]);
+            if (options?.echoUser !== false) {
+              setItems((current) => {
+                for (let i = current.length - 1; i >= 0; i--) {
+                  const item = current[i];
+                  if (item && item.kind === "user" && item.text === text) {
+                    return [...current.slice(0, i), ...current.slice(i + 1)];
+                  }
+                }
+                return current;
+              });
+            }
+            return;
+          }
           setItems((current) => [
             ...current,
             { kind: "note", text: payload.error ?? `Send failed (${response.status}).` },
@@ -537,9 +705,12 @@ export function App() {
           },
         ]);
       } finally {
-        setWorking(false);
-        setLiveStatus(null);
-        setLiveText("");
+        postStreamActiveRef.current = false;
+        if (!busyElsewhere) {
+          setWorking(false);
+          setLiveStatus(null);
+          setLiveText("");
+        }
       }
     },
     [refreshSpecifics],
@@ -572,17 +743,21 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [working, selectedId]);
 
-  // Drain the queue whenever Darwin finishes a turn.
+  // Drain the queue whenever Darwin finishes a turn — and on load, when a
+  // reload restored a persisted queue against an idle daemon. `queued` in the
+  // deps is what makes the on-load drain fire; a drain that races a turn
+  // someone else started comes back as a 409 and re-queues.
   useEffect(() => {
-    if (working || !selectedId) {
+    if (working || !selectedId || queueRef.current.length === 0) {
       return;
     }
     const next = queueRef.current.shift();
+    saveQueue(window.localStorage, selectedId, queueRef.current);
     setQueued([...queueRef.current]);
     if (next) {
       void sendNow(selectedId, next.text);
     }
-  }, [working, selectedId, sendNow]);
+  }, [working, selectedId, sendNow, queued]);
 
   // Steering a queued message: bump it to the head of the queue and interrupt
   // the in-flight turn. The interrupt ends the turn → `working` flips false →
@@ -598,6 +773,9 @@ export function App() {
       if (steered) {
         queueRef.current.unshift(steered);
       }
+      if (selectedId) {
+        saveQueue(window.localStorage, selectedId, queueRef.current);
+      }
       setQueued([...queueRef.current]);
       if (working && selectedId) {
         void fetch("/api/manager/interrupt", {
@@ -610,10 +788,16 @@ export function App() {
     [working, selectedId],
   );
 
-  const handleQueueRemove = useCallback((id: string) => {
-    queueRef.current = queueRef.current.filter((message) => message.id !== id);
-    setQueued([...queueRef.current]);
-  }, []);
+  const handleQueueRemove = useCallback(
+    (id: string) => {
+      queueRef.current = queueRef.current.filter((message) => message.id !== id);
+      if (selectedId) {
+        saveQueue(window.localStorage, selectedId, queueRef.current);
+      }
+      setQueued([...queueRef.current]);
+    },
+    [selectedId],
+  );
 
   // "Change to Opus": switch this project's manager model and re-send the
   // message that hit Fable's limit. The daemon remembers the switch, so every
@@ -670,6 +854,7 @@ export function App() {
       }
       if (working) {
         queueRef.current.push({ id: crypto.randomUUID(), text });
+        saveQueue(window.localStorage, selectedId, queueRef.current);
         setQueued([...queueRef.current]);
         return;
       }
