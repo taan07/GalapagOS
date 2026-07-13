@@ -75,6 +75,13 @@ export type ManagerToolContext = {
    * flow back through Darwin. Wired only for triage sessions.
    */
   escalateToUser?: (question: string, context: string) => { attentionId: string };
+  /**
+   * The sign-off hook (track C): fired when update_record moves an
+   * implementation_plan to "approved" — the signature that ends Interview
+   * mode. The daemon flips the persisted autonomy stop here; absent in
+   * contexts without modes (distill forks, triage).
+   */
+  onPlanApproved?: () => void;
   onToolEvent?: (event: { tool: string; summary: string; detail: string }) => void;
 };
 
@@ -361,6 +368,14 @@ export function createManagerToolServer(context: ManagerToolContext) {
               ...(chosen_path !== undefined ? { chosenPath: chosen_path } : {}),
             });
             emit("update_record", `updated ${doc.type} ${doc.id} → ${doc.status}`, renderFullRecord(doc));
+            if (doc.type === "implementation_plan" && doc.status === "approved") {
+              // The formal sign-off (track C): an approved plan is the
+              // signature that ends Interview mode.
+              context.onPlanApproved?.();
+              return text(
+                `Updated ${doc.type} ${doc.id}: status approved. The plan is SIGNED — Interview mode has ended and the project is back in Default mode; building may begin.`,
+              );
+            }
             return text(`Updated ${doc.type} ${doc.id}: status ${doc.status}.`);
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);

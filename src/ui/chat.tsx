@@ -4,6 +4,7 @@ import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
+  AutonomyModeView,
   ChatItem,
   DecisionView,
   LiveTurnStatusView,
@@ -569,12 +570,28 @@ const TurnBlock = memo(function TurnBlock({
  * The free-text answer to a pending card arrives here too (2026-07-08 ruling):
  * `onSend` routes it to the waiting decision instead of starting a new turn.
  */
+const MODE_LABELS: Record<AutonomyModeView, string> = {
+  interview: "Interview/Plan",
+  default: "Default",
+  auto: "Auto",
+};
+
+const MODE_HINTS: Record<AutonomyModeView, string> = {
+  interview:
+    "Clarity phase: Darwin interrogates and plans; starting new workers is off. He proposes the formal sign-off when the plan is ready — signing it returns to Default. Shift+Tab cycles.",
+  default:
+    "Balanced: Darwin acts on what is clearly agreed and asks about the rest. Shift+Tab cycles.",
+  auto: "Long leash over workers: Darwin spawns, steers, and retires freely. Ambiguity still interrupts; main and direction calls still need your yes. Shift+Tab cycles.",
+};
+
 function Composer({
   projectId,
   disabled,
   answering,
   working,
   queued,
+  mode,
+  onCycleMode,
   onSend,
 }: {
   projectId: string | null;
@@ -582,6 +599,8 @@ function Composer({
   answering: boolean;
   working: boolean;
   queued: QueuedMessage[];
+  mode: AutonomyModeView;
+  onCycleMode: () => void;
   onSend: (text: string) => void;
 }) {
   const storageKey = projectId ? `galapagos.draft.${projectId}` : null;
@@ -645,6 +664,15 @@ function Composer({
         }}
       />
       <div className="compose-row">
+        <button
+          type="button"
+          className={`mode-pill mode-${mode}`}
+          onClick={onCycleMode}
+          disabled={disabled}
+          title={MODE_HINTS[mode]}
+        >
+          {MODE_LABELS[mode]} <span className="mode-key">⇧⇥</span>
+        </button>
         {answering ? (
           <span className="hint">Your message answers the question above.</span>
         ) : queued.length > 0 ? (
@@ -678,6 +706,8 @@ export function Chat({
   onClearRebrief,
   onAnswerDecision,
   onSwitchToOpus,
+  mode,
+  onCycleMode,
 }: {
   items: ChatItem[];
   working: boolean;
@@ -704,6 +734,9 @@ export function Chat({
     custom: string,
   ) => void;
   onSwitchToOpus: (failedText: string) => void;
+  /** The project's autonomy stop; the composer pill renders and cycles it. */
+  mode: AutonomyModeView;
+  onCycleMode: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -839,6 +872,8 @@ export function Chat({
         answering={answering}
         working={working}
         queued={queued}
+        mode={mode}
+        onCycleMode={onCycleMode}
         onSend={onSend}
       />
     </section>

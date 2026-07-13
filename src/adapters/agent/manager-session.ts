@@ -1,5 +1,6 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { GalapagosConfig } from "../../config";
+import { deniedToolsForMode, type AutonomyMode } from "../../core/autonomy";
 import { contextFillFromModelUsage } from "../../core/context-fill";
 import { oneLine } from "../../core/text";
 import { buildRebrief, type RebriefRecord } from "../../core/records/rebrief";
@@ -333,9 +334,21 @@ export async function runManagerTurn(input: {
    * Adopted instead of appending a duplicate.
    */
   persistedUserTurn?: ManagerTurnRow;
+  /** The project's autonomy stop for THIS turn; omitted = the middle stop. */
+  mode?: AutonomyMode;
+  /** Fired when update_record signs an implementation_plan (Interview exit). */
+  onPlanApproved?: () => void;
 }): Promise<ManagerTurnOutcome> {
   const { db, config, project, userText, emit } = input;
   const store = createRecordsStore(project.root_path, project.slug);
+  const mode: AutonomyMode = input.mode ?? "default";
+  // Structural mode gating: Interview/Plan removes the start-new-work tools
+  // outright — doctrine is the soft gate, the allowlist is the hard one.
+  const deniedForMode = deniedToolsForMode(mode);
+  const allowedTools =
+    deniedForMode.length === 0
+      ? MANAGER_ALLOWED_TOOLS
+      : MANAGER_ALLOWED_TOOLS.filter((toolName) => !deniedForMode.includes(toolName));
 
   let session = getOrCreateActiveSession(db, project.id);
   let resumeId = latestSdkSessionId(db, session.id);
@@ -487,6 +500,7 @@ export async function runManagerTurn(input: {
     ...(askUser ? { askUser } : {}),
     ...(askBatch ? { askBatch } : {}),
     ...(askConfirm ? { askConfirm } : {}),
+    ...(input.onPlanApproved ? { onPlanApproved: input.onPlanApproved } : {}),
     onToolEvent: (event) => {
       const turn = appendTurn(db, {
         sessionId: session.id,
@@ -547,9 +561,10 @@ export async function runManagerTurn(input: {
           projectName: project.name,
           projectRoot: project.root_path,
           projectSlug: project.slug,
+          mode,
         }),
         mcpServers: { galapagos: toolServer },
-        allowedTools: MANAGER_ALLOWED_TOOLS,
+        allowedTools,
         maxTurns: 25,
         // Live turn: raw stream events ride along so the UI can show what
         // Darwin is doing and stream his prose token by token.

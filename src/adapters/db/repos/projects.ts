@@ -4,6 +4,7 @@ import path from "node:path";
 import type { GalapagosDb } from "../db";
 import { nowIso } from "../db";
 import { initGitRepo, isGitRepo } from "../../git/init";
+import { isAutonomyMode, type AutonomyMode } from "../../../core/autonomy";
 
 export type ProjectRow = {
   id: string;
@@ -11,7 +12,22 @@ export type ProjectRow = {
   slug: string;
   root_path: string;
   created_at: string;
+  /** The Shift+Tab autonomy stop — persisted; a restart never moves it. */
+  autonomy_mode: AutonomyMode;
 };
+
+/** A row's mode, defensively: an unknown value reads as the middle stop. */
+export function projectAutonomyMode(row: { autonomy_mode?: unknown }): AutonomyMode {
+  return isAutonomyMode(row.autonomy_mode) ? row.autonomy_mode : "default";
+}
+
+export function setProjectAutonomyMode(
+  db: GalapagosDb,
+  id: string,
+  mode: AutonomyMode,
+): void {
+  db.prepare("UPDATE projects SET autonomy_mode = ? WHERE id = ?").run(mode, id);
+}
 
 export type RegisterProjectInput = {
   rootPath: string;
@@ -76,9 +92,12 @@ export async function registerProject(
     slug,
     root_path: rootPath,
     created_at: nowIso(),
+    // Every project starts at the middle stop; the column default covers
+    // pre-migration rows the same way.
+    autonomy_mode: "default",
   };
   db.prepare(
-    "INSERT INTO projects (id, name, slug, root_path, created_at) VALUES (@id, @name, @slug, @root_path, @created_at)",
+    "INSERT INTO projects (id, name, slug, root_path, created_at, autonomy_mode) VALUES (@id, @name, @slug, @root_path, @created_at, @autonomy_mode)",
   ).run(row);
   return row;
 }

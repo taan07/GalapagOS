@@ -64,6 +64,12 @@ export type MonitorDeps = {
    * tick the single authority on "done".
    */
   retireWorker: (workerId: string, reason: string) => Promise<void>;
+  /**
+   * Fired right after a completion passes the quality gate and its worker is
+   * auto-retired — the narrator hook (track C). Must be fire-and-forget: the
+   * monitor tick makes zero LLM calls and never waits on one.
+   */
+  onDigestReviewed?: (input: { projectId: string; workerId: string }) => void;
   broadcast?: (event: MonitorBroadcast) => void;
   now?: () => Date;
 };
@@ -446,6 +452,10 @@ export function createMonitor(deps: MonitorDeps) {
             `[monitor] auto-retire failed for ${worker.id}: ${error instanceof Error ? error.message : String(error)}`,
           );
         }
+        // The narrator (principle 1): a VERIFIED completion is the moment
+        // worth a daemon-initiated manager turn — Darwin debriefs the user
+        // in conversation. Fire-and-forget; the tick stays LLM-free.
+        deps.onDigestReviewed?.({ projectId: project.id, workerId: worker.id });
       }
     }
     return changed;

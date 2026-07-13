@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   AttentionView,
+  AutonomyModeView,
   ChatItem,
   DaemonStreamEvent,
   DecisionView,
@@ -301,6 +302,21 @@ export function App() {
       try {
         event = JSON.parse(message.data as string) as DaemonStreamEvent;
       } catch {
+        return;
+      }
+      // Mode flips update the projects list for WHICHEVER project changed —
+      // handled before the selected-project filter so switching back never
+      // shows a stale pill.
+      if (event.type === "autonomy_mode") {
+        setProjects((current) =>
+          current
+            ? current.map((project) =>
+                project.id === event.projectId
+                  ? { ...project, autonomy_mode: event.mode }
+                  : project,
+              )
+            : current,
+        );
         return;
       }
       const projectId = selectedIdRef.current;
@@ -775,6 +791,50 @@ export function App() {
     [refreshSpecifics],
   );
 
+  // The Shift+Tab autonomy axis: cycle the persisted per-project stop. The
+  // daemon owns the truth (doctrine + tool allowlist change server-side); the
+  // pill updates optimistically and the broadcast reconciles every tab.
+  const autonomyMode: AutonomyModeView = selected?.autonomy_mode ?? "default";
+  const handleCycleMode = useCallback(() => {
+    const projectId = selectedIdRef.current;
+    if (!projectId || daemonDown) {
+      return;
+    }
+    const current =
+      projects?.find((project) => project.id === projectId)?.autonomy_mode ?? "default";
+    const next: AutonomyModeView =
+      current === "interview" ? "default" : current === "default" ? "auto" : "interview";
+    setProjects((existing) =>
+      existing
+        ? existing.map((project) =>
+            project.id === projectId ? { ...project, autonomy_mode: next } : project,
+          )
+        : existing,
+    );
+    void fetch("/api/manager/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId, mode: next }),
+    }).then((response) => {
+      if (!response.ok) {
+        // The daemon refused (or is down): re-pull the truth, never render a
+        // mode Darwin isn't actually in.
+        void refreshProjects();
+      }
+    });
+  }, [projects, daemonDown, refreshProjects]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Tab" && event.shiftKey) {
+        event.preventDefault();
+        handleCycleMode();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [handleCycleMode]);
+
   // Triple-Esc within ~a second force-interrupts the in-flight turn, so a
   // queued message gets through without waiting Darwin out.
   const escPressesRef = useRef<number[]>([]);
@@ -1075,6 +1135,8 @@ export function App() {
             onClearRebrief={handleClearRebrief}
             onAnswerDecision={handleAnswerDecision}
             onSwitchToOpus={handleSwitchToOpus}
+            mode={autonomyMode}
+            onCycleMode={handleCycleMode}
           />
           <div className="side-stack">
             {confidence ? (
