@@ -46,15 +46,17 @@ export function saveQueue(
   projectId: string,
   queue: QueuedMessage[],
 ): void {
-  if (queue.length === 0) {
+  // Attachments stay in memory only: base64 image bytes would blow the
+  // localStorage quota. A reload keeps the queued text; chips are
+  // re-pasteable. An attachments-ONLY message has no durable payload at all —
+  // persisting its empty shell would reload into a phantom 400 send (review
+  // finding), so it drops from the persisted queue entirely.
+  const durable = queue
+    .map(({ id, text }) => ({ id, text }))
+    .filter((entry) => entry.text.trim().length > 0);
+  if (durable.length === 0) {
     storage.removeItem(queueStorageKey(projectId));
     return;
   }
-  // Attachments stay in memory only: base64 image bytes would blow the
-  // localStorage quota. A reload keeps the queued text; chips are
-  // re-pasteable.
-  storage.setItem(
-    queueStorageKey(projectId),
-    JSON.stringify(queue.map(({ id, text }) => ({ id, text }))),
-  );
+  storage.setItem(queueStorageKey(projectId), JSON.stringify(durable));
 }
