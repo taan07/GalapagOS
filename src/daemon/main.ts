@@ -773,7 +773,7 @@ async function wakeManagerForDecisionAnswer(
     `SYSTEM — escalated question answered.\n\n` +
     `While you were between turns, triage asked the user:\n${answer.question}\n\n` +
     `The user's answer:\n${answer.outcomeText}\n\n` +
-    `The backing attention item (${answer.attentionId}) is already resolved. Act on the answer now — steer or hold workers as it directs, record the durable outcome (user_answer or update_record where it belongs), and acknowledge the answer to the user in your reply, answer-first.`;
+    `The backing attention item (${answer.attentionId}) is still OPEN and now carries this answer. Act on it now — steer or hold workers as it directs, record the durable outcome (user_answer or update_record where it belongs) — then resolve_attention ${answer.attentionId} with what you did, and acknowledge the answer to the user in your reply, answer-first.`;
   await runAutonomousManagerTurn({ project, seed, noteText, logTag: "triage-answer" });
 }
 

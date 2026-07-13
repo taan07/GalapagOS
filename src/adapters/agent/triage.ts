@@ -14,7 +14,7 @@ import type { GalapagosDb } from "../db/db";
 import {
   createAttentionItem,
   listOpenAttentionItems,
-  resolveAttentionItem,
+  updateAttentionDetail,
   type AttentionItemRow,
 } from "../db/repos/attention";
 import { listUnreviewedDigests, type CompletionDigestRow } from "../db/repos/digests";
@@ -70,8 +70,12 @@ Management by exception, in order of preference:
    resolve_attention with what you did.
 2. Escalate with ask_user ONLY for: failures you cannot fix, contradicted
    claims, and genuine direction calls. Always include what you checked and
-   your recommendation. Mark the related completion escalated via
-   review_completion when there is one.
+   your recommendation — and ALWAYS give 2-4 clickable options (lead with
+   your recommendation). Your question renders as a card the user clicks;
+   an options-less card can only be answered by typing, and when several
+   cards stack only the newest gets the composer — options keep every card
+   answerable. Mark the related completion escalated via review_completion
+   when there is one.
 3. Dismiss (resolve_attention, resolution=dismissed) only items that are
    plainly noise — and say why.
 
@@ -322,16 +326,23 @@ export function createAskUserBridge(input: {
         custom: answered?.custom ?? "",
       });
       if (settled.status === "answered") {
-        resolveAttentionItem(
+        // The durable anchor is NOT released here (review finding: the wake
+        // is in-memory, and closing the item first strands the answer if a
+        // restart or busy-queue loss eats the wake). Instead the answer is
+        // folded INTO the open item — whoever picks it up (Darwin's pickup
+        // turn, or triage re-raising it after a lost wake) acts on the
+        // answer instead of re-asking. Darwin resolves the item himself once
+        // he has actually acted, exactly like every other attention item.
+        const outcomeText = describeOutcome(settled);
+        updateAttentionDetail(
           input.db,
           item.id,
-          "resolved",
-          "Answered via the triage card in chat.",
+          `${fullQuestion}\n\nANSWERED by the user via the chat card:\n${outcomeText}\n\nAwaiting Darwin's pickup — act on the answer, then resolve this item.`,
         );
         input.broadcast?.({ type: "attention_changed", projectId: input.project.id });
         input.onAnswered?.({
           question: fullQuestion,
-          outcomeText: describeOutcome(settled),
+          outcomeText,
           attentionId: item.id,
         });
       }

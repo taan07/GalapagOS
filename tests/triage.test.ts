@@ -199,7 +199,10 @@ test("with a broker, an escalation is a REAL pending card — persisted, broadca
   assert.equal(answers.length, 0, "the bridge never waits");
 
   // The user answers: the turn stamps settled, decision_settled broadcasts,
-  // the attention item resolves, and the answer callback fires for the wake.
+  // and the answer callback fires for the wake — but the durable attention
+  // item stays OPEN, now CARRYING the answer. The wake is in-memory; closing
+  // the item first would strand the answer if a restart ate the wake (review
+  // finding). Darwin resolves it himself once he has acted.
   const answered = decisions.answer(String(payload.decisionId), {
     selections: ["PromptPay"],
     responses: {},
@@ -214,7 +217,10 @@ test("with a broker, an escalation is a REAL pending card — persisted, broadca
   assert.equal(settled.status, "answered");
   assert.deepEqual(settled.selections, ["PromptPay"]);
   assert.ok(events.some((event) => event.type === "decision_settled"));
-  assert.equal(listOpenAttentionItems(db, project.id).length, 0, "answered = resolved");
+  const open = listOpenAttentionItems(db, project.id);
+  assert.equal(open.length, 1, "the durable anchor survives until Darwin acts");
+  assert.match(open[0]?.detail ?? "", /ANSWERED by the user via the chat card/);
+  assert.match(open[0]?.detail ?? "", /PromptPay/);
   assert.equal(answers.length, 1);
   assert.match(answers[0]?.outcomeText ?? "", /PromptPay/);
   assert.equal(answers[0]?.attentionId, attentionId);

@@ -100,6 +100,20 @@ export function getAttentionItem(db: GalapagosDb, id: string): AttentionItemRow 
     | undefined;
 }
 
+/**
+ * Rewrite an OPEN item's detail in place — track E uses this to fold the
+ * user's card answer INTO the durable question item, so a lost wake self-heals:
+ * the open item now carries the answer, and whoever picks it up (Darwin's
+ * pickup turn, or triage re-raising it) acts on the answer instead of
+ * re-asking the user.
+ */
+export function updateAttentionDetail(db: GalapagosDb, id: string, detail: string): void {
+  db.prepare("UPDATE attention_items SET detail = ? WHERE id = ? AND status = 'open'").run(
+    detail,
+    id,
+  );
+}
+
 export function resolveAttentionItem(
   db: GalapagosDb,
   id: string,
