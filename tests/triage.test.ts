@@ -24,6 +24,7 @@ import {
   createAskUserBridge,
   TRIAGE_ALLOWED_TOOLS,
 } from "../src/adapters/agent/triage";
+import { createDecisionBroker } from "../src/adapters/agent/decisions";
 
 function fixtureRepo(): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), "glp-triage-repo-"));
@@ -115,7 +116,7 @@ test("buildTriageSeed carries the batch, worker confidence, and claim-vs-evidenc
   assert.match(seed, /No test run exists/);
 });
 
-test("createAskUserBridge lands the question in chat AND on the queue, and broadcasts", async () => {
+test("createAskUserBridge without a broker keeps the legacy note path", async () => {
   const { db, project } = await fixture();
   const events: unknown[] = [];
   const bridge = createAskUserBridge({
@@ -148,6 +149,108 @@ test("createAskUserBridge lands the question in chat AND on the queue, and broad
 
   assert.ok(events.some((event) => (event as { type: string }).type === "manager_note"));
   assert.ok(events.some((event) => (event as { type: string }).type === "attention_changed"));
+});
+
+test("with a broker, an escalation is a REAL pending card — persisted, broadcast, never awaited", async () => {
+  const { db, project } = await fixture();
+  const events: { type: string; [key: string]: unknown }[] = [];
+  const answers: { question: string; outcomeText: string; attentionId: string }[] = [];
+  const decisions = createDecisionBroker();
+  const bridge = createAskUserBridge({
+    db,
+    project,
+    decisions,
+    broadcast: (event) => events.push(event as { type: string }),
+    onAnswered: (answer) => answers.push(answer),
+  });
+
+  const { attentionId } = bridge(
+    "Stripe or PromptPay first?",
+    "Recommendation: PromptPay.",
+    [
+      { label: "PromptPay", implication: "Launch-market default — e.g. TH QR checkout day one." },
+      { label: "Stripe", implication: "Cards first — e.g. international buyers before local." },
+    ],
+    false,
+  );
+
+  // The durable half is unchanged: the queue records the question.
+  const items = listOpenAttentionItems(db, project.id);
+  assert.equal(items[0]?.id, attentionId);
+
+  // The chat surface: a PENDING decision turn, byte-compatible with live
+  // cards (reload rendering + the boot sweep both key on this shape).
+  const session = getOrCreateActiveSession(db, project.id);
+  const cardTurn = listTurns(db, session.id).find((turn) => turn.role === "system");
+  assert.ok(cardTurn);
+  const payload = JSON.parse(cardTurn.content) as Record<string, unknown>;
+  assert.equal(payload.kind, "decision");
+  assert.equal(payload.status, "pending");
+  assert.match(String(payload.question), /Stripe or PromptPay first\?/);
+  assert.equal((payload.options as unknown[]).length, 2);
+
+  // The broadcast: a decision_request with the card's decisionId, plus the
+  // queue ping — and NO dead manager_note.
+  const request = events.find((event) => event.type === "decision_request");
+  assert.ok(request);
+  assert.equal(request.decisionId, payload.decisionId);
+  assert.ok(events.some((event) => event.type === "attention_changed"));
+  assert.ok(!events.some((event) => event.type === "manager_note"));
+  assert.equal(answers.length, 0, "the bridge never waits");
+
+  // The user answers: the turn stamps settled, decision_settled broadcasts,
+  // the attention item resolves, and the answer callback fires for the wake.
+  const answered = decisions.answer(String(payload.decisionId), {
+    selections: ["PromptPay"],
+    responses: {},
+    custom: "",
+  });
+  assert.ok(answered);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const settled = JSON.parse(
+    listTurns(db, session.id).find((turn) => turn.id === cardTurn.id)?.content ?? "{}",
+  ) as Record<string, unknown>;
+  assert.equal(settled.status, "answered");
+  assert.deepEqual(settled.selections, ["PromptPay"]);
+  assert.ok(events.some((event) => event.type === "decision_settled"));
+  assert.equal(listOpenAttentionItems(db, project.id).length, 0, "answered = resolved");
+  assert.equal(answers.length, 1);
+  assert.match(answers[0]?.outcomeText ?? "", /PromptPay/);
+  assert.equal(answers[0]?.attentionId, attentionId);
+});
+
+test("a timed-out card stamps honestly and leaves the attention item OPEN", async () => {
+  const { db, project } = await fixture();
+  const answers: unknown[] = [];
+  const decisions = createDecisionBroker();
+  const bridge = createAskUserBridge({
+    db,
+    project,
+    decisions,
+    onAnswered: (answer) => answers.push(answer),
+    cardTimeoutMs: 25,
+  });
+  bridge("Ship tonight?", "", [], false);
+
+  const session = getOrCreateActiveSession(db, project.id);
+  const cardTurn = listTurns(db, session.id).find((turn) => turn.role === "system");
+  assert.ok(cardTurn);
+  assert.equal((JSON.parse(cardTurn.content) as { status: string }).status, "pending");
+
+  // A real broker timeout (injected short for the test; production is 10min).
+  await new Promise((resolve) => setTimeout(resolve, 80));
+
+  const settled = JSON.parse(
+    listTurns(db, session.id).find((turn) => turn.id === cardTurn.id)?.content ?? "{}",
+  ) as Record<string, unknown>;
+  assert.equal(settled.status, "timeout");
+  assert.equal(
+    listOpenAttentionItems(db, project.id).length,
+    1,
+    "a non-answer keeps the question owed — the queue re-raises it",
+  );
+  assert.equal(answers.length, 0, "no wake without an answer");
 });
 
 test("triage's tool surface is non-destructive: pause and escalate, never stop (2026-07-10 ruling)", () => {

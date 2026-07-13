@@ -85,6 +85,12 @@ const pendingLaneWakes = new Map<string, LaneViolationNotice>();
 // Completions that passed the quality gate while Darwin was mid-turn: each
 // queues for its own narrated debrief when the lock frees (track C).
 const pendingCompletionWakes = new Map<string, string[]>();
+// Triage-card answers that landed while Darwin was mid-turn (track E): each
+// queues for its own pickup turn when the lock frees.
+const pendingAnswerWakes = new Map<
+  string,
+  { question: string; outcomeText: string; attentionId: string }[]
+>();
 // What an in-flight turn looks like RIGHT NOW, per project — so a client that
 // loads mid-turn (reload, second tab) can arm working=true and render the
 // live tail it never streamed. Served by GET /manager/live, gated on the busy
@@ -141,6 +147,12 @@ const monitor = createMonitor({
       project,
       workers,
       broadcast: (event) => broadcast(event),
+      // Track E: escalations become real cards, and an answered card wakes
+      // Darwin so the answer is acted on now, not parked behind the queue.
+      decisions,
+      onEscalationAnswered: (answer) => {
+        void wakeManagerForDecisionAnswer(project.id, answer);
+      },
     });
     if (outcome.error) {
       console.error(`[triage] ${project.slug}: ${outcome.error}`);
@@ -535,6 +547,7 @@ async function handleManagerMessage(
     // both now that Darwin is free, strays first.
     drainPendingLaneWake(projectId);
     drainPendingCompletionWake(projectId);
+    drainPendingAnswerWake(projectId);
   }
 }
 
@@ -667,6 +680,7 @@ async function runAutonomousManagerTurn(input: {
     // strays first (a frozen worker is bleeding urgency; a debrief keeps).
     drainPendingLaneWake(project.id);
     drainPendingCompletionWake(project.id);
+    drainPendingAnswerWake(project.id);
   }
 }
 
@@ -731,6 +745,47 @@ function drainPendingCompletionWake(projectId: string): void {
   }
   if (next) {
     void wakeManagerForWorkerCompletion(projectId, next);
+  }
+}
+
+/**
+ * The answer pickup (track E): the user answered a triage card. Wake Darwin
+ * with the question AND the answer so he acts on it now — steering, records,
+ * acknowledgment — instead of the answer waiting for the user's next message.
+ * Same busy discipline as every wake: mid-turn answers queue and drain.
+ */
+async function wakeManagerForDecisionAnswer(
+  projectId: string,
+  answer: { question: string; outcomeText: string; attentionId: string },
+): Promise<void> {
+  const project = getProject(db, projectId);
+  if (!project) {
+    return;
+  }
+  if (busyProjects.has(project.id)) {
+    const queue = pendingAnswerWakes.get(project.id) ?? [];
+    queue.push(answer);
+    pendingAnswerWakes.set(project.id, queue);
+    return;
+  }
+  const noteText = "The user answered triage's question — Darwin is picking it up.";
+  const seed =
+    `SYSTEM — escalated question answered.\n\n` +
+    `While you were between turns, triage asked the user:\n${answer.question}\n\n` +
+    `The user's answer:\n${answer.outcomeText}\n\n` +
+    `The backing attention item (${answer.attentionId}) is already resolved. Act on the answer now — steer or hold workers as it directs, record the durable outcome (user_answer or update_record where it belongs), and acknowledge the answer to the user in your reply, answer-first.`;
+  await runAutonomousManagerTurn({ project, seed, noteText, logTag: "triage-answer" });
+}
+
+/** Pick up the oldest card answer that landed while the project was busy. */
+function drainPendingAnswerWake(projectId: string): void {
+  const queue = pendingAnswerWakes.get(projectId);
+  const next = queue?.shift();
+  if (queue && queue.length === 0) {
+    pendingAnswerWakes.delete(projectId);
+  }
+  if (next) {
+    void wakeManagerForDecisionAnswer(projectId, next);
   }
 }
 
