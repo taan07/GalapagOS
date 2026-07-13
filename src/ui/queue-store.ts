@@ -50,5 +50,11 @@ export function saveQueue(
     storage.removeItem(queueStorageKey(projectId));
     return;
   }
-  storage.setItem(queueStorageKey(projectId), JSON.stringify(queue));
+  // Attachments stay in memory only: base64 image bytes would blow the
+  // localStorage quota. A reload keeps the queued text; chips are
+  // re-pasteable.
+  storage.setItem(
+    queueStorageKey(projectId),
+    JSON.stringify(queue.map(({ id, text }) => ({ id, text }))),
+  );
 }

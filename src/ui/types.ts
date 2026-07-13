@@ -1,5 +1,7 @@
 // View types for the UI layer. The UI never imports adapters — these mirror
-// the shapes served by the route handlers.
+// the shapes served by the route handlers. (core/attachments is the one
+// shared import by design: it IS the wire contract both ends must agree on.)
+import type { OutgoingAttachment } from "../core/attachments";
 /** The Shift+Tab autonomy stops — mirror of core/autonomy (UI stays
  * adapter-free; the daemon validates, this only renders). */
 export type AutonomyModeView = "interview" | "default" | "auto";
@@ -75,11 +77,26 @@ export type DecisionView = {
   custom: string;
 };
 
-/** A message waiting its turn while Darwin works — visible and steerable. */
-export type QueuedMessage = { id: string; text: string };
+/**
+ * An attachment as the chat renders it: `url` is a server path
+ * (/api/attachments/…) for history, or a data:/blob: URL on the optimistic
+ * echo before the turn persists. Images render as click-to-expand
+ * thumbnails; text files as open-in-new-tab chips.
+ */
+export type AttachmentView = {
+  kind: "image" | "text";
+  name: string;
+  size: number;
+  url: string;
+};
+
+/** A message waiting its turn while Darwin works — visible and steerable.
+ * Attachments ride in memory only; the persisted queue keeps just the text
+ * (base64 image bytes would blow the localStorage quota). */
+export type QueuedMessage = { id: string; text: string; attachments?: OutgoingAttachment[] };
 
 export type ChatItem = (
-  | { kind: "user"; text: string }
+  | { kind: "user"; text: string; attachments?: AttachmentView[] }
   /** folded: loaded from history — the reply collapses to its summary
    * paragraph so scrolled-back history scans, not walls of text. Replies
    * streamed live in this session render in full. */

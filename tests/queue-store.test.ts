@@ -41,3 +41,19 @@ test("malformed or hostile stored values load as empty, never throw", () => {
     "bad entries are dropped, good ones survive",
   );
 });
+
+test("attachments ride the queue in memory but are never persisted", () => {
+  const storage = fakeStorage();
+  saveQueue(storage, "p1", [
+    {
+      id: "a",
+      text: "with an image",
+      attachments: [
+        { kind: "image", mediaType: "image/png", data: "aGk=", name: "shot.png", size: 2 },
+      ],
+    },
+  ]);
+  const raw = storage.dump()[queueStorageKey("p1")];
+  assert.ok(raw && !raw.includes("attachments"), "base64 bytes must never hit localStorage");
+  assert.deepEqual(loadQueue(storage, "p1"), [{ id: "a", text: "with an image" }]);
+});

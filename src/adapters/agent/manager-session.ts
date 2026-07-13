@@ -1,5 +1,6 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { GalapagosConfig } from "../../config";
+import { userTurnPlainText, type ImageAttachment } from "../../core/attachments";
 import { deniedToolsForMode, type AutonomyMode } from "../../core/autonomy";
 import { contextFillFromModelUsage } from "../../core/context-fill";
 import { oneLine } from "../../core/text";
@@ -284,7 +285,14 @@ function rebriefPreamble(
   const threadState: string[] = [];
   if (context.db && context.previousSessionId) {
     for (const turn of listUndistilledTurns(context.db, context.previousSessionId).slice(-10)) {
-      threadState.push(`${turn.role === "user" ? "User" : "Darwin"}: ${oneLine(turn.content, 200)}`);
+      threadState.push(
+        `${turn.role === "user" ? "User" : "Darwin"}: ${oneLine(
+          // User turns may be attachment payloads — the tail wants the words
+          // plus attachment names, never the raw JSON envelope.
+          turn.role === "user" ? userTurnPlainText(turn.content) : turn.content,
+          200,
+        )}`,
+      );
     }
   }
 
@@ -316,6 +324,32 @@ function rebriefPreamble(
   });
 }
 
+/**
+ * The prompt as one streamed user message carrying image blocks ahead of the
+ * text — the SDK's only channel for image input. Exported for tests.
+ */
+export function imageBearingPrompt(
+  promptText: string,
+  images: ImageAttachment[],
+): AsyncIterable<SDKUserMessage> {
+  const content = [
+    ...images.map((image) => ({
+      type: "image" as const,
+      source: { type: "base64" as const, media_type: image.mediaType, data: image.data },
+    })),
+    ...(promptText.trim().length > 0 ? [{ type: "text" as const, text: promptText }] : []),
+  ];
+  return {
+    async *[Symbol.asyncIterator]() {
+      yield {
+        type: "user" as const,
+        message: { role: "user" as const, content },
+        parent_tool_use_id: null,
+      };
+    },
+  };
+}
+
 export async function runManagerTurn(input: {
   db: GalapagosDb;
   config: GalapagosConfig;
@@ -339,8 +373,27 @@ export async function runManagerTurn(input: {
   /** Fired when update_record signs an implementation_plan (Interview exit).
    * Returns whether the mode actually flipped — the tool words its reply on it. */
   onPlanApproved?: () => boolean;
+  /**
+   * This turn's attachments (track I). Images ride the SDK message as base64
+   * content blocks; pasted-text files are already on disk — `promptNote`
+   * points Darwin at their paths. The persisted turn (persistedUserTurn)
+   * already carries the durable payload; these are the prompt-side halves.
+   */
+  attachments?: {
+    images: ImageAttachment[];
+    promptNote: string | null;
+  };
 }): Promise<ManagerTurnOutcome> {
   const { db, config, project, userText, emit } = input;
+  // What the model sees vs. what history stores: the prompt text carries the
+  // pasted-file pointer note; the DB keeps the user's raw text + payload.
+  const promptNote = input.attachments?.promptNote ?? null;
+  const promptUserText = promptNote
+    ? userText
+      ? `${userText}\n\n${promptNote}`
+      : promptNote
+    : userText;
+  const turnImages = input.attachments?.images ?? [];
   const store = createRecordsStore(project.root_path, project.slug);
   const mode: AutonomyMode = input.mode ?? "default";
   // Structural mode gating: Interview/Plan removes the start-new-work tools
@@ -543,17 +596,26 @@ export async function runManagerTurn(input: {
       role: "system",
       content: JSON.stringify(payload),
     });
-    userTurn = appendTurn(db, { sessionId: session.id, role: "user", content: userText });
+    // Re-append what was persisted, not the bare text — an attachment-bearing
+    // turn's payload (paths and all) must survive the compaction move.
+    userTurn = appendTurn(db, {
+      sessionId: session.id,
+      role: "user",
+      content: input.persistedUserTurn?.content ?? userText,
+    });
 
     emit({ type: "rebrief", reason, preamble, turnId: rebriefTurn.id });
     return preamble
-      ? `${preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${userText}`
-      : userText;
+      ? `${preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${promptUserText}`
+      : promptUserText;
   };
 
   const runQuery = async (resume: string | null, promptText: string): Promise<void> => {
     const stream = query({
-      prompt: promptText,
+      // A plain string until images ride along — then the same prompt becomes
+      // one streamed user message whose content is [image blocks..., text],
+      // the only shape the SDK accepts image input through.
+      prompt: turnImages.length === 0 ? promptText : imageBearingPrompt(promptText, turnImages),
       options: {
         ...baseQueryOptions({ config, cwd: project.root_path, resume }),
         ...(input.abortController ? { abortController: input.abortController } : {}),
@@ -663,14 +725,14 @@ export async function runManagerTurn(input: {
   //    style contract, thread tail, live fleet, all at use-time freshness.
   //    (A deliberately blanked session — re-brief cleared — has
   //    seeded_from_records_at null and starts blank.)
-  let prompt = userText;
+  let prompt = promptUserText;
   if (!resumeId) {
     const marker = session.seeded_from_records_at
       ? findUnclearedRebriefMarker(db, session.id)
       : null;
     if (marker) {
       if (marker.preamble) {
-        prompt = `${marker.preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${userText}`;
+        prompt = `${marker.preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${promptUserText}`;
       }
     } else if (hasHistory) {
       prompt = compactAndRebrief("The previous session's resume pointer was lost.");
@@ -693,7 +755,7 @@ export async function runManagerTurn(input: {
       });
       emit({ type: "rebrief", reason, preamble, turnId: rebriefTurn.id });
       if (preamble) {
-        prompt = `${preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${userText}`;
+        prompt = `${preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${promptUserText}`;
       }
     }
   }
