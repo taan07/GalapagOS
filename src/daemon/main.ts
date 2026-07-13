@@ -5,11 +5,15 @@ import { config } from "../config";
 import { openDb } from "../adapters/db/db";
 import {
   createNewProject,
+  flipInterviewToDefault,
   getProject,
   listProjects,
+  projectAutonomyMode,
   registerProject,
+  setProjectAutonomyMode,
   type ProjectRow,
 } from "../adapters/db/repos/projects";
+import { AUTONOMY_MODES, isAutonomyMode } from "../core/autonomy";
 import { runDistillJob } from "../adapters/agent/distill";
 import {
   isUsageLimitError,
@@ -78,6 +82,9 @@ const managerModelOverrides = new Map<string, string>();
 // already frozen, so we hold the latest stray here and wake Darwin the instant
 // the turn lock frees — never forking his session.
 const pendingLaneWakes = new Map<string, LaneViolationNotice>();
+// Completions that passed the quality gate while Darwin was mid-turn: each
+// queues for its own narrated debrief when the lock frees (track C).
+const pendingCompletionWakes = new Map<string, string[]>();
 // What an in-flight turn looks like RIGHT NOW, per project — so a client that
 // loads mid-turn (reload, second tab) can arm working=true and render the
 // live tail it never streamed. Served by GET /manager/live, gated on the busy
@@ -116,6 +123,11 @@ const monitor = createMonitor({
   // Quality-gated retirement: the tick just proved the completion clean, so
   // the stop is ungated ("force"); the reason lands in the stream's stopped
   // marker so the retirement reads honestly.
+  // The narrator (track C): a verified completion wakes Darwin to debrief the
+  // user. Fire-and-forget — the tick never waits on a model turn.
+  onDigestReviewed: ({ projectId, workerId }) => {
+    void wakeManagerForWorkerCompletion(projectId, workerId);
+  },
   retireWorker: async (workerId, reason) => {
     const outcome = await workers.stop(workerId, reason, { intent: "force" });
     if (!outcome.ok) {
@@ -279,6 +291,26 @@ async function ingestProjectVault(project: ProjectRow): Promise<void> {
   }
 }
 
+/**
+ * The formal sign-off (track C): an implementation_plan moved to "approved"
+ * ends Interview mode. Persisted — a restart never resurrects the interview —
+ * and broadcast so every tab's mode pill flips together. Returns whether the
+ * mode actually flipped so tool replies never claim an exit that didn't
+ * happen (approving a plan in Default/Auto is a plain record update).
+ */
+function approvePlanSignOff(projectId: string): boolean {
+  if (!flipInterviewToDefault(db, projectId)) {
+    return false;
+  }
+  broadcast({ type: "autonomy_mode", projectId, mode: "default" });
+  broadcast({
+    type: "manager_note",
+    projectId,
+    text: "Plan signed — Interview mode ends; Darwin is back in Default mode and building may begin.",
+  });
+  return true;
+}
+
 const COMPACTED_NOTE =
   "Darwin's context was compacted at a clean boundary — he re-briefs himself from the committed records (plus the live thread tail and worker fleet) on his next turn.";
 
@@ -411,16 +443,22 @@ async function handleManagerMessage(
     // triple-Esc during distillation aborts the fork too.
     const turnController = new AbortController();
     armController(turnController);
+    // Mode is re-read AFTER the distill gate: the gate can hold for tens of
+    // seconds, and a Shift+Tab in that window must bind THIS turn — the hard
+    // gate is worthless if it reads a stale snapshot (review finding).
+    const projectAtTurnStart = getProject(db, projectId) ?? project;
     const outcome = await runManagerTurn({
       db,
       config: effectiveConfig,
-      project,
+      project: projectAtTurnStart,
       userText: text,
       emit,
       abortController: turnController,
       workers,
       decisions,
       persistedUserTurn: userTurn,
+      mode: projectAutonomyMode(projectAtTurnStart),
+      onPlanApproved: () => approvePlanSignOff(project.id),
     });
 
     // Post-turn distillation no longer holds the input lock: the turn is
@@ -439,6 +477,7 @@ async function handleManagerMessage(
           sessionId: outcome.sessionId,
           sdkSessionId: outcome.sdkSessionId,
           abortController: distillController,
+          onPlanApproved: () => approvePlanSignOff(project.id),
         });
         emit({
           type: "distilled",
@@ -492,9 +531,10 @@ async function handleManagerMessage(
     }
     releaseBusy();
     res.end();
-    // A worker may have strayed and frozen while this turn ran — handle it now
-    // that Darwin is free.
+    // A worker may have strayed or completed while this turn ran — handle
+    // both now that Darwin is free, strays first.
     drainPendingLaneWake(projectId);
+    drainPendingCompletionWake(projectId);
   }
 }
 
@@ -532,9 +572,25 @@ async function wakeManagerForLaneViolation(notice: LaneViolationNotice): Promise
     return;
   }
 
+  await runAutonomousManagerTurn({ project, seed, noteText, logTag: "lane-guard" });
+}
+
+/**
+ * One daemon-initiated manager turn: busy held throughout, live snapshot
+ * armed (a reload mid-narration sees Darwin working), distill + boundary
+ * compaction after, pending wakes drained on the way out. Shared by every
+ * autonomous wake — the lane guard and the completion narrator.
+ */
+async function runAutonomousManagerTurn(input: {
+  project: NonNullable<ReturnType<typeof getProject>>;
+  seed: string;
+  noteText: string;
+  logTag: string;
+}): Promise<void> {
+  const { project, seed, noteText, logTag } = input;
   busyProjects.add(project.id);
   // Autonomous turns arm the same mid-turn surface as user turns: a tab that
-  // loads while Darwin course-corrects sees him working, not a dead page.
+  // loads while Darwin narrates sees him working, not a dead page.
   liveTurnSnapshots.set(project.id, {
     status: { status: "thinking", label: "Thinking" },
     text: "",
@@ -557,10 +613,13 @@ async function wakeManagerForLaneViolation(notice: LaneViolationNotice): Promise
         : { ...config, managerModel: activeManagerModel };
     const turnController = new AbortController();
     activeTurnControllers.set(project.id, turnController);
+    // Same staleness rule as user turns: the distill gate above can hold for
+    // a while, and the mode must bind at TURN start, not wake time.
+    const projectAtTurnStart = getProject(db, project.id) ?? project;
     const outcome = await runManagerTurn({
       db,
       config: effectiveConfig,
-      project,
+      project: projectAtTurnStart,
       userText: seed,
       // Autonomous turns have no chat stream — the /events broadcast is the
       // ONLY path anything (decision cards, live status, prose) reaches the
@@ -569,6 +628,8 @@ async function wakeManagerForLaneViolation(notice: LaneViolationNotice): Promise
       abortController: turnController,
       workers,
       decisions,
+      mode: projectAutonomyMode(projectAtTurnStart),
+      onPlanApproved: () => approvePlanSignOff(project.id),
     });
     if (outcome.completed || outcome.interrupted) {
       const distillController = new AbortController();
@@ -580,6 +641,7 @@ async function wakeManagerForLaneViolation(notice: LaneViolationNotice): Promise
         sessionId: outcome.sessionId,
         sdkSessionId: outcome.sdkSessionId,
         abortController: distillController,
+        onPlanApproved: () => approvePlanSignOff(project.id),
       });
       // Autonomous turns hit the same completed-distill boundary; busy is
       // still ours here, so the session is provably quiet.
@@ -593,7 +655,7 @@ async function wakeManagerForLaneViolation(notice: LaneViolationNotice): Promise
     }
   } catch (error) {
     console.error(
-      `[lane-guard] autonomous course-correction failed for ${project.slug}: ${error instanceof Error ? error.message : String(error)}`,
+      `[${logTag}] autonomous manager turn failed for ${project.slug}: ${error instanceof Error ? error.message : String(error)}`,
     );
   } finally {
     activeTurnControllers.delete(project.id);
@@ -601,8 +663,10 @@ async function wakeManagerForLaneViolation(notice: LaneViolationNotice): Promise
     // No user POST turn can own this project's snapshot while autonomous busy
     // was held, so dropping it here can never clobber a successor's.
     liveTurnSnapshots.delete(project.id);
-    // Another worker may have strayed during this turn — drain it.
+    // A worker may have strayed or completed during this turn — handle both,
+    // strays first (a frozen worker is bleeding urgency; a debrief keeps).
     drainPendingLaneWake(project.id);
+    drainPendingCompletionWake(project.id);
   }
 }
 
@@ -612,6 +676,61 @@ function drainPendingLaneWake(projectId: string): void {
   if (pending) {
     pendingLaneWakes.delete(projectId);
     void wakeManagerForLaneViolation(pending);
+  }
+}
+
+/**
+ * The narrator (principles 1 and 5): a completion that passed the quality
+ * gate becomes a daemon-initiated manager turn — Darwin debriefs the user in
+ * conversation, linking the diffs and green checks on /workers. Same
+ * discipline as the lane wake: never fork a busy session; queued completions
+ * drain one debrief at a time when the lock frees.
+ */
+async function wakeManagerForWorkerCompletion(projectId: string, workerId: string): Promise<void> {
+  const project = getProject(db, projectId);
+  if (!project) {
+    return;
+  }
+  const worker = getWorkerRow(db, workerId);
+  const lane = worker ? getLane(db, worker.lane_id) : undefined;
+  const laneName = lane?.name ?? "(unknown lane)";
+  const noteText = `Worker "${laneName}" finished and its completion passed the quality gate — Darwin is preparing the debrief.`;
+  const seed =
+    `SYSTEM — worker completion.\n\n` +
+    `Worker ${workerId} (lane "${laneName}") finished its task and the completion PASSED the quality gate: the monitor verified its evidence and auto-retired it cleanly (digest status manager_reviewed).\n\n` +
+    `Debrief the user now, per your narrating-worker-events doctrine:\n` +
+    `1. Call worker_status ${workerId} for the digest — narrative, before → after, claims and their evidence.\n` +
+    `2. Compose the debrief in your reply: what the worker set out to do, what actually changed, the verified claims with their evidence status, and point the user at the diffs, commits, and green checks on the workers page (lane "${laneName}").\n` +
+    `3. Say plainly anything unfinished, deferred, or worth a follow-up.\n` +
+    `Answer-first and short — a colleague reporting a landed change, not a log dump.`;
+
+  if (busyProjects.has(project.id)) {
+    // Debriefs keep: queue every completion and drain them in order when the
+    // turn lock frees — unlike lane strays, each one deserves its own turn.
+    // The includes() dedupe covers the queue only, not a debrief currently
+    // running — exactly-once here leans on the monitor firing once per
+    // worker (manager_reviewed digests leave listUnreviewedDigests).
+    const queue = pendingCompletionWakes.get(project.id) ?? [];
+    if (!queue.includes(workerId)) {
+      queue.push(workerId);
+    }
+    pendingCompletionWakes.set(project.id, queue);
+    broadcast({ type: "manager_note", projectId: project.id, text: noteText });
+    return;
+  }
+
+  await runAutonomousManagerTurn({ project, seed, noteText, logTag: "narrator" });
+}
+
+/** Debrief the oldest completion that queued while the project was busy. */
+function drainPendingCompletionWake(projectId: string): void {
+  const queue = pendingCompletionWakes.get(projectId);
+  const next = queue?.shift();
+  if (queue && queue.length === 0) {
+    pendingCompletionWakes.delete(projectId);
+  }
+  if (next) {
+    void wakeManagerForWorkerCompletion(projectId, next);
   }
 }
 
@@ -1084,6 +1203,32 @@ const server = http.createServer((req, res) => {
   }
   if (route === "POST /manager/interrupt") {
     void handleInterrupt(req, res).catch((error) => {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    });
+    return;
+  }
+  if (route === "POST /manager/mode") {
+    // The Shift+Tab axis lands here: validate, persist, broadcast — every
+    // tab's pill flips together, and the NEXT turn runs under the new mode
+    // (doctrine + allowlist are rebuilt per turn).
+    void (async () => {
+      const body = await readBody(req);
+      const projectId = asString(body.projectId);
+      const mode = asString(body.mode);
+      if (!projectId || !isAutonomyMode(mode)) {
+        sendJson(res, 400, {
+          error: `projectId and a valid mode (${AUTONOMY_MODES.join(" | ")}) are required.`,
+        });
+        return;
+      }
+      if (!getProject(db, projectId)) {
+        sendJson(res, 404, { error: `Unknown project: ${projectId}` });
+        return;
+      }
+      setProjectAutonomyMode(db, projectId, mode);
+      broadcast({ type: "autonomy_mode", projectId, mode });
+      sendJson(res, 200, { ok: true, mode });
+    })().catch((error) => {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     });
     return;

@@ -1,11 +1,16 @@
 // View types for the UI layer. The UI never imports adapters — these mirror
 // the shapes served by the route handlers.
+/** The Shift+Tab autonomy stops — mirror of core/autonomy (UI stays
+ * adapter-free; the daemon validates, this only renders). */
+export type AutonomyModeView = "interview" | "default" | "auto";
+
 export type ProjectView = {
   id: string;
   name: string;
   slug: string;
   root_path: string;
   created_at: string;
+  autonomy_mode: AutonomyModeView;
 };
 
 export type TurnView = {
@@ -311,6 +316,9 @@ export type DaemonStreamEvent =
   | { type: "manager_note"; projectId: string; text: string }
   /** A worker's plan/steps changed — re-fetch its checklist (ids only). */
   | { type: "worker_plan"; projectId: string; workerId: string }
+  /** The autonomy stop changed (Shift+Tab, or a plan sign-off ended
+   * Interview) — every tab's pill flips together. */
+  | { type: "autonomy_mode"; projectId: string; mode: AutonomyModeView }
   /** Every turn event now rides the broadcast wrapped with its project
    * (turn-attach): decision cards drive the needs-you cue in every tab, and
    * the full lifecycle (turn_started … turn_complete) lets a tab that loaded

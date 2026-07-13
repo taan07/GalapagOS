@@ -1463,6 +1463,34 @@ select:focus {
   color: var(--fg);
 }
 
+/* Track C: the autonomy pill — the composer's mode stop, Shift+Tab cycles. */
+.mode-pill {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 9px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.mode-pill .mode-key {
+  color: var(--faint);
+  margin-left: 4px;
+}
+
+.mode-pill.mode-interview {
+  color: var(--attention);
+  border-color: color-mix(in srgb, var(--attention) 45%, var(--line));
+}
+
+.mode-pill.mode-auto {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--line));
+}
+
 .claim-badge.evidence-manual {
   color: var(--attention);
   border-color: color-mix(in srgb, var(--attention) 45%, var(--line));

@@ -64,6 +64,13 @@ export async function runDistillJob(input: {
   sdkSessionId: string | null;
   /** Shared with the main turn: a triple-Esc during distill aborts the fork. */
   abortController?: AbortController;
+  /**
+   * The sign-off hook (track C): update_record is in this fork's tool
+   * surface, so a distill pass that moves an implementation_plan to
+   * "approved" must flip Interview mode exactly like a live turn — an
+   * unwired approval would strand the project in Interview.
+   */
+  onPlanApproved?: () => boolean;
 }): Promise<DistillOutcome> {
   const { db, config, project } = input;
   const job = createJob(db, "distill", {
@@ -86,6 +93,7 @@ export async function runDistillJob(input: {
       projectRoot: project.root_path,
       projectSlug: project.slug,
       vaultPath: config.vaultPath,
+      ...(input.onPlanApproved ? { onPlanApproved: input.onPlanApproved } : {}),
       onToolEvent: (event) => {
         if (event.tool === "write_record" && event.summary.startsWith("wrote ")) {
           recordsWritten += 1;
