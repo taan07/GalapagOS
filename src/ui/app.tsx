@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { parseUserTurnContent, type OutgoingAttachment } from "../core/attachments";
 import type {
+  AttachmentView,
   AttentionView,
   AutonomyModeView,
   ChatItem,
@@ -34,7 +36,29 @@ function turnsToChatItems(turns: TurnView[]): ChatItem[] {
   return turns.flatMap((turn): ChatItem[] => {
     const at = turn.created_at;
     if (turn.role === "user") {
-      return [{ kind: "user", text: turn.content, at }];
+      // Attachment-bearing turns persist as a JSON payload; everything else
+      // is the raw text (the parser is tolerant by contract). Bytes stay on
+      // disk — the view carries only the serve-route URL.
+      const { text, attachments } = parseUserTurnContent(turn.content);
+      return [
+        {
+          kind: "user",
+          text,
+          at,
+          ...(attachments.length > 0
+            ? {
+                attachments: attachments.map(
+                  (attachment): AttachmentView => ({
+                    kind: attachment.kind,
+                    name: attachment.name,
+                    size: attachment.size,
+                    url: `/api/${attachment.path}`,
+                  }),
+                ),
+              }
+            : {}),
+        },
+      ];
     }
     if (turn.role === "assistant") {
       // History folds; live replies don't (they get the folded flag only on
@@ -514,8 +538,14 @@ export function App() {
     async (
       projectId: string,
       text: string,
-      options?: { model?: string; echoUser?: boolean; requeueAtHead?: boolean },
+      options?: {
+        model?: string;
+        echoUser?: boolean;
+        requeueAtHead?: boolean;
+        attachments?: OutgoingAttachment[];
+      },
     ): Promise<void> => {
+      const attachments = options?.attachments ?? [];
       setWorking(true);
       setLiveText("");
       setLiveStatus({ status: "thinking", label: "Thinking" });
@@ -529,7 +559,36 @@ export function App() {
       // The Opus retry doesn't re-echo the user bubble — the failed message is
       // already on screen above the limit note.
       if (options?.echoUser !== false) {
-        setItems((current) => [...current, { kind: "user", text, at: now() }]);
+        // The optimistic bubble renders attachments from local bytes (data:
+        // for images, a blob: URL for pasted text); once the turn persists, a
+        // reload swaps them for the serve-route URLs.
+        const echoAttachments = attachments.map(
+          (attachment): AttachmentView =>
+            attachment.kind === "image"
+              ? {
+                  kind: "image",
+                  name: attachment.name,
+                  size: attachment.size,
+                  url: `data:${attachment.mediaType};base64,${attachment.data}`,
+                }
+              : {
+                  kind: "text",
+                  name: attachment.name,
+                  size: attachment.size,
+                  url: URL.createObjectURL(
+                    new Blob([attachment.text], { type: "text/plain" }),
+                  ),
+                },
+        );
+        setItems((current) => [
+          ...current,
+          {
+            kind: "user",
+            text,
+            at: now(),
+            ...(echoAttachments.length > 0 ? { attachments: echoAttachments } : {}),
+          },
+        ]);
       }
       try {
         const response = await fetch("/api/manager/message", {
@@ -538,6 +597,7 @@ export function App() {
           body: JSON.stringify({
             projectId,
             text,
+            ...(attachments.length > 0 ? { attachments } : {}),
             ...(options?.model ? { model: options.model } : {}),
           }),
         });
@@ -553,7 +613,11 @@ export function App() {
             // rendering a dead error note. The optimistic bubble comes back
             // when the queue drains and the send re-echoes it.
             busyElsewhere = true;
-            const queuedMessage = { id: crypto.randomUUID(), text };
+            const queuedMessage = {
+              id: crypto.randomUUID(),
+              text,
+              ...(attachments.length > 0 ? { attachments } : {}),
+            };
             if (options?.requeueAtHead) {
               // A drained message that bounced goes back to the FRONT — it
               // was the head of the queue; re-queuing it behind later
@@ -892,7 +956,12 @@ export function App() {
     saveQueue(window.localStorage, selectedId, queueRef.current);
     setQueued([...queueRef.current]);
     if (next) {
-      void sendNow(selectedId, next.text, { requeueAtHead: true });
+      void sendNow(selectedId, next.text, {
+        requeueAtHead: true,
+        ...(next.attachments && next.attachments.length > 0
+          ? { attachments: next.attachments }
+          : {}),
+      });
     }
   }, [working, selectedId, sendNow, queued]);
 
@@ -976,12 +1045,14 @@ export function App() {
   // message settles the waiting card as the custom answer instead of starting
   // a new turn (2026-07-08 ruling — no embedded text fields).
   const handleSend = useCallback(
-    (text: string) => {
+    (text: string, attachments: OutgoingAttachment[]) => {
       if (!selectedId) {
         return;
       }
       const pending = pendingDecisionRef.current;
       if (pending) {
+        // Free-text card answers are text-only; the composer already strips
+        // the tray while answering.
         void postDecisionAnswer(pending.decisionId, {
           selections: [],
           responses: {},
@@ -990,12 +1061,16 @@ export function App() {
         return;
       }
       if (working) {
-        queueRef.current.push({ id: crypto.randomUUID(), text });
+        queueRef.current.push({
+          id: crypto.randomUUID(),
+          text,
+          ...(attachments.length > 0 ? { attachments } : {}),
+        });
         saveQueue(window.localStorage, selectedId, queueRef.current);
         setQueued([...queueRef.current]);
         return;
       }
-      void sendNow(selectedId, text);
+      void sendNow(selectedId, text, attachments.length > 0 ? { attachments } : {});
     },
     [selectedId, working, sendNow, postDecisionAnswer],
   );

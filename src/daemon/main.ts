@@ -14,6 +14,13 @@ import {
   type ProjectRow,
 } from "../adapters/db/repos/projects";
 import { AUTONOMY_MODES, isAutonomyMode } from "../core/autonomy";
+import {
+  MAX_MESSAGE_BODY_BYTES,
+  attachmentPromptNote,
+  parseOutgoingAttachments,
+  type UserTurnPayload,
+} from "../core/attachments";
+import { storeAttachments } from "../adapters/attachments/store";
 import { runDistillJob } from "../adapters/agent/distill";
 import {
   isUsageLimitError,
@@ -245,10 +252,26 @@ function makeTurnEmit(
   };
 }
 
-async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+/** Body over the wire cap — thrown before JSON.parse ever sees the bytes. */
+class BodyTooLargeError extends Error {
+  constructor(maxBytes: number) {
+    super(`Request body exceeds ${maxBytes} bytes.`);
+  }
+}
+
+async function readBody(
+  req: http.IncomingMessage,
+  maxBytes?: number,
+): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
-    chunks.push(chunk as Buffer);
+    const buffer = chunk as Buffer;
+    total += buffer.length;
+    if (maxBytes !== undefined && total > maxBytes) {
+      throw new BodyTooLargeError(maxBytes);
+    }
+    chunks.push(buffer);
   }
   const raw = Buffer.concat(chunks).toString("utf8");
   if (!raw) {
@@ -370,10 +393,27 @@ async function handleManagerMessage(
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): Promise<void> {
-  const body = await readBody(req);
+  let body: Record<string, unknown>;
+  try {
+    body = await readBody(req, MAX_MESSAGE_BODY_BYTES);
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) {
+      sendJson(res, 413, { error: error.message });
+      return;
+    }
+    throw error;
+  }
   const projectId = asString(body.projectId);
-  const text = asString(body.text);
-  if (!projectId || !text) {
+  // Attachment-bearing sends may carry no prose at all (a bare screenshot);
+  // a malformed attachments array rejects the send whole — a silently
+  // dropped attachment would be worse than an error.
+  const text = asString(body.text) ?? "";
+  const attachments = parseOutgoingAttachments(body.attachments);
+  if (!attachments) {
+    sendJson(res, 400, { error: "Malformed attachments." });
+    return;
+  }
+  if (!projectId || (!text && attachments.length === 0)) {
     sendJson(res, 400, { error: "projectId and text are required." });
     return;
   }
@@ -431,7 +471,18 @@ async function handleManagerMessage(
     // wait lost it without a trace. Persisted-but-unanswered is honest;
     // vanished is not.
     const session = getOrCreateActiveSession(db, projectId);
-    const userTurn = appendTurn(db, { sessionId: session.id, role: "user", content: text });
+    // Attachment bytes land on disk FIRST; the turn's content column carries
+    // only text + relative paths, so history fetches stay light forever.
+    const storedAttachments = storeAttachments(config.stateDir, projectId, attachments);
+    const userTurnContent =
+      storedAttachments.length > 0
+        ? JSON.stringify({
+            kind: "user",
+            text,
+            attachments: storedAttachments,
+          } satisfies UserTurnPayload)
+        : text;
+    const userTurn = appendTurn(db, { sessionId: session.id, role: "user", content: userTurnContent });
 
     // The previous turn's distillation may still be running. The fork
     // invariant stands — the manager session is never forked concurrently
@@ -469,6 +520,14 @@ async function handleManagerMessage(
       workers,
       decisions,
       persistedUserTurn: userTurn,
+      ...(storedAttachments.length > 0
+        ? {
+            attachments: {
+              images: attachments.filter((entry) => entry.kind === "image"),
+              promptNote: attachmentPromptNote(storedAttachments, config.stateDir),
+            },
+          }
+        : {}),
       mode: projectAutonomyMode(projectAtTurnStart),
       onPlanApproved: () => approvePlanSignOff(project.id),
     });
