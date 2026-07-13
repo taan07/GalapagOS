@@ -70,11 +70,18 @@ export type ManagerToolContext = {
    */
   askConfirm?: (playback: string) => Promise<DecisionOutcome>;
   /**
-   * Fire-and-forget escalation (chunk 4 triage): the question lands as a
-   * system note in Darwin's chat AND a high-priority queue item; answers
-   * flow back through Darwin. Wired only for triage sessions.
+   * Fire-and-forget escalation (chunk 4 triage; track E made it a real card):
+   * the question lands as a pending decision card in the user's chat AND a
+   * high-priority queue item — without waiting. Options ride along so the
+   * card is clickable, not prose; the answer wakes Darwin. Wired only for
+   * triage sessions.
    */
-  escalateToUser?: (question: string, context: string) => { attentionId: string };
+  escalateToUser?: (
+    question: string,
+    context: string,
+    options?: DecisionOption[],
+    multiSelect?: boolean,
+  ) => { attentionId: string };
   /**
    * The sign-off hook (track C): fired when update_record moves an
    * implementation_plan to "approved" — the signature that ends Interview
@@ -730,12 +737,18 @@ export function createManagerToolServer(context: ManagerToolContext) {
             return text(describeOutcome(decision));
           }
           if (context.escalateToUser) {
-            // Triage never blocks on the user: fire-and-forget into chat +
-            // queue; the answer arrives through Darwin.
-            const { attentionId } = context.escalateToUser(question, questionContext ?? "");
+            // Triage never blocks on the user: fire-and-forget card into chat
+            // + queue; the answer arrives through Darwin. Options ride along
+            // so the user clicks instead of typing prose.
+            const { attentionId } = context.escalateToUser(
+              question,
+              questionContext ?? "",
+              options ?? [],
+              multi_select ?? false,
+            );
             emit("ask_user", `escalated to user: ${oneLine(question, 80)}`, questionContext ?? "");
             return text(
-              `Question delivered to the user (attention item ${attentionId}). Do not wait for the answer — it will arrive through Darwin.`,
+              `Question delivered to the user as a card (attention item ${attentionId}). Do not wait for the answer — it will arrive through Darwin.`,
             );
           }
           return text(
