@@ -5,6 +5,7 @@ import { config } from "../config";
 import { openDb } from "../adapters/db/db";
 import {
   createNewProject,
+  flipInterviewToDefault,
   getProject,
   listProjects,
   projectAutonomyMode,
@@ -293,20 +294,21 @@ async function ingestProjectVault(project: ProjectRow): Promise<void> {
 /**
  * The formal sign-off (track C): an implementation_plan moved to "approved"
  * ends Interview mode. Persisted — a restart never resurrects the interview —
- * and broadcast so every tab's mode pill flips together.
+ * and broadcast so every tab's mode pill flips together. Returns whether the
+ * mode actually flipped so tool replies never claim an exit that didn't
+ * happen (approving a plan in Default/Auto is a plain record update).
  */
-function approvePlanSignOff(projectId: string): void {
-  const project = getProject(db, projectId);
-  if (!project || projectAutonomyMode(project) !== "interview") {
-    return;
+function approvePlanSignOff(projectId: string): boolean {
+  if (!flipInterviewToDefault(db, projectId)) {
+    return false;
   }
-  setProjectAutonomyMode(db, projectId, "default");
   broadcast({ type: "autonomy_mode", projectId, mode: "default" });
   broadcast({
     type: "manager_note",
     projectId,
     text: "Plan signed — Interview mode ends; Darwin is back in Default mode and building may begin.",
   });
+  return true;
 }
 
 const COMPACTED_NOTE =
@@ -441,17 +443,21 @@ async function handleManagerMessage(
     // triple-Esc during distillation aborts the fork too.
     const turnController = new AbortController();
     armController(turnController);
+    // Mode is re-read AFTER the distill gate: the gate can hold for tens of
+    // seconds, and a Shift+Tab in that window must bind THIS turn — the hard
+    // gate is worthless if it reads a stale snapshot (review finding).
+    const projectAtTurnStart = getProject(db, projectId) ?? project;
     const outcome = await runManagerTurn({
       db,
       config: effectiveConfig,
-      project,
+      project: projectAtTurnStart,
       userText: text,
       emit,
       abortController: turnController,
       workers,
       decisions,
       persistedUserTurn: userTurn,
-      mode: projectAutonomyMode(project),
+      mode: projectAutonomyMode(projectAtTurnStart),
       onPlanApproved: () => approvePlanSignOff(project.id),
     });
 
@@ -471,6 +477,7 @@ async function handleManagerMessage(
           sessionId: outcome.sessionId,
           sdkSessionId: outcome.sdkSessionId,
           abortController: distillController,
+          onPlanApproved: () => approvePlanSignOff(project.id),
         });
         emit({
           type: "distilled",
@@ -606,10 +613,13 @@ async function runAutonomousManagerTurn(input: {
         : { ...config, managerModel: activeManagerModel };
     const turnController = new AbortController();
     activeTurnControllers.set(project.id, turnController);
+    // Same staleness rule as user turns: the distill gate above can hold for
+    // a while, and the mode must bind at TURN start, not wake time.
+    const projectAtTurnStart = getProject(db, project.id) ?? project;
     const outcome = await runManagerTurn({
       db,
       config: effectiveConfig,
-      project,
+      project: projectAtTurnStart,
       userText: seed,
       // Autonomous turns have no chat stream — the /events broadcast is the
       // ONLY path anything (decision cards, live status, prose) reaches the
@@ -618,7 +628,7 @@ async function runAutonomousManagerTurn(input: {
       abortController: turnController,
       workers,
       decisions,
-      mode: projectAutonomyMode(project),
+      mode: projectAutonomyMode(projectAtTurnStart),
       onPlanApproved: () => approvePlanSignOff(project.id),
     });
     if (outcome.completed || outcome.interrupted) {
@@ -631,6 +641,7 @@ async function runAutonomousManagerTurn(input: {
         sessionId: outcome.sessionId,
         sdkSessionId: outcome.sdkSessionId,
         abortController: distillController,
+        onPlanApproved: () => approvePlanSignOff(project.id),
       });
       // Autonomous turns hit the same completed-distill boundary; busy is
       // still ours here, so the session is provably quiet.
@@ -696,6 +707,9 @@ async function wakeManagerForWorkerCompletion(projectId: string, workerId: strin
   if (busyProjects.has(project.id)) {
     // Debriefs keep: queue every completion and drain them in order when the
     // turn lock frees — unlike lane strays, each one deserves its own turn.
+    // The includes() dedupe covers the queue only, not a debrief currently
+    // running — exactly-once here leans on the monitor firing once per
+    // worker (manager_reviewed digests leave listUnreviewedDigests).
     const queue = pendingCompletionWakes.get(project.id) ?? [];
     if (!queue.includes(workerId)) {
       queue.push(workerId);

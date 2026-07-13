@@ -826,10 +826,28 @@ export function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Tab" && event.shiftKey) {
-        event.preventDefault();
-        handleCycleMode();
+      if (event.key !== "Tab" || !event.shiftKey) {
+        return;
       }
+      // The axis owns Shift+Tab in the composer (the muscle memory) and on
+      // an unfocused page — but NEVER over other interactive elements, where
+      // Shift+Tab is reverse focus-navigation and hijacking it would strand
+      // keyboard users (review finding).
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName ?? "";
+      const inComposer = tag === "TEXTAREA";
+      const inOtherInteractive =
+        !inComposer &&
+        (tag === "INPUT" ||
+          tag === "SELECT" ||
+          tag === "BUTTON" ||
+          tag === "A" ||
+          (target?.isContentEditable ?? false));
+      if (inOtherInteractive) {
+        return;
+      }
+      event.preventDefault();
+      handleCycleMode();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);

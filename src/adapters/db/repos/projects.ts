@@ -29,6 +29,22 @@ export function setProjectAutonomyMode(
   db.prepare("UPDATE projects SET autonomy_mode = ? WHERE id = ?").run(mode, id);
 }
 
+/**
+ * The sign-off transition (track C): Interview → Default, atomically guarded
+ * on the CURRENT row so an approval landing in any other mode is a no-op.
+ * Returns whether the mode actually flipped — callers word their replies on
+ * this, never on the approval alone (an "Interview has ended" that didn't
+ * happen is a lie fed straight back to Darwin).
+ */
+export function flipInterviewToDefault(db: GalapagosDb, id: string): boolean {
+  const project = getProject(db, id);
+  if (!project || projectAutonomyMode(project) !== "interview") {
+    return false;
+  }
+  setProjectAutonomyMode(db, id, "default");
+  return true;
+}
+
 export type RegisterProjectInput = {
   rootPath: string;
   name?: string;

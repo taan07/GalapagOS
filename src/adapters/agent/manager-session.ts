@@ -336,8 +336,9 @@ export async function runManagerTurn(input: {
   persistedUserTurn?: ManagerTurnRow;
   /** The project's autonomy stop for THIS turn; omitted = the middle stop. */
   mode?: AutonomyMode;
-  /** Fired when update_record signs an implementation_plan (Interview exit). */
-  onPlanApproved?: () => void;
+  /** Fired when update_record signs an implementation_plan (Interview exit).
+   * Returns whether the mode actually flipped — the tool words its reply on it. */
+  onPlanApproved?: () => boolean;
 }): Promise<ManagerTurnOutcome> {
   const { db, config, project, userText, emit } = input;
   const store = createRecordsStore(project.root_path, project.slug);

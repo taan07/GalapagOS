@@ -78,10 +78,12 @@ export type ManagerToolContext = {
   /**
    * The sign-off hook (track C): fired when update_record moves an
    * implementation_plan to "approved" — the signature that ends Interview
-   * mode. The daemon flips the persisted autonomy stop here; absent in
-   * contexts without modes (distill forks, triage).
+   * mode. Returns whether the mode actually flipped (Interview → Default);
+   * the tool words its reply on that truth. Wire it in EVERY context that
+   * can reach update_record (manager turns, distill forks, triage) — an
+   * unwired approval would strand a project in Interview.
    */
-  onPlanApproved?: () => void;
+  onPlanApproved?: () => boolean;
   onToolEvent?: (event: { tool: string; summary: string; detail: string }) => void;
 };
 
@@ -370,10 +372,14 @@ export function createManagerToolServer(context: ManagerToolContext) {
             emit("update_record", `updated ${doc.type} ${doc.id} → ${doc.status}`, renderFullRecord(doc));
             if (doc.type === "implementation_plan" && doc.status === "approved") {
               // The formal sign-off (track C): an approved plan is the
-              // signature that ends Interview mode.
-              context.onPlanApproved?.();
+              // signature that ends Interview mode — but the reply only says
+              // so when the flip actually happened (already in Default/Auto,
+              // or an unwired context, is a plain record update).
+              const flipped = context.onPlanApproved?.() ?? false;
               return text(
-                `Updated ${doc.type} ${doc.id}: status approved. The plan is SIGNED — Interview mode has ended and the project is back in Default mode; building may begin.`,
+                flipped
+                  ? `Updated ${doc.type} ${doc.id}: status approved. The plan is SIGNED — Interview mode has ended and the project is back in Default mode; building may begin.`
+                  : `Updated ${doc.type} ${doc.id}: status approved.`,
               );
             }
             return text(`Updated ${doc.type} ${doc.id}: status ${doc.status}.`);
