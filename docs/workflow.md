@@ -1,72 +1,66 @@
-# Working agreement: tracks, worktrees, and the runtime
+# Working agreement: tracks, worktrees, and the runtime bench
 
-Adopted 2026-07-09, after a week of parallel sessions sharing one checkout
-produced tangled commits, swept-up WIP, and lost work. Galapagos builds
-lane-scoped isolation for its users; its own development now follows the
-same doctrine.
+## The rule
 
-## The one rule
-
-**One track = one branch = one git worktree = one session.**
-
-A "track" is a coherent line of work (a feature, a fix round, a doc). It
-lives on its own branch, checked out in its own directory, worked by one
-session at a time. No two sessions ever share a working tree. Nothing is
-ever committed from a directory the track doesn't own.
+**One track = one branch = one git worktree = one session.** A track is a
+coherent feature, fix, or documentation change. It owns its worktree and no
+other session edits or commits there.
 
 ## Directory map
 
 | Directory | Branch | Role |
 |---|---|---|
-| `~/Dev/galapagos` | (the track you're actively developing) | primary dev checkout |
-| `~/Dev/galapagos-runtime` | `next` — always | serves the daemon (`npm run dev`), never edited by hand |
-| `~/Dev/galapagos-<track>` | `feat/<track>` etc. | one per active track |
+| `~/Dev/galapagos` | primary development checkout | source for new tracks |
+| `~/Dev/galapagos-runtime` | `next`, permanently | user-owned deployment bench |
+| `~/Dev/galapagos-<track>` | `feat/<track>` etc. | isolated development track |
 
-Create a track: `git worktree add ~/Dev/galapagos-<name> -b feat/<name> main`
-Retire a track (after merge): `git worktree remove ~/Dev/galapagos-<name> && git branch -d feat/<name>`
+Create a track with `git worktree add ~/Dev/galapagos-<name> -b feat/<name> main`.
+After its merge, retire it with `git worktree remove ~/Dev/galapagos-<name>`
+and `git branch -d feat/<name>`.
 
-## The runtime and `next`
+## The permanent runtime bench
 
-The daemon runs from `galapagos-runtime`, pinned to the **`next`**
-integration branch, via `tsx watch` — it hot-reloads on any file change,
-so deploying is a git operation, never a manual restart:
+`~/Dev/galapagos-runtime` is permanently checked out on `next`. It is a
+deployment-only, user-owned checkout. A track session must never manually
+edit it, check out another branch there, or start, stop, or restart its
+processes.
 
-- **Test a track (or several together):** `git -C ~/Dev/galapagos-runtime merge feat/<track>` — the daemon reloads with it.
-- **Reset the bench:** `git -C ~/Dev/galapagos-runtime reset --hard main` — `next` is throwaway by design; nothing lives only on `next`.
-- `curl localhost:4517/health` tells you exactly what revision/branch is serving (identity is resolved at boot — a branch switch with identical trees keeps the old label until the first real reload).
+Deploy only by merging a tested track into `next`; the runtime's existing
+watch process reloads the merge. Do not use branch switches, copied files, or
+manual restarts as deployment mechanisms. Only the user may hard-reset
+`next`.
 
-## `main`
+Before accepting a bench result, verify both the listener and its working
+directory: identify the process listening on port 4517, then inspect that
+process's `cwd`; it must be `~/Dev/galapagos-runtime`. Confirm
+`curl localhost:4517/health` reports the expected `next` branch and revision.
+If either the port, cwd, branch, or revision differs, stop and ask the runtime
+owner to correct it rather than changing the bench.
 
-`main` receives **tested work only**, through PRs (one per track). Never
-commit directly to main; never merge an untested track to main "to see
-it". Testing happens on `next`.
+## Dependencies and verification
 
-## Commit hygiene
+Use Bun for Galapagos's own dependencies and top-level scripts. After a
+`package.json` change, run `bun install` in the track that made the change and
+commit the resulting `bun.lock`. Do not run it as a routine preflight. Use
+`bun install --frozen-lockfile` only to verify a committed lockfile from a
+clean install.
 
-- Never `git add -A` / `git add .` — stage explicit paths. (This is how a
-  model-switch feature once got swept into an unrelated WIP checkpoint.)
-- Commit messages carry the track's *intent*, not just its mechanics —
-  each distinct effort gets its own section in the body.
-- Zero untracked files at the end of a work session: commit, or delete.
-- Auto-stash tools ("epitaxy: pre-switch") are not a safety net; treat an
-  unexpected stash as a smell and resolve it same-day.
+A dependency-changing worker lane must explicitly cover both `package.json`
+and its selected lockfile (`bun.lock`, `bun.lockb`, `pnpm-lock.yaml`,
+`yarn.lock`, or `package-lock.json`). Do not weaken lane globs globally to
+make dependency changes fit.
 
-## Current tracks and their goals (2026-07-09)
+Track-local verification is safe without touching the runtime:
 
-| Track | Goal | State |
-|---|---|---|
-| `feat/workers-goal-progress` | Worker plan contract: a worker turns its brief into a visible checklist (`worker_steps`), so /workers shows real goal progress. Also carries GitHub-link derivation (remote → web/branch/blob URLs). | in progress |
-| `feat/quality-gated-retirement` | Stopping a worker carries intent (`retire`/`abandon`/`force`); retire is refused unless the completion is manager-reviewed; monitor auto-retires clean completions; abandoned work raises attention. | committed, awaiting PR merge |
-| `feat/chat-ux` | Port of open-webui chat affordances: markdown rendering of Darwin's replies, visible/steerable message queue, copy buttons. Reference digest in `docs/reference/`. | committed, awaiting PR merge |
-| `chore/workflow-doc` | This document. | this commit |
+- `bun run test`
+- `bun run build`
+- `git diff --check`
 
-Recently merged to main (2026-07-09): turn-lock/hold-preempt fix,
-interactive prompting (ask_user/ask_batch/confirm_understanding cards,
-chat-composer-as-free-text), Fable-limit → Opus model switch, lane guard.
+Do not rewrite npm-specific worker-project behavior or historical handoffs:
+Galapagos still supervises repositories that use npm.
 
-## Known debt
+## Main and commits
 
-- `main` may sit ahead of `origin/main` between pushes — check
-  `git branch -vv` before assuming GitHub is current.
-- The next big fronts (per the user): the user↔Darwin chat behaviour and
-  the /workers page — both have dedicated-track work ahead.
+`main` receives tested work through one PR per track. Never commit directly to
+`main`, and never use the runtime bench as an editing checkout. Stage explicit
+paths, keep each commit to one intent, and leave no accidental untracked work.

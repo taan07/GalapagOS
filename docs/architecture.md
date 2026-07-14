@@ -69,7 +69,7 @@ src/app/        Next app router pages: / (chat+overview), /workers, /clarity,
 
 Rules: `core/` imports nothing outside `core/`. `adapters/` may import `core/`.
 `ui/` never imports `adapters/` — only route handlers and SSE. Tests:
-TypeScript strict; `node --test` (compiled) like the ported suites; `npm test`
+TypeScript strict; `node --test` (compiled) like the ported suites; `bun run test`
 = typecheck + unit tests.
 
 **No half-wired surfaces.** A page, tool, or table ships in the same chunk as

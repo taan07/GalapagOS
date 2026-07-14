@@ -128,7 +128,7 @@ const execFileAsync = promisify(execFile);
 const codeIdentity = { revision: "unknown", branch: "unknown" };
 async function resolveCodeIdentity(): Promise<void> {
   try {
-    // npm scripts run from the package root, which is the galapagos checkout.
+    // Bun scripts run from the package root, which is the galapagos checkout.
     const git = (args: string[]) =>
       execFileAsync("git", args, { cwd: process.cwd(), encoding: "utf8" });
     codeIdentity.revision = (await git(["rev-parse", "--short", "HEAD"])).stdout.trim();

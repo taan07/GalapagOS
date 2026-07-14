@@ -551,7 +551,7 @@ export async function runManagerTurn(input: {
     if (resultWasError) {
       // The session itself ran — retrying with a fresh session cannot help.
       const guidance = /not logged in/i.test(messageText)
-        ? " The daemon cannot reach Claude Code's credentials. Start Galapagos from your own terminal (npm run dev) so the spawned Claude binary can use your keychain login, and check `claude /login` status."
+        ? " The daemon cannot reach Claude Code's credentials. Ask the runtime owner to restore the permanent bench from their own terminal (`bun run dev`) so the spawned Claude binary can use their keychain login, and check `claude /login` status."
         : "";
       emit({
         type: "turn_error",
