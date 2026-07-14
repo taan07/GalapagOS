@@ -17,16 +17,20 @@ const KIND_LABEL: Record<string, string> = {
   unstructured_completion: "unstructured completion",
   worker_failed: "worker failed",
   integrity_alert: "integrity alert",
+  worker_retirement_failed: "retirement failed",
+  completion_debrief_failed: "debrief failed",
 };
 
 function QueueRow({
   item,
   acting,
   onResolve,
+  onRetry,
 }: {
   item: AttentionView;
   acting: boolean;
   onResolve: (id: string, resolution: "resolved" | "dismissed") => void;
+  onRetry: (id: string) => void;
 }) {
   return (
     <div className={`queue-item priority-${item.priority}`}>
@@ -40,6 +44,11 @@ function QueueRow({
       </details>
       <div className="queue-actions">
         <span className="queue-when">{item.createdAt.slice(0, 16).replace("T", " ")}</span>
+        {item.kind === "completion_debrief_failed" ? (
+          <button disabled={acting} onClick={() => onRetry(item.id)}>
+            Retry debrief
+          </button>
+        ) : null}
         <button disabled={acting} onClick={() => onResolve(item.id, "resolved")}>
           Resolve
         </button>
@@ -83,6 +92,27 @@ export function AttentionQueue({
     }
   };
 
+  const retryDebrief = async (attentionId: string) => {
+    setActingId(attentionId);
+    setError(null);
+    try {
+      const response = await fetch("/api/completion-debriefs/rearm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ attentionId }),
+      });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => ({}))) as { error?: string };
+        setError(payload.error ?? `Retry failed (${response.status}).`);
+      }
+    } catch (fetchError) {
+      setError(fetchError instanceof Error ? fetchError.message : String(fetchError));
+    } finally {
+      setActingId(null);
+      onChanged();
+    }
+  };
+
   if (items === null) {
     return (
       <section className="attention-queue" aria-label="Attention queue">
@@ -106,7 +136,13 @@ export function AttentionQueue({
         <p className="empty-note">Nothing needs you — the monitor and triage are on it.</p>
       ) : (
         open.map((item) => (
-          <QueueRow key={item.id} item={item} acting={actingId === item.id} onResolve={resolve} />
+          <QueueRow
+            key={item.id}
+            item={item}
+            acting={actingId === item.id}
+            onResolve={resolve}
+            onRetry={retryDebrief}
+          />
         ))
       )}
       {closed.length > 0 ? (

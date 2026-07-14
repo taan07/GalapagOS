@@ -87,7 +87,7 @@ export type MonitorDeps = {
    * the trigger; the retirement result travels separately so narration can
    * report a failure instead of claiming a clean stop.
    */
-  onDigestReviewed?: (input: { projectId: string; workerId: string }) => void;
+  onDigestReviewed?: (input: { projectId: string; workerId: string; digestId: string }) => void;
   broadcast?: (event: MonitorBroadcast) => void;
   now?: () => Date;
 };
@@ -567,7 +567,7 @@ export function createMonitor(deps: MonitorDeps) {
         changed = retirementResult.attentionChanged || changed;
         // Verification — not retirement success — creates the debrief. The
         // wake reads the recorded stop outcome and must state it exactly.
-        deps.onDigestReviewed?.({ projectId: project.id, workerId: worker.id });
+        deps.onDigestReviewed?.({ projectId: project.id, workerId: worker.id, digestId: digest.id });
       }
     }
     return changed;

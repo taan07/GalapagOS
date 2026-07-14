@@ -177,7 +177,12 @@ async function fixture(
             }
           : { status: "pending" as const };
       debriefSeeds.push(
-        buildCompletionDebrief({ workerId, laneName: "auth ui", retirement: view }).seed,
+        buildCompletionDebrief({
+          digestId: digest?.id ?? "missing",
+          workerId,
+          laneName: "auth ui",
+          retirement: view,
+        }).seed,
       );
     },
     runTriage: async (target) => {
@@ -443,6 +448,8 @@ test("verified evidence survives retirement failure and Darwin receives the hone
   assert.equal(debriefSeeds.length, 1, "verification still creates one debrief obligation");
   assert.match(debriefSeeds[0] ?? "", /Retirement FAILED after verification/);
   assert.match(debriefSeeds[0] ?? "", /transport unavailable/);
+  assert.match(debriefSeeds[0] ?? "", new RegExp(digest.id));
+  assert.match(debriefSeeds[0] ?? "", /digest_id/);
   assert.doesNotMatch(debriefSeeds[0] ?? "", /auto-retired it cleanly/);
 
   await monitor.tick();

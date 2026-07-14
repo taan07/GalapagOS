@@ -113,10 +113,46 @@ CREATE TABLE IF NOT EXISTS completion_retirements (
 CREATE INDEX IF NOT EXISTS idx_completion_retirements_project
   ON completion_retirements(project_id, status);
 
+-- One durable user-debrief obligation per verified digest. Attempts are a
+-- separate append-only diagnostic trail: restarts can recover the queue and
+-- explain exactly when/why delivery failed without replaying model calls.
+CREATE TABLE IF NOT EXISTS completion_debriefs (
+  digest_id TEXT PRIMARY KEY REFERENCES completion_digests(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  worker_id TEXT NOT NULL REFERENCES workers(id),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  due_at TEXT NOT NULL,
+  last_failure_kind TEXT CHECK (last_failure_kind IN ('transient', 'non_retryable')),
+  last_error_code TEXT,
+  last_error TEXT,
+  last_attempt_at TEXT,
+  narrated_at TEXT,
+  attention_id TEXT REFERENCES attention_items(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_completion_debriefs_project_due
+  ON completion_debriefs(project_id, status, due_at);
+
+CREATE TABLE IF NOT EXISTS completion_debrief_attempts (
+  id TEXT PRIMARY KEY,
+  digest_id TEXT NOT NULL REFERENCES completion_debriefs(digest_id),
+  attempt_number INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+  context TEXT NOT NULL,
+  failure_kind TEXT CHECK (failure_kind IN ('transient', 'non_retryable')),
+  error_code TEXT,
+  error TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  UNIQUE(digest_id, attempt_number)
+);
+
 -- kind: lane_violation | stale_worker | question_for_user | unsupported_claim |
 --       check_failed | decision_needed | unstructured_completion | worker_failed |
 --       integrity_alert | tool_denied | worker_abandoned |
---       worker_retirement_failed
+--       worker_retirement_failed | completion_debrief_failed
 CREATE TABLE IF NOT EXISTS attention_items (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),

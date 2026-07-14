@@ -49,7 +49,7 @@ import { getAttentionItem, resolveAttentionItem } from "../adapters/db/repos/att
 import { existsSync } from "node:fs";
 import { getLane } from "../adapters/db/repos/lanes";
 import { getWorker as getWorkerRow } from "../adapters/db/repos/workers";
-import { latestDigestForWorker } from "../adapters/db/repos/digests";
+import { getCompletionDigest } from "../adapters/db/repos/digests";
 import { getCompletionRetirement } from "../adapters/db/repos/retirements";
 import { CHECK_KEYS, latestRunsByKey } from "../adapters/db/repos/evidence";
 import { parseStatusPorcelain } from "../core/git/parsers";
@@ -67,6 +67,12 @@ import {
   type LiveTurnSnapshot,
 } from "./live-turn-snapshot";
 import { buildCompletionDebrief } from "./completion-debrief";
+import {
+  createCompletionDebriefScheduler,
+  type DebriefAttemptContext,
+  type DebriefRunResult,
+} from "./completion-debrief-scheduler";
+import type { CompletionDebriefRow } from "../adapters/db/repos/debriefs";
 
 const db = openDb(config.stateDir);
 // The only module-level state: live SSE clients, per-project busy flags, the
@@ -92,9 +98,6 @@ const managerModelOverrides = new Map<string, string>();
 // already frozen, so we hold the latest stray here and wake Darwin the instant
 // the turn lock frees — never forking his session.
 const pendingLaneWakes = new Map<string, LaneViolationNotice>();
-// Completions that passed the quality gate while Darwin was mid-turn: each
-// queues for its own narrated debrief when the lock frees (track C).
-const pendingCompletionWakes = new Map<string, string[]>();
 // Triage-card answers that landed while Darwin was mid-turn (track E): each
 // queues for its own pickup turn when the lock frees.
 const pendingAnswerWakes = new Map<
@@ -115,6 +118,89 @@ const workers = createWorkerRuntime({
   // worker's event loop on a manager turn).
   onLaneViolation: (notice) => {
     void wakeManagerForLaneViolation(notice);
+  },
+});
+
+function buildDebriefAttemptContext(row: CompletionDebriefRow): DebriefAttemptContext | null {
+  const project = getProject(db, row.project_id);
+  const worker = getWorkerRow(db, row.worker_id);
+  const digest = getCompletionDigest(db, row.digest_id);
+  if (!project || !worker || !digest || digest.worker_id !== worker.id) {
+    return null;
+  }
+  const lane = getLane(db, worker.lane_id);
+  const laneName = lane?.name ?? "(unknown lane)";
+  // Resolve at actual attempt time: a delayed debrief reports the latest
+  // retirement retry result while remaining pinned to its original digest.
+  const retirement = getCompletionRetirement(db, row.digest_id);
+  const retirementView = retirement?.status === "succeeded"
+    ? { status: "succeeded" as const }
+    : retirement?.status === "failed"
+      ? {
+          status: "failed" as const,
+          reason: retirement.last_error ?? "no failure reason was recorded",
+          retryable: retirement.failure_kind === "transient",
+        }
+      : { status: retirement?.status ?? "pending" as const };
+  const { noteText, seed } = buildCompletionDebrief({
+    digestId: row.digest_id,
+    workerId: worker.id,
+    laneName,
+    retirement: retirementView,
+  });
+  return {
+    digestId: row.digest_id,
+    workerId: worker.id,
+    laneName,
+    retirementStatus: retirement?.status ?? "missing",
+    retirementFailureKind: retirement?.failure_kind ?? null,
+    retirementError: retirement?.last_error ?? null,
+    model: managerModelOverrides.get(project.id) ?? config.managerModel,
+    seed,
+    noteText,
+  };
+}
+
+const completionDebriefs = createCompletionDebriefScheduler({
+  db,
+  isProjectBusy: (projectId) => busyProjects.has(projectId),
+  buildContext: buildDebriefAttemptContext,
+  runAttempt: async (row, _queuedContext, begin) => {
+    const project = getProject(db, row.project_id);
+    if (!project) {
+      return {
+        ok: false,
+        failureKind: "non_retryable",
+        errorCode: "project_missing",
+        error: `Project ${row.project_id} no longer exists.`,
+      };
+    }
+    // Delivery succeeds at turn_complete, not after the optional distillation
+    // fork. A restart during paperwork must not duplicate a debrief the user
+    // already received.
+    return new Promise<DebriefRunResult>((resolve) => {
+      void runAutonomousManagerTurn({
+        project,
+        seed: "",
+        noteText: "",
+        logTag: `narrator:${row.digest_id}`,
+        refreshTurn: () => buildDebriefAttemptContext(row),
+        onTurnBeginning: begin,
+        onTurnSettled: resolve,
+      })
+        .then(resolve)
+        .catch((error) => {
+          resolve({
+            ok: false,
+            failureKind: "transient",
+            errorCode: "runner_exception",
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+    });
+  },
+  onAttentionChanged: (projectId) => {
+    broadcast({ type: "attention_changed", projectId });
   },
 });
 const decisions = createDecisionBroker();
@@ -141,8 +227,9 @@ const monitor = createMonitor({
   // marker so the retirement reads honestly.
   // The narrator (track C): a verified completion wakes Darwin to debrief the
   // user. Fire-and-forget — the tick never waits on a model turn.
-  onDigestReviewed: ({ projectId, workerId }) => {
-    void wakeManagerForWorkerCompletion(projectId, workerId);
+  onDigestReviewed: ({ projectId, workerId, digestId }) => {
+    completionDebriefs.ensure({ projectId, workerId, digestId });
+    void completionDebriefs.drain(projectId);
   },
   retireWorker: async (workerId, reason) => {
     const outcome = await workers.stop(workerId, reason, { intent: "force" });
@@ -624,7 +711,7 @@ async function handleManagerMessage(
     // A worker may have strayed or completed while this turn ran — handle
     // both now that Darwin is free, strays first.
     drainPendingLaneWake(projectId);
-    drainPendingCompletionWake(projectId);
+    void completionDebriefs.drain(projectId);
     drainPendingAnswerWake(projectId);
   }
 }
@@ -677,8 +764,30 @@ async function runAutonomousManagerTurn(input: {
   seed: string;
   noteText: string;
   logTag: string;
-}): Promise<void> {
-  const { project, seed, noteText, logTag } = input;
+  refreshTurn?: () => DebriefAttemptContext | null;
+  onTurnBeginning?: (context: DebriefAttemptContext) => void;
+  onTurnSettled?: (result: DebriefRunResult) => void;
+}): Promise<DebriefRunResult> {
+  const { project, logTag } = input;
+  let seed = input.seed;
+  let noteText = input.noteText;
+  let actualDebriefContext: DebriefAttemptContext | null = null;
+  let result: DebriefRunResult = {
+    ok: false,
+    failureKind: "transient",
+    errorCode: "turn_incomplete",
+    error: "The autonomous manager turn ended without a successful result.",
+  };
+  let turnCompleted = false;
+  let turnError: string | null = null;
+  let turnReported = false;
+  const reportTurn = (outcome: DebriefRunResult) => {
+    result = outcome;
+    if (!turnReported) {
+      turnReported = true;
+      input.onTurnSettled?.(outcome);
+    }
+  };
   busyProjects.add(project.id);
   // Autonomous turns arm the same mid-turn surface as user turns: a tab that
   // loads while Darwin narrates sees him working, not a dead page.
@@ -686,7 +795,6 @@ async function runAutonomousManagerTurn(input: {
     status: { status: "thinking", label: "Thinking" },
     text: "",
   });
-  broadcast({ type: "manager_note", projectId: project.id, text: noteText });
   try {
     // Respect the fork invariant: never start a turn while the previous turn's
     // distillation fork is still running. Turn-lock decoupled distill from the
@@ -695,6 +803,22 @@ async function runAutonomousManagerTurn(input: {
     if (pendingDistill) {
       await pendingDistill;
     }
+    const refreshed = input.refreshTurn?.();
+    if (input.refreshTurn && !refreshed) {
+      reportTurn({
+        ok: false,
+        failureKind: "non_retryable",
+        errorCode: "context_missing",
+        error: "The digest-bound debrief context no longer exists.",
+      });
+      return result;
+    }
+    if (refreshed) {
+      seed = refreshed.seed;
+      noteText = refreshed.noteText;
+      actualDebriefContext = refreshed;
+    }
+    broadcast({ type: "manager_note", projectId: project.id, text: noteText });
     // Honor the project's manager-model override (e.g. the user switched Darwin
     // to Opus after a Fable limit) so the autonomous turn uses the live model.
     const activeManagerModel = managerModelOverrides.get(project.id) ?? config.managerModel;
@@ -707,6 +831,10 @@ async function runAutonomousManagerTurn(input: {
     // Same staleness rule as user turns: the distill gate above can hold for
     // a while, and the mode must bind at TURN start, not wake time.
     const projectAtTurnStart = getProject(db, project.id) ?? project;
+    const broadcastEmit = makeTurnEmit(project.id);
+    if (actualDebriefContext) {
+      input.onTurnBeginning?.(actualDebriefContext);
+    }
     const outcome = await runManagerTurn({
       db,
       config: effectiveConfig,
@@ -715,13 +843,32 @@ async function runAutonomousManagerTurn(input: {
       // Autonomous turns have no chat stream — the /events broadcast is the
       // ONLY path anything (decision cards, live status, prose) reaches the
       // user. Full parity with user turns via the shared emit.
-      emit: makeTurnEmit(project.id),
+      emit: (event) => {
+        if (event.type === "turn_error") {
+          turnError = event.message;
+        }
+        broadcastEmit(event);
+      },
       abortController: turnController,
       workers,
       decisions,
       mode: projectAutonomyMode(projectAtTurnStart),
       onPlanApproved: () => approvePlanSignOff(project.id),
     });
+    turnCompleted = outcome.completed;
+    if (outcome.completed) {
+      reportTurn({ ok: true });
+    } else if (outcome.interrupted) {
+      reportTurn({
+        ok: false,
+        failureKind: "non_retryable",
+        errorCode: "user_interrupted",
+        error: "The autonomous debrief was interrupted by the user.",
+      });
+    } else {
+      const error = turnError ?? "The manager turn returned without completing.";
+      reportTurn(classifyAutonomousFailure(error));
+    }
     if (outcome.completed || outcome.interrupted) {
       const distillController = new AbortController();
       activeTurnControllers.set(project.id, distillController);
@@ -745,9 +892,11 @@ async function runAutonomousManagerTurn(input: {
       });
     }
   } catch (error) {
-    console.error(
-      `[${logTag}] autonomous manager turn failed for ${project.slug}: ${error instanceof Error ? error.message : String(error)}`,
-    );
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[${logTag}] autonomous manager turn failed for ${project.slug}: ${message}`);
+    // Once turn_complete was emitted, the user received the debrief. A later
+    // distillation failure is bookkeeping debt, not narration failure.
+    reportTurn(turnCompleted ? { ok: true } : classifyAutonomousFailure(message));
   } finally {
     activeTurnControllers.delete(project.id);
     busyProjects.delete(project.id);
@@ -757,9 +906,24 @@ async function runAutonomousManagerTurn(input: {
     // A worker may have strayed or completed during this turn — handle both,
     // strays first (a frozen worker is bleeding urgency; a debrief keeps).
     drainPendingLaneWake(project.id);
-    drainPendingCompletionWake(project.id);
+    void completionDebriefs.drain(project.id);
     drainPendingAnswerWake(project.id);
   }
+  reportTurn(result);
+  return result;
+}
+
+function classifyAutonomousFailure(message: string): DebriefRunResult {
+  if (/not logged in|credential|keychain|authentication/i.test(message)) {
+    return { ok: false, failureKind: "non_retryable", errorCode: "auth", error: message };
+  }
+  if (isUsageLimitError(message)) {
+    return { ok: false, failureKind: "transient", errorCode: "usage_limit", error: message };
+  }
+  if (/timeout|timed out/i.test(message)) {
+    return { ok: false, failureKind: "transient", errorCode: "timeout", error: message };
+  }
+  return { ok: false, failureKind: "transient", errorCode: "turn_error", error: message };
 }
 
 /** Wake Darwin for a stray that queued while the project was busy, if any. */
@@ -768,68 +932,6 @@ function drainPendingLaneWake(projectId: string): void {
   if (pending) {
     pendingLaneWakes.delete(projectId);
     void wakeManagerForLaneViolation(pending);
-  }
-}
-
-/**
- * The narrator (principles 1 and 5): a completion that passed the quality
- * gate becomes a daemon-initiated manager turn — Darwin debriefs the user in
- * conversation, linking the diffs and green checks on /workers. Same
- * discipline as the lane wake: never fork a busy session; queued completions
- * drain one debrief at a time when the lock frees.
- */
-async function wakeManagerForWorkerCompletion(projectId: string, workerId: string): Promise<void> {
-  const project = getProject(db, projectId);
-  if (!project) {
-    return;
-  }
-  const worker = getWorkerRow(db, workerId);
-  const lane = worker ? getLane(db, worker.lane_id) : undefined;
-  const laneName = lane?.name ?? "(unknown lane)";
-  const digest = worker ? latestDigestForWorker(db, worker.id) : undefined;
-  const retirement = digest ? getCompletionRetirement(db, digest.id) : undefined;
-  const retirementView = retirement?.status === "succeeded"
-    ? { status: "succeeded" as const }
-    : retirement?.status === "failed"
-      ? {
-          status: "failed" as const,
-          reason: retirement.last_error ?? "no failure reason was recorded",
-          retryable: retirement.failure_kind === "transient",
-        }
-      : { status: retirement?.status ?? "pending" as const };
-  const { noteText, seed } = buildCompletionDebrief({
-    workerId,
-    laneName,
-    retirement: retirementView,
-  });
-
-  if (busyProjects.has(project.id)) {
-    // Debriefs keep: queue every completion and drain them in order when the
-    // turn lock frees — unlike lane strays, each one deserves its own turn.
-    // The includes() dedupe covers the queue only, not a debrief currently
-    // running — exactly-once here leans on the monitor firing once per
-    // worker (manager_reviewed digests leave listUnreviewedDigests).
-    const queue = pendingCompletionWakes.get(project.id) ?? [];
-    if (!queue.includes(workerId)) {
-      queue.push(workerId);
-    }
-    pendingCompletionWakes.set(project.id, queue);
-    broadcast({ type: "manager_note", projectId: project.id, text: noteText });
-    return;
-  }
-
-  await runAutonomousManagerTurn({ project, seed, noteText, logTag: "narrator" });
-}
-
-/** Debrief the oldest completion that queued while the project was busy. */
-function drainPendingCompletionWake(projectId: string): void {
-  const queue = pendingCompletionWakes.get(projectId);
-  const next = queue?.shift();
-  if (queue && queue.length === 0) {
-    pendingCompletionWakes.delete(projectId);
-  }
-  if (next) {
-    void wakeManagerForWorkerCompletion(projectId, next);
   }
 }
 
@@ -1289,6 +1391,25 @@ async function handleResolveAttention(
   sendJson(res, 200, { ok: true });
 }
 
+async function handleRearmCompletionDebrief(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const body = await readBody(req);
+  const attentionId = asString(body.attentionId);
+  if (!attentionId) {
+    sendJson(res, 400, { error: "attentionId is required." });
+    return;
+  }
+  const rearmed = completionDebriefs.rearmByAttention(attentionId);
+  if (!rearmed) {
+    sendJson(res, 409, { error: "That debrief is not in a re-armable failed state." });
+    return;
+  }
+  sendJson(res, 200, { ok: true, digestId: rearmed.digest_id });
+  void completionDebriefs.drain(rearmed.project_id);
+}
+
 async function handleChooseFolder(res: http.ServerResponse): Promise<void> {
   try {
     const result = await chooseFolder(config.devRoot);
@@ -1387,6 +1508,12 @@ const server = http.createServer((req, res) => {
   }
   if (route === "POST /manager/message") {
     void handleManagerMessage(req, res).catch((error) => {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    });
+    return;
+  }
+  if (route === "POST /completion-debriefs/rearm") {
+    void handleRearmCompletionDebrief(req, res).catch((error) => {
       sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     });
     return;
@@ -1490,6 +1617,24 @@ void (async () => {
       `[workers] orphan reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+
+  const recoveredDebriefs = completionDebriefs.recover();
+  if (recoveredDebriefs.length > 0) {
+    console.log(
+      `[narrator] recovered ${recoveredDebriefs.length} interrupted debrief attempt${recoveredDebriefs.length === 1 ? "" : "s"}`,
+    );
+  }
+  for (const project of listProjects(db)) {
+    void completionDebriefs.drain(project.id);
+  }
+  // Durable due_at owns retry timing; this poll only wakes due work. Busy
+  // projects remain untouched and consume no attempt until runManagerTurn
+  // actually begins.
+  setInterval(() => {
+    for (const project of listProjects(db)) {
+      void completionDebriefs.drain(project.id);
+    }
+  }, 5_000).unref();
 
   await resolveCodeIdentity();
   monitor.start();

@@ -100,6 +100,16 @@ completion_retirements(digest_id PK FK, project_id FK, worker_id FK,
                        failure_kind NULL, last_error NULL,          -- transient|non_retryable
                        last_attempt_at NULL, retired_at NULL,
                        created_at, updated_at)
+completion_debriefs(digest_id PK FK, project_id FK, worker_id FK,
+                    status, attempts, due_at,                      -- pending|running|succeeded|failed
+                    last_failure_kind NULL, last_error_code NULL,
+                    last_error NULL, last_attempt_at NULL,
+                    narrated_at NULL, attention_id NULL,
+                    created_at, updated_at)
+completion_debrief_attempts(id PK, digest_id FK, attempt_number,
+                            status, context JSON,                  -- running|succeeded|failed
+                            failure_kind NULL, error_code NULL,
+                            error NULL, started_at, finished_at NULL)
 attention_items(id PK, project_id FK, worker_id NULL, kind,
                 -- lane_violation|stale_worker|question_for_user|unsupported_claim|
                 -- check_failed|decision_needed|unstructured_completion|worker_failed|
@@ -204,6 +214,17 @@ failed retirement leaves the digest verified, creates high-priority attention
 with its classified reason, and may be retried only when the failure is
 classified transient. Darwin must narrate the recorded outcome and must never
 claim a clean retirement without `status = succeeded`.
+
+Every verified digest also creates one durable, digest-keyed debrief obligation
+in `completion_debriefs`; process-local queues are forbidden. Busy time never
+consumes an attempt. The scheduler resolves the digest and its current
+retirement row immediately before each model call, records an append-only
+attempt with context and timestamps, then tries at most three actual calls:
+immediately, after 30 seconds, and after a further 2 minutes. Restarts recover
+both queued and interrupted work. Transient failures retain a reason/code and
+retry at `due_at`; non-retryable or exhausted failures create high-priority
+attention and wait for an explicit user re-arm. A successful debrief records
+`narrated_at` and resolves that attention.
 
 **Distillation:** after each manager turn, enqueue a `distill` job — one cheap
 follow-up prompt: "record any durable outcomes of this exchange using

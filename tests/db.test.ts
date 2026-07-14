@@ -31,7 +31,7 @@ function tmpDir(prefix: string): string {
   return mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
-test("opening a pre-retirement database adds the independent lifecycle table", () => {
+test("opening a pre-lifecycle database adds retirement and durable debrief tables", () => {
   const stateDir = tmpDir("glp-pre-retirement-");
   const legacy = new Database(path.join(stateDir, "state.db"));
   // Exact pre-change shape: CREATE IF NOT EXISTS must preserve this table and
@@ -74,6 +74,12 @@ test("opening a pre-retirement database adds the independent lifecycle table", (
     false,
     "verification status was not overloaded by migration",
   );
+  const debriefColumns = db.pragma("table_info(completion_debriefs)") as { name: string }[];
+  assert.ok(debriefColumns.some((column) => column.name === "due_at"));
+  assert.ok(debriefColumns.some((column) => column.name === "narrated_at"));
+  const attemptColumns = db.pragma("table_info(completion_debrief_attempts)") as { name: string }[];
+  assert.ok(attemptColumns.some((column) => column.name === "context"));
+  assert.ok(attemptColumns.some((column) => column.name === "error_code"));
   db.close();
 });
 

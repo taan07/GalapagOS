@@ -10,7 +10,11 @@ import {
   listOpenAttentionItems,
   resolveAttentionItem,
 } from "../db/repos/attention";
-import { latestDigestForWorker, setDigestStatus } from "../db/repos/digests";
+import {
+  getCompletionDigest,
+  latestDigestForWorker,
+  setDigestStatus,
+} from "../db/repos/digests";
 import { buildWorkerEvidence } from "../evidence/adapter";
 import { scoreWorker } from "../../core/confidence/engine";
 import { getLane, laneGlobs } from "../db/repos/lanes";
@@ -182,7 +186,7 @@ function renderWorkerStatus(view: WorkerStatusView): string {
       : "",
     `last activity: ${worker.last_message_at ?? "(none yet)"}${worker.last_summary ? ` — ${worker.last_summary}` : ""}`,
     digest
-      ? `completion digest (${digest.status}): ${digest.narrative}`
+      ? `completion digest ${digest.id} (${digest.status}): ${digest.narrative}`
       : "no completion digest — NOT done, whatever the transcript claims",
   ].filter(Boolean);
 
@@ -945,9 +949,9 @@ export function createManagerToolServer(context: ManagerToolContext) {
       ),
       tool(
         "worker_status",
-        "Full status of one worker: lane contract, liveness, completion digest (or its honest absence), open attention items, and the most recent events.",
-        { id: z.string() },
-        async ({ id }) => {
+        "Full status of one worker: lane contract, liveness, completion digest (or its honest absence), open attention items, and the most recent events. Pass digest_id when narrating a queued completion so a newer digest cannot replace the one being reported.",
+        { id: z.string(), digest_id: z.string().optional() },
+        async ({ id, digest_id }) => {
           const bridge = requireWorkers();
           if (!bridge) {
             return text("Worker control is not available in this context.");
@@ -957,7 +961,15 @@ export function createManagerToolServer(context: ManagerToolContext) {
             emit("worker_status", `no worker ${id}`, "");
             return text(`No worker with id ${id}. Use list_workers to see what exists.`);
           }
-          const rendered = renderWorkerStatus(view);
+          const requestedDigest = digest_id && context.db
+            ? getCompletionDigest(context.db, digest_id)
+            : undefined;
+          if (digest_id && (!requestedDigest || requestedDigest.worker_id !== id)) {
+            return text(`Digest ${digest_id} does not belong to worker ${id}.`);
+          }
+          const rendered = renderWorkerStatus(
+            requestedDigest ? { ...view, digest: requestedDigest } : view,
+          );
           emit(
             "worker_status",
             `checked worker ${id.slice(0, 8)} [${view.worker.status}]`,

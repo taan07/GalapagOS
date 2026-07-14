@@ -33,7 +33,11 @@ export type AttentionKind =
   | "worker_abandoned"
   // A verified completion whose worker/lane could not be retired. Evidence
   // remains verified; this item makes the separate lifecycle failure loud.
-  | "worker_retirement_failed";
+  | "worker_retirement_failed"
+  // A verified completion whose autonomous user debrief exhausted retries or
+  // hit a non-retryable failure. The digest remains verified and retryable by
+  // explicit user action.
+  | "completion_debrief_failed";
 
 export type AttentionStatus = "open" | "resolved" | "dismissed";
 
