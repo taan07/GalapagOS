@@ -117,9 +117,23 @@ target repo. Frontmatter key `glp_type`; `written_by: Galapagos`; create with
 `wx` flag (never overwrite); open statuses on create; closed statuses
 (`resolved|done|approved|superseded|archived`) only via update.
 
-Eight types: `manager_synthesis`, `active_goal`, `implementation_plan`,
+Nine types: `manager_synthesis`, `active_goal`, `implementation_plan`,
 `open_question`, `user_answer`, `routed_clarification`, `worker_brief`,
-`decision`.
+`decision`, `style_contract`.
+
+`style_contract` is the durable "how to work with me" contract: standing user
+preferences about tone, response shape, autonomy, process, and red lines. It
+is doctrine, not a transcript or a place for one-off requests. Its type
+directory is `style/`; creation requires the common frontmatter plus
+`glp_type: style_contract` and `status: active`. It has no additional required
+type-specific frontmatter. When a preference changes, update or supersede the
+existing contract instead of leaving contradictory active contracts.
+
+Every re-brief loads all non-closed `style_contract` records ahead of project
+synthesis, goals, questions, and answers so compaction cannot reset Darwin's
+working relationship with the user. Until the first stored contract exists,
+the manager supplies the built-in baseline style contract; the baseline is
+runtime doctrine and is not fabricated as a committed record.
 
 `decision` required frontmatter: `decision_options[]`, `chosen_path` (required
 before any closed status), `rollback_note`, `confidence_impact`,
