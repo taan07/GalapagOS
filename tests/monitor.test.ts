@@ -18,6 +18,7 @@ import {
   listWorkerAttentionItems,
 } from "../src/adapters/db/repos/attention";
 import { createCompletionDigest, latestDigestForWorker } from "../src/adapters/db/repos/digests";
+import { getCompletionRetirement } from "../src/adapters/db/repos/retirements";
 import {
   createEvidenceRun,
   evidenceRunsKey,
@@ -28,7 +29,8 @@ import { countWorkerEvents, getWorker } from "../src/adapters/db/repos/workers";
 import { createWorkerRuntime } from "../src/adapters/agent/worker-runtime";
 import type { WorkerSession } from "../src/adapters/agent/worker-session";
 import { observeWorkspaceEvidence } from "../src/adapters/evidence/workspace";
-import { createMonitor, type MonitorBroadcast } from "../src/daemon/monitor";
+import { createMonitor, type MonitorBroadcast, type MonitorDeps } from "../src/daemon/monitor";
+import { buildCompletionDebrief } from "../src/daemon/completion-debrief";
 
 function fixtureRepo(): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), "glp-mon-repo-"));
@@ -86,9 +88,12 @@ type Fixture = {
   legs: LegBehavior;
   legRuns: string[];
   retired: { workerId: string; reason: string }[];
+  debriefSeeds: string[];
 };
 
-async function fixture(): Promise<Fixture> {
+async function fixture(
+  options: { retireWorker?: MonitorDeps["retireWorker"] } = {},
+): Promise<Fixture> {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "glp-mon-state-"));
   const config = loadConfig({ ...process.env, GALAPAGOS_STATE_DIR: stateDir });
   const db = openDb(stateDir);
@@ -145,6 +150,7 @@ async function fixture(): Promise<Fixture> {
       });
     };
   const retired: { workerId: string; reason: string }[] = [];
+  const debriefSeeds: string[] = [];
   const monitor = createMonitor({
     db,
     config,
@@ -152,8 +158,27 @@ async function fixture(): Promise<Fixture> {
     broadcast: (event) => events.push(event),
     runWatchdog: fakeLeg("watchdog"),
     runCritic: fakeLeg("critic"),
-    retireWorker: async (workerId, reason) => {
-      retired.push({ workerId, reason });
+    retireWorker:
+      options.retireWorker ??
+      (async (workerId, reason) => {
+        retired.push({ workerId, reason });
+        return { ok: true };
+      }),
+    onDigestReviewed: ({ workerId }) => {
+      const digest = latestDigestForWorker(db, workerId);
+      const retirement = digest ? getCompletionRetirement(db, digest.id) : undefined;
+      const view = retirement?.status === "succeeded"
+        ? { status: "succeeded" as const }
+        : retirement?.status === "failed"
+          ? {
+              status: "failed" as const,
+              reason: retirement.last_error ?? "unknown",
+              retryable: retirement.failure_kind === "transient",
+            }
+          : { status: "pending" as const };
+      debriefSeeds.push(
+        buildCompletionDebrief({ workerId, laneName: "auth ui", retirement: view }).seed,
+      );
     },
     runTriage: async (target) => {
       // The real triage records its job — the trigger cutoff depends on it.
@@ -174,6 +199,7 @@ async function fixture(): Promise<Fixture> {
     legs,
     legRuns,
     retired,
+    debriefSeeds,
   };
 }
 
@@ -308,7 +334,7 @@ test("claims without evidence raise unsupported_claim; new evidence auto-resolve
 });
 
 test("a clean completion is auto-reviewed only after ALL legs return clean", async () => {
-  const { db, workerId, worktree, monitor, events, legRuns } = await fixture();
+  const { db, workerId, worktree, monitor, events, legRuns, retired } = await fixture();
   setStatus(db, workerId, "idle");
   const worker = getWorker(db, workerId);
   assert.ok(worker);
@@ -357,8 +383,124 @@ test("a clean completion is auto-reviewed only after ALL legs return clean", asy
   assert.ok(
     events.some((event) => event.type === "digest_reviewed" && event.workerId === workerId),
   );
+  const digest = latestDigestForWorker(db, workerId);
+  assert.ok(digest);
+  assert.equal(getCompletionRetirement(db, digest.id)?.status, "succeeded");
+  assert.equal(retired.length, 1, "retirement is its own recorded step");
   await monitor.tick();
   assert.equal(legRuns.length, 2, "verdicts are not re-run while fresh");
+});
+
+test("verified evidence survives retirement failure and Darwin receives the honest failure", async () => {
+  const reason = "worker session refused to stop: transport unavailable";
+  const { db, workerId, worktree, monitor, debriefSeeds } = await fixture({
+    retireWorker: async () => ({
+      ok: false,
+      reason,
+      failureKind: "non_retryable",
+    }),
+  });
+  setStatus(db, workerId, "idle");
+  const worker = getWorker(db, workerId);
+  assert.ok(worker);
+  createCompletionDigest(db, {
+    workerId,
+    narrative: "done",
+    beforeAfter: [],
+    claims: [{ text: "tests pass", evidence_kind: "test", files: [] }],
+    touchedAreas: [],
+  });
+  const workspace = await observeWorkspaceEvidence(worktree);
+  for (const key of ["typecheck", "test"] as const) {
+    createEvidenceRun(db, {
+      projectId: worker.project_id,
+      workerId,
+      checkKey: key,
+      status: "passed",
+      summary: "passed",
+      headSha: workspace.key,
+    });
+  }
+
+  await monitor.tick();
+  await settleLegs();
+  await monitor.tick();
+
+  const digest = latestDigestForWorker(db, workerId);
+  assert.ok(digest);
+  assert.equal(digest.status, "manager_reviewed", "retirement cannot erase verification");
+  const retirement = getCompletionRetirement(db, digest.id);
+  assert.equal(retirement?.status, "failed");
+  assert.equal(retirement?.failure_kind, "non_retryable");
+  assert.equal(retirement?.attempts, 1);
+  assert.match(retirement?.last_error ?? "", /transport unavailable/);
+  const attention = listWorkerAttentionItems(db, workerId).find(
+    (item) => item.kind === "worker_retirement_failed" && item.status === "open",
+  );
+  assert.equal(attention?.priority, "high");
+  assert.match(attention?.detail ?? "", /remains manager_reviewed/);
+  assert.match(attention?.detail ?? "", /transport unavailable/);
+  assert.equal(debriefSeeds.length, 1, "verification still creates one debrief obligation");
+  assert.match(debriefSeeds[0] ?? "", /Retirement FAILED after verification/);
+  assert.match(debriefSeeds[0] ?? "", /transport unavailable/);
+  assert.doesNotMatch(debriefSeeds[0] ?? "", /auto-retired it cleanly/);
+
+  await monitor.tick();
+  assert.equal(
+    getCompletionRetirement(db, digest.id)?.attempts,
+    1,
+    "non-retryable retirement failures do not spin every monitor tick",
+  );
+});
+
+test("a transient retirement failure retries safely and resolves its attention", async () => {
+  let attempts = 0;
+  const { db, workerId, worktree, monitor } = await fixture({
+    retireWorker: async () => {
+      attempts += 1;
+      return attempts === 1
+        ? { ok: false, reason: "worker is already being stopped", failureKind: "transient" }
+        : { ok: true };
+    },
+  });
+  setStatus(db, workerId, "idle");
+  const worker = getWorker(db, workerId);
+  assert.ok(worker);
+  createCompletionDigest(db, {
+    workerId,
+    narrative: "done",
+    beforeAfter: [],
+    claims: [{ text: "tests pass", evidence_kind: "test", files: [] }],
+    touchedAreas: [],
+  });
+  const workspace = await observeWorkspaceEvidence(worktree);
+  for (const key of ["typecheck", "test"] as const) {
+    createEvidenceRun(db, {
+      projectId: worker.project_id,
+      workerId,
+      checkKey: key,
+      status: "passed",
+      summary: "passed",
+      headSha: workspace.key,
+    });
+  }
+
+  await monitor.tick();
+  await settleLegs();
+  await monitor.tick();
+  const digest = latestDigestForWorker(db, workerId);
+  assert.ok(digest);
+  assert.equal(getCompletionRetirement(db, digest.id)?.status, "failed");
+  assert.equal(getCompletionRetirement(db, digest.id)?.failure_kind, "transient");
+
+  await monitor.tick();
+  assert.equal(attempts, 2);
+  assert.equal(getCompletionRetirement(db, digest.id)?.status, "succeeded");
+  const attention = listWorkerAttentionItems(db, workerId).find(
+    (item) => item.kind === "worker_retirement_failed",
+  );
+  assert.equal(attention?.status, "resolved");
+  assert.match(attention?.detail ?? "", /retired successfully on a later attempt/);
 });
 
 test("an unevidenced completion is NOT auto-reviewed, even with clean legs", async () => {

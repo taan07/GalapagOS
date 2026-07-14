@@ -30,7 +30,10 @@ export type AttentionKind =
   // Goal-progress chunk: a worker was deliberately stopped BEFORE its work
   // passed the quality gate (stop_worker intent "abandon") — visible so
   // unfinished work is never mistaken for retired-clean work.
-  | "worker_abandoned";
+  | "worker_abandoned"
+  // A verified completion whose worker/lane could not be retired. Evidence
+  // remains verified; this item makes the separate lifecycle failure loud.
+  | "worker_retirement_failed";
 
 export type AttentionStatus = "open" | "resolved" | "dismissed";
 

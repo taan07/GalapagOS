@@ -49,6 +49,8 @@ import { getAttentionItem, resolveAttentionItem } from "../adapters/db/repos/att
 import { existsSync } from "node:fs";
 import { getLane } from "../adapters/db/repos/lanes";
 import { getWorker as getWorkerRow } from "../adapters/db/repos/workers";
+import { latestDigestForWorker } from "../adapters/db/repos/digests";
+import { getCompletionRetirement } from "../adapters/db/repos/retirements";
 import { CHECK_KEYS, latestRunsByKey } from "../adapters/db/repos/evidence";
 import { parseStatusPorcelain } from "../core/git/parsers";
 import { checkViewsFrom, parseCommitLog } from "../core/worker-changes";
@@ -64,6 +66,7 @@ import {
   updateLiveSnapshot,
   type LiveTurnSnapshot,
 } from "./live-turn-snapshot";
+import { buildCompletionDebrief } from "./completion-debrief";
 
 const db = openDb(config.stateDir);
 // The only module-level state: live SSE clients, per-project busy flags, the
@@ -143,9 +146,25 @@ const monitor = createMonitor({
   },
   retireWorker: async (workerId, reason) => {
     const outcome = await workers.stop(workerId, reason, { intent: "force" });
-    if (!outcome.ok) {
-      console.error(`[monitor] auto-retire of ${workerId} refused: ${outcome.reason}`);
+    if (outcome.ok) {
+      return { ok: true };
     }
+    // A deploy can land after finalizeStop committed but before the durable
+    // retirement row was stamped. Treat the observable stopped+retired state
+    // as success; retrying stop would otherwise turn a completed fact into a
+    // false refusal.
+    const current = getWorkerRow(db, workerId);
+    const lane = current ? getLane(db, current.lane_id) : undefined;
+    if (current?.status === "stopped" && lane?.status === "retired") {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      reason: outcome.reason,
+      failureKind: /already being stopped/i.test(outcome.reason)
+        ? "transient" as const
+        : "non_retryable" as const,
+    };
   },
   runTriage: async (project) => {
     const outcome = await runTriageJob({
@@ -767,15 +786,22 @@ async function wakeManagerForWorkerCompletion(projectId: string, workerId: strin
   const worker = getWorkerRow(db, workerId);
   const lane = worker ? getLane(db, worker.lane_id) : undefined;
   const laneName = lane?.name ?? "(unknown lane)";
-  const noteText = `Worker "${laneName}" finished and its completion passed the quality gate — Darwin is preparing the debrief.`;
-  const seed =
-    `SYSTEM — worker completion.\n\n` +
-    `Worker ${workerId} (lane "${laneName}") finished its task and the completion PASSED the quality gate: the monitor verified its evidence and auto-retired it cleanly (digest status manager_reviewed).\n\n` +
-    `Debrief the user now, per your narrating-worker-events doctrine:\n` +
-    `1. Call worker_status ${workerId} for the digest — narrative, before → after, claims and their evidence.\n` +
-    `2. Compose the debrief in your reply: what the worker set out to do, what actually changed, the verified claims with their evidence status, and point the user at the diffs, commits, and green checks on the workers page (lane "${laneName}").\n` +
-    `3. Say plainly anything unfinished, deferred, or worth a follow-up.\n` +
-    `Answer-first and short — a colleague reporting a landed change, not a log dump.`;
+  const digest = worker ? latestDigestForWorker(db, worker.id) : undefined;
+  const retirement = digest ? getCompletionRetirement(db, digest.id) : undefined;
+  const retirementView = retirement?.status === "succeeded"
+    ? { status: "succeeded" as const }
+    : retirement?.status === "failed"
+      ? {
+          status: "failed" as const,
+          reason: retirement.last_error ?? "no failure reason was recorded",
+          retryable: retirement.failure_kind === "transient",
+        }
+      : { status: retirement?.status ?? "pending" as const };
+  const { noteText, seed } = buildCompletionDebrief({
+    workerId,
+    laneName,
+    retirement: retirementView,
+  });
 
   if (busyProjects.has(project.id)) {
     // Debriefs keep: queue every completion and drain them in order when the

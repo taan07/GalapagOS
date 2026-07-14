@@ -95,6 +95,11 @@ completion_digests(id PK, worker_id FK, narrative, before_after JSON,
                    claims JSON,                                     -- [{text, evidence_kind, evidence_run_id NULL, files[]}]
                    touched_areas JSON, status,                      -- parsed|manager_reviewed|escalated
                    created_at)
+completion_retirements(digest_id PK FK, project_id FK, worker_id FK,
+                       status, attempts,                            -- pending|running|succeeded|failed
+                       failure_kind NULL, last_error NULL,          -- transient|non_retryable
+                       last_attempt_at NULL, retired_at NULL,
+                       created_at, updated_at)
 attention_items(id PK, project_id FK, worker_id NULL, kind,
                 -- lane_violation|stale_worker|question_for_user|unsupported_claim|
                 -- check_failed|decision_needed|unstructured_completion|worker_failed|
@@ -191,6 +196,14 @@ product terms, always a free-text field — and the manager turn waits for
 the answer (10-minute timeout resolves as a deferral; user-confirmed
 2026-07-05).
 `write_record(type=decision)` triggers the checkpoint mechanism (section 8).
+
+**Completion lifecycle facts are independent.** `manager_reviewed` means the
+evidence passed; it never implies the worker stopped or the user received a
+debrief. Retirement is recorded separately in `completion_retirements`. A
+failed retirement leaves the digest verified, creates high-priority attention
+with its classified reason, and may be retried only when the failure is
+classified transient. Darwin must narrate the recorded outcome and must never
+claim a clean retirement without `status = succeeded`.
 
 **Distillation:** after each manager turn, enqueue a `distill` job — one cheap
 follow-up prompt: "record any durable outcomes of this exchange using

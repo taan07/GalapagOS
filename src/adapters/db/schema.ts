@@ -94,9 +94,29 @@ CREATE TABLE IF NOT EXISTS completion_digests (
 );
 CREATE INDEX IF NOT EXISTS idx_completion_digests_worker ON completion_digests(worker_id);
 
+-- Verification, retirement, and narration are distinct facts. This table
+-- records only the attempt to end the worker/lane after a digest is verified;
+-- a failed stop never rewrites manager_reviewed back into an evidence state.
+CREATE TABLE IF NOT EXISTS completion_retirements (
+  digest_id TEXT PRIMARY KEY REFERENCES completion_digests(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  worker_id TEXT NOT NULL REFERENCES workers(id),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  failure_kind TEXT CHECK (failure_kind IN ('transient', 'non_retryable')),
+  last_error TEXT,
+  last_attempt_at TEXT,
+  retired_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_completion_retirements_project
+  ON completion_retirements(project_id, status);
+
 -- kind: lane_violation | stale_worker | question_for_user | unsupported_claim |
 --       check_failed | decision_needed | unstructured_completion | worker_failed |
---       integrity_alert | tool_denied | worker_abandoned
+--       integrity_alert | tool_denied | worker_abandoned |
+--       worker_retirement_failed
 CREATE TABLE IF NOT EXISTS attention_items (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),

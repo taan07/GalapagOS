@@ -17,10 +17,22 @@ import {
   listWorkerAttentionItems,
   openAttentionItemExists,
   resolveAttentionItem,
+  updateAttentionDetail,
   type AttentionKind,
 } from "../adapters/db/repos/attention";
 import { listUnreviewedDigests, setDigestStatus } from "../adapters/db/repos/digests";
 import { latestJobByPayload } from "../adapters/db/repos/jobs";
+import {
+  ensureCompletionRetirement,
+  ensureReviewedRetirements,
+  failRetirement,
+  getCompletionRetirement,
+  listRetryableRetirements,
+  startRetirementAttempt,
+  succeedRetirement,
+  type CompletionRetirementRow,
+  type RetirementFailureKind,
+} from "../adapters/db/repos/retirements";
 import { getLane, laneGlobs, listActiveLanes, type LaneRow } from "../adapters/db/repos/lanes";
 import { listProjects, type ProjectRow } from "../adapters/db/repos/projects";
 import {
@@ -63,11 +75,17 @@ export type MonitorDeps = {
    * proves clean both reviews AND retires in one place, keeping the LLM-free
    * tick the single authority on "done".
    */
-  retireWorker: (workerId: string, reason: string) => Promise<void>;
+  retireWorker: (
+    workerId: string,
+    reason: string,
+  ) => Promise<
+    | { ok: true }
+    | { ok: false; reason: string; failureKind: RetirementFailureKind }
+  >;
   /**
-   * Fired right after a completion passes the quality gate and its worker is
-   * auto-retired — the narrator hook (track C). Must be fire-and-forget: the
-   * monitor tick makes zero LLM calls and never waits on one.
+   * Fired right after a completion passes the quality gate. Verification is
+   * the trigger; the retirement result travels separately so narration can
+   * report a failure instead of claiming a clean stop.
    */
   onDigestReviewed?: (input: { projectId: string; workerId: string }) => void;
   broadcast?: (event: MonitorBroadcast) => void;
@@ -129,6 +147,100 @@ export function createMonitor(deps: MonitorDeps) {
       priority: input.priority ?? "normal",
     });
     return true;
+  };
+
+  const retirementAttentionTitle = "Verified worker could not be retired";
+
+  const setRetirementAttention = (
+    project: ProjectRow,
+    retirement: CompletionRetirementRow,
+  ): boolean => {
+    const detail =
+      `Digest ${retirement.digest_id} remains manager_reviewed: its evidence passed. ` +
+      `Retirement attempt ${retirement.attempts} failed (${retirement.failure_kind ?? "unknown"}): ` +
+      `${retirement.last_error ?? "no reason recorded"}. ` +
+      (retirement.failure_kind === "transient"
+        ? "The monitor will retry safely; inspect the worker and lane before intervening."
+        : "Automatic retries are stopped; inspect the worker/lane and re-arm retirement deliberately.");
+    const existing = listOpenWorkerAttentionByKind(
+      db,
+      retirement.worker_id,
+      "worker_retirement_failed",
+    ).find((item) => item.title === retirementAttentionTitle);
+    if (existing) {
+      updateAttentionDetail(db, existing.id, detail);
+      return true;
+    }
+    createAttentionItem(db, {
+      projectId: project.id,
+      workerId: retirement.worker_id,
+      kind: "worker_retirement_failed",
+      title: retirementAttentionTitle,
+      detail,
+      priority: "high",
+    });
+    return true;
+  };
+
+  const resolveRetirementAttention = (workerId: string): boolean => {
+    let changed = false;
+    for (const item of listOpenWorkerAttentionByKind(db, workerId, "worker_retirement_failed")) {
+      resolveAttentionItem(
+        db,
+        item.id,
+        "resolved",
+        "The verified worker and lane were retired successfully on a later attempt.",
+      );
+      changed = true;
+    }
+    return changed;
+  };
+
+  const attemptRetirement = async (
+    project: ProjectRow,
+    retirement: CompletionRetirementRow,
+  ): Promise<{ state: CompletionRetirementRow; attentionChanged: boolean }> => {
+    startRetirementAttempt(db, retirement.digest_id, now().toISOString());
+    try {
+      const outcome = await deps.retireWorker(
+        retirement.worker_id,
+        "retired: quality passed",
+      );
+      if (outcome.ok) {
+        succeedRetirement(db, retirement.digest_id, now().toISOString());
+        return {
+          state: getCompletionRetirement(db, retirement.digest_id)!,
+          attentionChanged: resolveRetirementAttention(retirement.worker_id),
+        };
+      }
+      failRetirement(db, {
+        digestId: retirement.digest_id,
+        kind: outcome.failureKind,
+        error: outcome.reason,
+        at: now().toISOString(),
+      });
+    } catch (error) {
+      // Thrown stop failures are transport/session failures: retryable unless
+      // the worker runtime returns a classified refusal above.
+      failRetirement(db, {
+        digestId: retirement.digest_id,
+        kind: "transient",
+        error: error instanceof Error ? error.message : String(error),
+        at: now().toISOString(),
+      });
+    }
+    const failed = getCompletionRetirement(db, retirement.digest_id)!;
+    return { state: failed, attentionChanged: setRetirementAttention(project, failed) };
+  };
+
+  /** Recover a deploy-interrupted stop and retry only classified-safe states. */
+  const scanRetirements = async (project: ProjectRow): Promise<boolean> => {
+    let changed = ensureReviewedRetirements(db, project.id, now().toISOString()) > 0;
+    for (const retirement of listRetryableRetirements(db, project.id)) {
+      const result = await attemptRetirement(project, retirement);
+      changed = result.attentionChanged || changed;
+    }
+    return changed;
   };
 
   /** Staleness + abandoned questions: silence is only suspicious per episode. */
@@ -442,19 +554,19 @@ export function createMonitor(deps: MonitorDeps) {
       if (report.state === "strong" && openItems.length === 0) {
         setDigestStatus(db, digest.id, "manager_reviewed");
         deps.broadcast?.({ type: "digest_reviewed", projectId: project.id, workerId: worker.id });
-        // Quality passed → the short-lived contract ends. Fires exactly once:
-        // a manager_reviewed digest leaves listUnreviewedDigests. A retire
-        // failure must not kill the tick — the item stays reviewable.
-        try {
-          await deps.retireWorker(worker.id, "retired: quality passed");
-        } catch (error) {
-          console.error(
-            `[monitor] auto-retire failed for ${worker.id}: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-        // The narrator (principle 1): a VERIFIED completion is the moment
-        // worth a daemon-initiated manager turn — Darwin debriefs the user
-        // in conversation. Fire-and-forget; the tick stays LLM-free.
+        // Verification, retirement, and narration are independent facts. The
+        // stop is attempted immediately and recorded durably; failure leaves
+        // the digest verified, raises attention, and is safe to retry.
+        const retirement = ensureCompletionRetirement(db, {
+          digestId: digest.id,
+          projectId: project.id,
+          workerId: worker.id,
+          at: now().toISOString(),
+        });
+        const retirementResult = await attemptRetirement(project, retirement);
+        changed = retirementResult.attentionChanged || changed;
+        // Verification — not retirement success — creates the debrief. The
+        // wake reads the recorded stop outcome and must state it exactly.
         deps.onDigestReviewed?.({ projectId: project.id, workerId: worker.id });
       }
     }
@@ -520,6 +632,12 @@ export function createMonitor(deps: MonitorDeps) {
 
   const tickProject = async (project: ProjectRow): Promise<void> => {
     let attentionChanged = false;
+    // Recovery first: a prior process may have committed manager_reviewed and
+    // died during the stop. Newly reviewed digests below cannot be retried a
+    // second time in this same tick.
+    if (await scanRetirements(project)) {
+      attentionChanged = true;
+    }
     const workers = listWorkers(db, project.id);
     const liveWorkers = workers.filter((worker) =>
       LIVE_WORKER_STATUSES.includes(worker.status),
