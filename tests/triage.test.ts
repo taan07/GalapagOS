@@ -226,7 +226,7 @@ test("with a broker, an escalation is a REAL pending card — persisted, broadca
   assert.equal(answers[0]?.attentionId, attentionId);
 });
 
-test("a timed-out card stamps honestly and leaves the attention item OPEN", async () => {
+test("a triage card stays pending without auto-settlement and leaves its attention anchor OPEN", async () => {
   const { db, project } = await fixture();
   const answers: unknown[] = [];
   const decisions = createDecisionBroker();
@@ -235,7 +235,6 @@ test("a timed-out card stamps honestly and leaves the attention item OPEN", asyn
     project,
     decisions,
     onAnswered: (answer) => answers.push(answer),
-    cardTimeoutMs: 25,
   });
   bridge("Ship tonight?", "", [], false);
 
@@ -244,19 +243,30 @@ test("a timed-out card stamps honestly and leaves the attention item OPEN", asyn
   assert.ok(cardTurn);
   assert.equal((JSON.parse(cardTurn.content) as { status: string }).status, "pending");
 
-  // A real broker timeout (injected short for the test; production is 10min).
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  await new Promise((resolve) => setTimeout(resolve, 40));
 
-  const settled = JSON.parse(
+  const stillPending = JSON.parse(
     listTurns(db, session.id).find((turn) => turn.id === cardTurn.id)?.content ?? "{}",
   ) as Record<string, unknown>;
-  assert.equal(settled.status, "timeout");
+  assert.equal(stillPending.status, "pending");
   assert.equal(
     listOpenAttentionItems(db, project.id).length,
     1,
-    "a non-answer keeps the question owed — the queue re-raises it",
+    "a pending triage card keeps the durable question owed",
   );
   assert.equal(answers.length, 0, "no wake without an answer");
+
+  assert.equal(
+    decisions.answer(String(stillPending.decisionId), { selections: [], responses: {}, custom: "tomorrow" }),
+    true,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    listOpenAttentionItems(db, project.id).length,
+    1,
+    "the anchor stays open after an answer until Darwin acts",
+  );
+  assert.equal(answers.length, 1, "an answer wakes Darwin");
 });
 
 test("triage's tool surface is non-destructive: pause and escalate, never stop (2026-07-10 ruling)", () => {

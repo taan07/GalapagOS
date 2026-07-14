@@ -215,8 +215,9 @@ export function updateTurnContent(db: GalapagosDb, turnId: string, content: stri
 
 /**
  * Boot hygiene for the chat decision channel: a decision pending when the
- * daemon died can never be answered (its turn's promise died with the
- * process) — stamp it expired so the UI never offers dead buttons.
+ * daemon died has lost its in-memory owner (and its promise died with the
+ * process) — stamp it expired so the UI never offers dead buttons. This is
+ * restart recovery, never a decision timeout.
  */
 export function sweepPendingDecisionTurns(db: GalapagosDb): number {
   const rows = db

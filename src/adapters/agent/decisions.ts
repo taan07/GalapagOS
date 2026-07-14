@@ -54,17 +54,12 @@ export type DecisionAnswer = {
 
 export type DecisionOutcome =
   | { status: "answered"; answer: DecisionAnswer }
-  | { status: "timeout" }
   | { status: "interrupted" };
 
 type PendingDecision = {
   request: DecisionRequest;
   resolve: (outcome: DecisionOutcome) => void;
 };
-
-/** A decision left unanswered this long resolves as timeout — Darwin is told
- * to treat it as deferred, never to guess. */
-export const DECISION_TIMEOUT_MS = 10 * 60 * 1000;
 
 export type DecisionBroker = ReturnType<typeof createDecisionBroker>;
 
@@ -75,7 +70,6 @@ type AskInput = {
   multiSelect?: boolean;
   fields?: DecisionField[];
   signal?: AbortSignal;
-  timeoutMs?: number;
 };
 
 export function createDecisionBroker() {
@@ -83,8 +77,8 @@ export function createDecisionBroker() {
 
   return {
     /**
-     * Register a decision and wait for the user. Resolution: the UI answers,
-     * the timeout fires, or the turn is interrupted — whichever comes first.
+     * Register a decision and wait for the user. Resolution is only the UI's
+     * answer or interruption of the owning turn. A pending card has no timer.
      * Handles single decisions, batches (fields), and confirms uniformly.
      */
     ask(input: AskInput): { request: DecisionRequest; outcome: Promise<DecisionOutcome> } {
@@ -98,18 +92,21 @@ export function createDecisionBroker() {
       };
 
       const outcome = new Promise<DecisionOutcome>((resolve) => {
+        let onAbort: () => void;
         const finish = (result: DecisionOutcome) => {
           if (pending.delete(request.id)) {
-            clearTimeout(timer);
             input.signal?.removeEventListener("abort", onAbort);
             resolve(result);
           }
         };
-        const timer = setTimeout(
-          () => finish({ status: "timeout" }),
-          input.timeoutMs ?? DECISION_TIMEOUT_MS,
-        );
-        const onAbort = () => finish({ status: "interrupted" });
+
+        // An already-aborted owning turn cannot receive an answer. Do not add
+        // an entry that no later event can settle.
+        if (input.signal?.aborted) {
+          resolve({ status: "interrupted" });
+          return;
+        }
+        onAbort = () => finish({ status: "interrupted" });
         input.signal?.addEventListener("abort", onAbort, { once: true });
         pending.set(request.id, { request, resolve: finish });
       });
@@ -137,9 +134,6 @@ export function createDecisionBroker() {
 /** Render the user's answer as tool text Darwin can act on. Pass a batch's
  * fields to label each response with its question. */
 export function describeOutcome(outcome: DecisionOutcome, fields: DecisionField[] = []): string {
-  if (outcome.status === "timeout") {
-    return "The user did not answer within the time limit. Treat this question as deferred — record it as an open_question and do NOT guess an answer.";
-  }
   if (outcome.status === "interrupted") {
     return "The turn was interrupted before the user answered. Do not assume an answer.";
   }

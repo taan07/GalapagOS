@@ -76,7 +76,7 @@ export type ManagerTurnEvent =
   | {
       type: "decision_settled";
       decisionId: string;
-      status: "answered" | "timeout" | "interrupted";
+      status: "answered" | "interrupted";
       selections: string[];
       responses: Record<string, string[]>;
       custom: string;
@@ -102,6 +102,8 @@ export type DecisionTurnPayload = {
   multiSelect: boolean;
   /** Batch questions (absent/empty on single decisions and confirms). */
   fields?: DecisionField[];
+  /** `timeout` is retained only to render historical persisted cards. New
+   * live outcomes never emit it. */
   status: "pending" | "answered" | "timeout" | "interrupted" | "expired";
   selections: string[];
   /** Per-field selected labels for a batch. */
@@ -435,7 +437,8 @@ export async function runManagerTurn(input: {
    * The chat decision channel: persist the question as a system turn (so it
    * survives reloads), stream it as clickable options, wait for the user via
    * the broker, stamp the settled state back into the turn. Darwin's turn
-   * holds while the user decides; timeout and interrupt resolve honestly.
+   * holds while the user decides; only explicit interruption settles without
+   * an answer.
    */
   // Shared machinery for every chat card — single decision, batch of
   // questions, or understanding playback: persist a system turn (survives

@@ -228,8 +228,6 @@ export function createAskUserBridge(input: {
    * happens to send another message.
    */
   onAnswered?: (answer: { question: string; outcomeText: string; attentionId: string }) => void;
-  /** Card timeout override; omitted = the broker's 10-minute default. */
-  cardTimeoutMs?: number;
 }): (
   question: string,
   context: string,
@@ -238,7 +236,7 @@ export function createAskUserBridge(input: {
 ) => { attentionId: string } {
   return (question, questionContext, options = [], multiSelect = false) => {
     // The durable half, unchanged: the queue records the question whatever
-    // happens to the card (timeout, restart, ignored tab).
+    // happens to the owning process (restart or ignored tab).
     const item = createAttentionItem(input.db, {
       projectId: input.project.id,
       kind: "question_for_user",
@@ -263,8 +261,8 @@ export function createAskUserBridge(input: {
       return { attentionId: item.id };
     }
 
-    // The card surface (track E): register with the broker (10-minute
-    // timeout, same as live cards), persist the SAME pending payload a live
+    // The card surface (track E): register with the broker, persist the SAME
+    // pending payload a live
     // turn would (byte-compatible with reload rendering and the boot sweep),
     // broadcast the request — and DO NOT WAIT. Triage never blocks on the
     // user; the settle callback below carries the answer onward.
@@ -273,7 +271,6 @@ export function createAskUserBridge(input: {
       question: fullQuestion,
       options,
       multiSelect,
-      ...(input.cardTimeoutMs !== undefined ? { timeoutMs: input.cardTimeoutMs } : {}),
     });
     const payload: DecisionTurnPayload = {
       kind: "decision",
@@ -346,9 +343,9 @@ export function createAskUserBridge(input: {
           attentionId: item.id,
         });
       }
-      // Timeout/interrupt: the turn is stamped honestly and the attention
-      // item stays OPEN — the question is still owed an answer, and the
-      // queue is what re-raises it.
+      // An interrupted triage card is stamped honestly and the attention item
+      // stays OPEN — the question is still owed an answer, and the queue is
+      // what re-raises it.
     });
 
     return { attentionId: item.id };

@@ -1260,7 +1260,7 @@ async function handleDecisionAnswer(
   }
   if (!decisions.answer(decisionId, { selections, responses, custom })) {
     sendJson(res, 409, {
-      error: "That decision is no longer pending — it was answered, timed out, or belongs to an ended turn.",
+      error: "That decision is no longer pending — it was answered or belongs to an ended turn.",
     });
     return;
   }
@@ -1600,7 +1600,7 @@ void (async () => {
   // survive a reconcile failure (and still run vault ingestion after it).
   const staleDecisions = sweepPendingDecisionTurns(db);
   if (staleDecisions > 0) {
-    console.log(`[decisions] expired ${staleDecisions} pending decision${staleDecisions === 1 ? "" : "s"} from before the restart`);
+    console.log(`[decisions] expired ${staleDecisions} pending decision${staleDecisions === 1 ? "" : "s"} whose owning process was lost on restart`);
   }
   try {
     const { reattached, finalized } = await workers.reconcileOrphans();

@@ -114,7 +114,7 @@ function DecisionPrompt({
       decision.status === "answered"
         ? settledSummary(decision)
         : decision.status === "timeout"
-          ? "Not answered in time — Darwin treats it as deferred"
+          ? "No answer recorded (legacy card)"
           : decision.status === "expired"
             ? "Expired (the daemon restarted before an answer)"
             : "Interrupted before an answer";
