@@ -47,7 +47,7 @@ const TEST_FILE_PATTERNS: RegExp[] = [
 /**
  * Vendored/generated trees are NOT the worker's change set: every dependency
  * ships its own package.json (with a "test" script), jest configs, and test
- * suites, so one `npm install` in a repo that hasn't ignored node_modules
+ * suites, so one package-manager install in a repo that hasn't ignored node_modules
  * used to fire the check-script tripwire thousands of times over — a false
  * positive Darwin disproved by hand, 11+ times in one day (2026-07-10),
  * before triage acted on it destructively. Nothing under these paths is
