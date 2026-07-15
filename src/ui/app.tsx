@@ -26,11 +26,26 @@ import { createNeedsYouCue } from "./needs-you";
 import { ConfidenceGauge } from "./confidence";
 import { AddProjectForm, ProjectPicker } from "./project-picker";
 import { SpecificsPanel } from "./specifics-panel";
+import {
+  createProjectActivityModel,
+  createProjectRecoveryModel,
+  createSingleFlightReconciler,
+  type StreamConnectionState,
+} from "../core/live-recovery";
 
 const LAST_PROJECT_KEY = "galapagos.lastProjectId";
 // The fallback model when Fable's usage limit is reached (see the "change to
 // Opus" action on a limit-reached turn error).
 const OPUS_MODEL = "claude-opus-4-8";
+
+type MainProjectSnapshot = {
+  turns: TurnView[] | null;
+  live: { busy: boolean; status: LiveTurnStatusView | null; text: string } | null;
+  specifics: SpecificView[] | null;
+  attention: AttentionView[] | null;
+  confidence: ProjectConfidenceView | null;
+  projects: ProjectView[] | null;
+};
 
 function turnsToChatItems(turns: TurnView[]): ChatItem[] {
   return turns.flatMap((turn): ChatItem[] => {
@@ -138,8 +153,9 @@ export function App() {
   const [liveStatus, setLiveStatus] = useState<LiveTurnStatusView | null>(null);
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const [daemonDown, setDaemonDown] = useState(false);
+  const [streamConnection, setStreamConnection] = useState<StreamConnectionState>("connecting");
   const [showAddProject, setShowAddProject] = useState(false);
-  const queueRef = useRef<QueuedMessage[]>([]);
+  const projectActivityRef = useRef(createProjectActivityModel<QueuedMessage>());
   const selectedIdRef = useRef<string | null>(null);
   selectedIdRef.current = selectedId;
   // The POST stream is authoritative while attached: the tab that owns an
@@ -149,11 +165,22 @@ export function App() {
   // A COUNT, not a boolean: turn N's stream stays open through its post-turn
   // distill while turn N+1 already streams (the drain path), and the earliest
   // finally must not disarm the gate under the later turn.
-  const postStreamCountRef = useRef(0);
   // Turn events from /events are held off until this project's history has
   // loaded — applying a broadcast onto an empty item list would be wiped by
   // the history fetch resolving a moment later.
   const historyLoadedForRef = useRef<string | null>(null);
+  const recoveryRef = useRef(createProjectRecoveryModel<MainProjectSnapshot>());
+  const reconciliationRef = useRef(createSingleFlightReconciler());
+  const deferredHistoryRef = useRef(new Set<string>());
+  const daemonDownRef = useRef(false);
+
+  const postStreamOwns = (projectId: string) =>
+    projectActivityRef.current.ownsStream(projectId);
+  const queueFor = useCallback((projectId: string): QueuedMessage[] => {
+    return projectActivityRef.current.queue(projectId, () =>
+      loadQueue(window.localStorage, projectId),
+    );
+  }, []);
 
   const now = () => new Date().toISOString();
 
@@ -197,43 +224,87 @@ export function App() {
     }
   }, [selectedId]);
 
-  const refreshSpecifics = useCallback(async (projectId: string) => {
-    const response = await fetch(`/api/specifics?projectId=${encodeURIComponent(projectId)}`, {
-      cache: "no-store",
+  /** Fetch the entire selected-project truth as one generation-scoped unit. */
+  const reconcileProject = useCallback(async (projectId: string) => {
+    return reconciliationRef.current.run(projectId, async () => {
+      const ticket = recoveryRef.current.begin(projectId);
+      const json = async <T,>(url: string): Promise<T | null> => {
+        try {
+          const response = await fetch(url, { cache: "no-store" });
+          return response.ok ? ((await response.json()) as T) : null;
+        } catch {
+          return null;
+        }
+      };
+      // A locally attached POST is the only source allowed to replace its
+      // live tail. It does not stop the rest of recovery (attention,
+      // confidence, metadata) from repairing after sleep.
+      const postOwnsHistory = postStreamOwns(projectId);
+      const previous = recoveryRef.current.cached(projectId);
+      const [history, live, specificsPayload, attentionPayload, confidencePayload, projectsPayload] =
+        await Promise.all([
+          postOwnsHistory
+            ? Promise.resolve(null)
+            : json<{ turns: TurnView[] }>(`/api/manager/history?projectId=${encodeURIComponent(projectId)}`),
+          postOwnsHistory
+            ? Promise.resolve(null)
+            : json<{ busy: boolean; status: LiveTurnStatusView | null; text: string }>(
+                `/api/manager/live?projectId=${encodeURIComponent(projectId)}`,
+              ),
+          json<{ specifics: SpecificView[] }>(`/api/specifics?projectId=${encodeURIComponent(projectId)}`),
+          json<{ items: AttentionView[] }>(`/api/attention?projectId=${encodeURIComponent(projectId)}`),
+          json<ProjectConfidenceView>(`/api/confidence?projectId=${encodeURIComponent(projectId)}`),
+          json<{ projects: ProjectView[] }>("/api/projects"),
+        ]);
+      // A POST may begin while the HTTP reads are in flight. In that case the
+      // fetched history predates the optimistic/streamed tail and must not
+      // replace either rendered state or the per-project cache.
+      const postOwnsAtCompletion = postStreamOwns(projectId);
+      const preserveHistory = postOwnsHistory || postOwnsAtCompletion;
+      if (preserveHistory) deferredHistoryRef.current.add(projectId);
+      const snapshot: MainProjectSnapshot = {
+        turns: preserveHistory ? (previous?.turns ?? null) : (history?.turns ?? null),
+        live: preserveHistory ? (previous?.live ?? null) : live,
+        specifics: specificsPayload?.specifics ?? null,
+        attention: attentionPayload?.items ?? null,
+        confidence: confidencePayload,
+        projects: projectsPayload?.projects ?? null,
+      };
+      if (!recoveryRef.current.store(ticket, snapshot)) return;
+      // selectedIdRef moves during render, before the selection effect updates
+      // the recovery model. Guard both to close that navigation window.
+      if (selectedIdRef.current !== projectId || !recoveryRef.current.mayApply(ticket)) return;
+      if (snapshot.projects) setProjects(snapshot.projects);
+      if (snapshot.specifics) setSpecifics(snapshot.specifics);
+      if (snapshot.attention) setAttention(snapshot.attention);
+      if (snapshot.confidence) setConfidence(snapshot.confidence);
+      if (snapshot.turns && !postStreamOwns(projectId)) {
+        setItems(turnsToChatItems(snapshot.turns));
+        historyLoadedForRef.current = projectId;
+      }
+      if (snapshot.live && !postStreamOwns(projectId)) {
+        setWorking(snapshot.live.busy);
+        setLiveStatus(snapshot.live.busy ? (snapshot.live.status ?? { status: "thinking", label: "Thinking" }) : null);
+        setLiveText(snapshot.live.busy ? snapshot.live.text : "");
+      }
     });
-    if (response.ok) {
-      const payload = (await response.json()) as { specifics: SpecificView[] };
-      setSpecifics(payload.specifics);
-    }
-  }, []);
-
-  const refreshAttention = useCallback(async (projectId: string) => {
-    const response = await fetch(`/api/attention?projectId=${encodeURIComponent(projectId)}`, {
-      cache: "no-store",
-    });
-    if (response.ok) {
-      const payload = (await response.json()) as { items: AttentionView[] };
-      setAttention(payload.items);
-    }
-  }, []);
-
-  const refreshConfidence = useCallback(async (projectId: string) => {
-    const response = await fetch(`/api/confidence?projectId=${encodeURIComponent(projectId)}`, {
-      cache: "no-store",
-    });
-    if (response.ok) {
-      setConfidence((await response.json()) as ProjectConfidenceView);
-    }
   }, []);
 
   const checkDaemon = useCallback(async () => {
+    let down = true;
     try {
       const response = await fetch("/api/daemon-health", { cache: "no-store" });
-      setDaemonDown(!response.ok);
+      down = !response.ok;
     } catch {
-      setDaemonDown(true);
+      down = true;
     }
-  }, []);
+    const wasDown = daemonDownRef.current;
+    daemonDownRef.current = down;
+    setDaemonDown(down);
+    if (wasDown && !down && selectedIdRef.current) {
+      void reconcileProject(selectedIdRef.current);
+    }
+  }, [reconcileProject]);
 
   useEffect(() => {
     void refreshProjects();
@@ -246,55 +317,32 @@ export function App() {
     if (!selectedId) {
       return;
     }
+    recoveryRef.current.select(selectedId);
+    const cached = recoveryRef.current.cached(selectedId);
     setItems([]);
     setLiveText("");
     setLiveStatus(null);
+    setSpecifics([]);
     setAttention(null);
     setConfidence(null);
     historyLoadedForRef.current = null;
     // The queue survives reloads and project hops (turn-attach): same
     // per-project localStorage contract as the composer draft.
-    queueRef.current = loadQueue(window.localStorage, selectedId);
-    setQueued([...queueRef.current]);
+    const selectedQueue = loadQueue(window.localStorage, selectedId);
+    projectActivityRef.current.replaceQueue(selectedId, selectedQueue);
+    setQueued([...selectedQueue]);
     setWorking(false);
-    void (async () => {
-      const response = await fetch(
-        `/api/manager/history?projectId=${encodeURIComponent(selectedId)}`,
-        { cache: "no-store" },
-      );
-      if (response.ok) {
-        const payload = (await response.json()) as { turns: TurnView[] };
-        setItems(turnsToChatItems(payload.turns));
+    if (cached) {
+      if (cached.turns) {
+        setItems(turnsToChatItems(cached.turns));
+        historyLoadedForRef.current = selectedId;
       }
-      historyLoadedForRef.current = selectedId;
-      // Re-attach to a turn already in flight: the daemon's live snapshot
-      // arms working=true and seeds the tail this page never streamed. From
-      // here /events carries the rest of the turn.
-      try {
-        const live = await fetch(
-          `/api/manager/live?projectId=${encodeURIComponent(selectedId)}`,
-          { cache: "no-store" },
-        );
-        if (live.ok && selectedIdRef.current === selectedId) {
-          const payload = (await live.json()) as {
-            busy: boolean;
-            status: LiveTurnStatusView | null;
-            text: string;
-          };
-          if (payload.busy) {
-            setWorking(true);
-            setLiveStatus(payload.status ?? { status: "thinking", label: "Thinking" });
-            setLiveText(payload.text);
-          }
-        }
-      } catch {
-        // Daemon unreachable — the health poll surfaces it; load stays idle.
-      }
-      await refreshSpecifics(selectedId);
-      await refreshAttention(selectedId);
-      await refreshConfidence(selectedId);
-    })();
-  }, [selectedId, refreshSpecifics, refreshAttention, refreshConfidence]);
+      if (cached.specifics) setSpecifics(cached.specifics);
+      if (cached.attention) setAttention(cached.attention);
+      if (cached.confidence) setConfidence(cached.confidence);
+    }
+    void reconcileProject(selectedId);
+  }, [selectedId, reconcileProject]);
 
   // Live updates from the daemon: the monitor's tick keeps the gauge honest
   // (evidence freshness moves without any user action), attention changes
@@ -306,20 +354,14 @@ export function App() {
     // stay locked forever. Every (re)open re-syncs working from the daemon's
     // live state — skipped while a POST stream is attached (it is the truth).
     source.onopen = () => {
+      recoveryRef.current.setConnection("live");
+      setStreamConnection("live");
       const projectId = selectedIdRef.current;
-      if (!projectId || postStreamCountRef.current > 0) {
-        return;
-      }
-      void fetch(`/api/manager/live?projectId=${encodeURIComponent(projectId)}`, {
-        cache: "no-store",
-      })
-        .then((live) => (live.ok ? (live.json() as Promise<{ busy: boolean }>) : null))
-        .then((payload) => {
-          if (payload && !payload.busy && selectedIdRef.current === projectId) {
-            setWorking(false);
-          }
-        })
-        .catch(() => {});
+      if (projectId) void reconcileProject(projectId);
+    };
+    source.onerror = () => {
+      recoveryRef.current.setConnection("reconnecting");
+      setStreamConnection("reconnecting");
     };
     source.onmessage = (message) => {
       let event: DaemonStreamEvent;
@@ -344,14 +386,22 @@ export function App() {
         return;
       }
       const projectId = selectedIdRef.current;
-      if (!projectId || !("projectId" in event) || event.projectId !== projectId) {
+      if (!projectId || !("projectId" in event)) {
+        return;
+      }
+      if (event.projectId !== projectId) {
+        // Background projects never mutate the rendered selection. Stable
+        // events refresh only that project's cache so switching back can show
+        // durable truth immediately, followed by the ordinary selected fetch.
+        if (event.type !== "assistant_delta" && event.type !== "turn_status") {
+          void reconcileProject(event.projectId);
+        }
         return;
       }
       if (event.type === "attention_changed") {
-        void refreshAttention(projectId);
-        void refreshConfidence(projectId);
+        void reconcileProject(projectId);
       } else if (event.type === "monitor_tick" || event.type === "digest_reviewed") {
-        void refreshConfidence(projectId);
+        void reconcileProject(projectId);
       } else if (event.type === "manager_note") {
         const text = event.text;
         setItems((current) =>
@@ -359,7 +409,7 @@ export function App() {
             ? current
             : [...current, { kind: "note", text, at: now() }],
         );
-        void refreshAttention(projectId);
+        void reconcileProject(projectId);
       } else if (event.type === "decision_request") {
         // Broadcast copy of a card. The initiating tab already appended it
         // from its own stream — only tabs that DIDN'T see it add the card
@@ -424,7 +474,7 @@ export function App() {
         // tab drops these — its own stream already delivered them — and
         // nothing applies until history has loaded, or the fetch resolving
         // would wipe what we appended.
-        if (postStreamCountRef.current > 0 || historyLoadedForRef.current !== projectId) {
+        if (postStreamOwns(projectId) || historyLoadedForRef.current !== projectId) {
           return;
         }
         if (event.type === "turn_started") {
@@ -472,7 +522,7 @@ export function App() {
               : [...current, { kind: "chip", chip, at: now() }],
           );
           if (event.tool === "record_specific") {
-            void refreshSpecifics(projectId);
+            void reconcileProject(projectId);
           }
         } else if (event.type === "rebrief") {
           setLiveText("");
@@ -495,7 +545,7 @@ export function App() {
           setItems((current) => [...current, { kind: "note", text: event.message, at: now() }]);
         } else if (event.type === "distilled") {
           if (event.recordsWritten > 0 || event.commitSkippedReason || event.error) {
-            void refreshSpecifics(projectId);
+            void reconcileProject(projectId);
           }
         } else if (event.type === "turn_complete") {
           setWorking(false);
@@ -516,7 +566,27 @@ export function App() {
       }
     };
     return () => source.close();
-  }, [refreshAttention, refreshConfidence, refreshSpecifics]);
+  }, [reconcileProject]);
+
+  // Laptop sleep commonly leaves an EventSource half-open. These triggers
+  // repair from HTTP truth even before the browser notices the socket died.
+  useEffect(() => {
+    const recover = () => {
+      const projectId = selectedIdRef.current;
+      if (projectId) void reconcileProject(projectId);
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") recover();
+    };
+    window.addEventListener("focus", recover);
+    window.addEventListener("online", recover);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.removeEventListener("focus", recover);
+      window.removeEventListener("online", recover);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [reconcileProject]);
 
   // The needs-you cue: a pending card + an unfocused tab = tab-title flash,
   // favicon badge, and a macOS notification (permission asked lazily). The
@@ -546,12 +616,14 @@ export function App() {
       },
     ): Promise<void> => {
       const attachments = options?.attachments ?? [];
-      setWorking(true);
-      setLiveText("");
-      setLiveStatus({ status: "thinking", label: "Thinking" });
+      if (selectedIdRef.current === projectId) {
+        setWorking(true);
+        setLiveText("");
+        setLiveStatus({ status: "thinking", label: "Thinking" });
+      }
       // While this fetch streams, /events turn traffic is a duplicate feed —
       // armed before the request so the first broadcast can never race it.
-      postStreamCountRef.current += 1;
+      projectActivityRef.current.beginStream(projectId);
       // A 409 hands the turn lock to someone else (another tab, an autonomous
       // turn): the message queues instead of dying, and `working` must stay
       // armed past the finally — /events drives it from here.
@@ -580,15 +652,17 @@ export function App() {
                   ),
                 },
         );
-        setItems((current) => [
-          ...current,
-          {
-            kind: "user",
-            text,
-            at: now(),
-            ...(echoAttachments.length > 0 ? { attachments: echoAttachments } : {}),
-          },
-        ]);
+        if (selectedIdRef.current === projectId) {
+          setItems((current) => [
+            ...current,
+            {
+              kind: "user",
+              text,
+              at: now(),
+              ...(echoAttachments.length > 0 ? { attachments: echoAttachments } : {}),
+            },
+          ]);
+        }
       }
       try {
         const response = await fetch("/api/manager/message", {
@@ -618,23 +692,24 @@ export function App() {
               text,
               ...(attachments.length > 0 ? { attachments } : {}),
             };
+            const projectQueue = queueFor(projectId);
             if (options?.requeueAtHead) {
               // A drained message that bounced goes back to the FRONT — it
               // was the head of the queue; re-queuing it behind later
               // messages would violate FIFO on contention.
-              queueRef.current.unshift(queuedMessage);
+              projectQueue.unshift(queuedMessage);
             } else {
-              queueRef.current.push(queuedMessage);
+              projectQueue.push(queuedMessage);
             }
-            saveQueue(window.localStorage, projectId, queueRef.current);
-            setQueued([...queueRef.current]);
+            saveQueue(window.localStorage, projectId, projectQueue);
+            if (selectedIdRef.current === projectId) setQueued([...projectQueue]);
             // The unlock normally arrives as a /events turn_complete — but a
             // 409 can land in the daemon's tiny post-complete window where
             // busy is still held and THAT event was already consumed by our
             // own POST stream. One delayed live-state check heals the stuck
             // case; if busy is genuinely held, /events keeps driving.
             setTimeout(() => {
-              if (selectedIdRef.current !== projectId || postStreamCountRef.current > 0) {
+              if (selectedIdRef.current !== projectId || postStreamOwns(projectId)) {
                 return;
               }
               void fetch(`/api/manager/live?projectId=${encodeURIComponent(projectId)}`, {
@@ -648,7 +723,7 @@ export function App() {
                 })
                 .catch(() => {});
             }, 2000);
-            if (options?.echoUser !== false) {
+            if (options?.echoUser !== false && selectedIdRef.current === projectId) {
               setItems((current) => {
                 for (let i = current.length - 1; i >= 0; i--) {
                   const item = current[i];
@@ -661,10 +736,12 @@ export function App() {
             }
             return;
           }
-          setItems((current) => [
-            ...current,
-            { kind: "note", text: payload.error ?? `Send failed (${response.status}).` },
-          ]);
+          if (selectedIdRef.current === projectId) {
+            setItems((current) => [
+              ...current,
+              { kind: "note", text: payload.error ?? `Send failed (${response.status}).` },
+            ]);
+          }
           setDaemonDown(response.status === 502);
           return;
         }
@@ -688,6 +765,9 @@ export function App() {
               continue;
             }
             const event = JSON.parse(dataLine.slice(6)) as ManagerStreamEvent;
+            if (selectedIdRef.current !== projectId) {
+              continue;
+            }
             if (event.type === "turn_complete") {
               // The turn is over — unlock the input NOW. The stream stays
               // open only to deliver the post-turn distillation note; the
@@ -717,7 +797,7 @@ export function App() {
                 { kind: "chip", chip: { tool: event.tool, summary: event.summary, detail: event.detail }, at: now() },
               ]);
               if (event.tool === "record_specific") {
-                void refreshSpecifics(projectId);
+                void reconcileProject(projectId);
               }
             } else if (event.type === "rebrief") {
               // A rebrief means the turn is being retried on a fresh session —
@@ -809,7 +889,7 @@ export function App() {
                   ...notes.map((text) => ({ kind: "note" as const, text, at: now() })),
                 ]);
               }
-              void refreshSpecifics(projectId);
+              void reconcileProject(projectId);
             } else if (event.type === "turn_error") {
               // A usage limit on Fable is recoverable: offer the Opus switch
               // instead of a dead error note. Once Darwin is already on Opus,
@@ -835,24 +915,31 @@ export function App() {
           }
         }
       } catch (error) {
-        setItems((current) => [
-          ...current,
-          {
-            kind: "note",
-            text: `Connection lost mid-turn: ${error instanceof Error ? error.message : String(error)}`,
-            at: now(),
-          },
-        ]);
+        if (selectedIdRef.current === projectId) {
+          setItems((current) => [
+            ...current,
+            {
+              kind: "note",
+              text: `Connection lost mid-turn: ${error instanceof Error ? error.message : String(error)}`,
+              at: now(),
+            },
+          ]);
+        }
       } finally {
-        postStreamCountRef.current -= 1;
-        if (!busyElsewhere) {
+        const remaining = projectActivityRef.current.endStream(projectId);
+        if (remaining === 0) {
+          if (deferredHistoryRef.current.delete(projectId)) {
+            void reconcileProject(projectId);
+          }
+        }
+        if (!busyElsewhere && selectedIdRef.current === projectId) {
           setWorking(false);
           setLiveStatus(null);
           setLiveText("");
         }
       }
     },
-    [refreshSpecifics],
+    [queueFor, reconcileProject],
   );
 
   // The Shift+Tab autonomy axis: cycle the persisted per-project stop. The
@@ -949,12 +1036,14 @@ export function App() {
   // deps is what makes the on-load drain fire; a drain that races a turn
   // someone else started comes back as a 409 and re-queues.
   useEffect(() => {
-    if (working || !selectedId || queueRef.current.length === 0) {
+    if (working || !selectedId) {
       return;
     }
-    const next = queueRef.current.shift();
-    saveQueue(window.localStorage, selectedId, queueRef.current);
-    setQueued([...queueRef.current]);
+    const projectQueue = queueFor(selectedId);
+    if (projectQueue.length === 0) return;
+    const next = projectQueue.shift();
+    saveQueue(window.localStorage, selectedId, projectQueue);
+    setQueued([...projectQueue]);
     if (next) {
       void sendNow(selectedId, next.text, {
         requeueAtHead: true,
@@ -963,7 +1052,7 @@ export function App() {
           : {}),
       });
     }
-  }, [working, selectedId, sendNow, queued]);
+  }, [working, selectedId, sendNow, queued, queueFor]);
 
   // Steering a queued message: bump it to the head of the queue and interrupt
   // the in-flight turn. The interrupt ends the turn → `working` flips false →
@@ -971,19 +1060,19 @@ export function App() {
   // Darwin's context refreshed by whatever the interrupted turn got done.
   const handleQueueSteer = useCallback(
     (id: string) => {
-      const index = queueRef.current.findIndex((message) => message.id === id);
+      if (!selectedId) return;
+      const projectQueue = queueFor(selectedId);
+      const index = projectQueue.findIndex((message) => message.id === id);
       if (index === -1) {
         return;
       }
-      const [steered] = queueRef.current.splice(index, 1);
+      const [steered] = projectQueue.splice(index, 1);
       if (steered) {
-        queueRef.current.unshift(steered);
+        projectQueue.unshift(steered);
       }
-      if (selectedId) {
-        saveQueue(window.localStorage, selectedId, queueRef.current);
-      }
-      setQueued([...queueRef.current]);
-      if (working && selectedId) {
+      saveQueue(window.localStorage, selectedId, projectQueue);
+      setQueued([...projectQueue]);
+      if (working) {
         void fetch("/api/manager/interrupt", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -991,18 +1080,18 @@ export function App() {
         });
       }
     },
-    [working, selectedId],
+    [working, selectedId, queueFor],
   );
 
   const handleQueueRemove = useCallback(
     (id: string) => {
-      queueRef.current = queueRef.current.filter((message) => message.id !== id);
-      if (selectedId) {
-        saveQueue(window.localStorage, selectedId, queueRef.current);
-      }
-      setQueued([...queueRef.current]);
+      if (!selectedId) return;
+      const remaining = queueFor(selectedId).filter((message) => message.id !== id);
+      projectActivityRef.current.replaceQueue(selectedId, remaining);
+      saveQueue(window.localStorage, selectedId, remaining);
+      setQueued([...remaining]);
     },
-    [selectedId],
+    [selectedId, queueFor],
   );
 
   // "Change to Opus": switch this project's manager model and re-send the
@@ -1022,6 +1111,7 @@ export function App() {
   // waiting tool call; the decision_settled event stamps the final state.
   const postDecisionAnswer = useCallback(
     async (
+      projectId: string,
       decisionId: string,
       answer: { selections: string[]; responses: Record<string, string[]>; custom: string },
     ) => {
@@ -1030,7 +1120,7 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ decisionId, ...answer }),
       });
-      if (!response.ok) {
+      if (!response.ok && selectedIdRef.current === projectId) {
         const payload = (await response.json().catch(() => ({}))) as { error?: string };
         setItems((current) => [
           ...current,
@@ -1053,7 +1143,7 @@ export function App() {
       if (pending) {
         // Free-text card answers are text-only; the composer already strips
         // the tray while answering.
-        void postDecisionAnswer(pending.decisionId, {
+        void postDecisionAnswer(selectedId, pending.decisionId, {
           selections: [],
           responses: {},
           custom: text,
@@ -1061,18 +1151,19 @@ export function App() {
         return;
       }
       if (working) {
-        queueRef.current.push({
+        const projectQueue = queueFor(selectedId);
+        projectQueue.push({
           id: crypto.randomUUID(),
           text,
           ...(attachments.length > 0 ? { attachments } : {}),
         });
-        saveQueue(window.localStorage, selectedId, queueRef.current);
-        setQueued([...queueRef.current]);
+        saveQueue(window.localStorage, selectedId, projectQueue);
+        setQueued([...projectQueue]);
         return;
       }
       void sendNow(selectedId, text, attachments.length > 0 ? { attachments } : {});
     },
-    [selectedId, working, sendNow, postDecisionAnswer],
+    [selectedId, working, sendNow, postDecisionAnswer, queueFor],
   );
 
   // Answer a card via its clickable options: single/confirm selections, or a
@@ -1083,8 +1174,10 @@ export function App() {
       selections: string[],
       responses: Record<string, string[]>,
       custom: string,
-    ) => postDecisionAnswer(decisionId, { selections, responses, custom }),
-    [postDecisionAnswer],
+    ) => {
+      if (selectedId) void postDecisionAnswer(selectedId, decisionId, { selections, responses, custom });
+    },
+    [postDecisionAnswer, selectedId],
   );
 
   // The manual mirror of the boundary compaction: compact NOW, re-brief on
@@ -1094,15 +1187,17 @@ export function App() {
     if (!selectedId) {
       return;
     }
+    const projectId = selectedId;
     const response = await fetch("/api/manager/rebrief/now", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectId: selectedId }),
+      body: JSON.stringify({ projectId }),
     });
     const payload = (await response.json().catch(() => ({}))) as {
       error?: string;
       note?: string;
     };
+    if (selectedIdRef.current !== projectId) return;
     if (!response.ok) {
       setItems((current) => [
         ...current,
@@ -1125,12 +1220,14 @@ export function App() {
       if (!selectedId || !rebrief.turnId) {
         return;
       }
+      const projectId = selectedId;
       const response = await fetch("/api/manager/rebrief/clear", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projectId: selectedId, turnId: rebrief.turnId }),
+        body: JSON.stringify({ projectId, turnId: rebrief.turnId }),
       });
       const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      if (selectedIdRef.current !== projectId) return;
       if (!response.ok) {
         setItems((current) => [
           ...current,
@@ -1165,6 +1262,9 @@ export function App() {
         <div className="app-title">
           GALAPAGOS <span>/ Darwin</span>
         </div>
+        <span className={`stream-state ${streamConnection}`} aria-label={`Live updates: ${streamConnection}`}>
+          {streamConnection === "live" ? "live" : streamConnection}
+        </span>
         {selected ? (
           <>
             <a className="nav-link" href={`/workers?projectId=${encodeURIComponent(selected.id)}`}>
@@ -1245,8 +1345,7 @@ export function App() {
               items={attention}
               onChanged={() => {
                 if (selectedIdRef.current) {
-                  void refreshAttention(selectedIdRef.current);
-                  void refreshConfidence(selectedIdRef.current);
+                  void reconcileProject(selectedIdRef.current);
                 }
               }}
             />
