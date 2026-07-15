@@ -2,11 +2,11 @@
 // the RIGHT directory — a worker's checks run in its worktree, never the
 // main checkout — and write evidence_runs rows keyed to the workspace state
 // at run time. Check commands are auto-detected from the target repo's
-// package.json scripts (user-confirmed 2026-07-05): 'typecheck', 'lint',
-// 'test', 'build' map to `npm run <key>`; a key with no script is honestly
-// reported "not configured" and writes no row.
+// package.json scripts (user-confirmed 2026-07-05). The selected package
+// manager runs the known key; a key with no script is honestly reported "not
+// configured" and writes no row.
 import { execFile } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { GalapagosConfig } from "../../config";
@@ -27,21 +27,105 @@ export type RunChecksResult = {
   outcomes: CheckOutcome[];
 };
 
+export type CheckPackageManager = "bun" | "pnpm" | "yarn" | "npm";
+
+export type CheckRunner = {
+  manager: CheckPackageManager;
+  command: string;
+  argsBeforeKey: string[];
+};
+
+export type CheckRunnerDetection =
+  | { status: "resolved"; runner: CheckRunner }
+  | { status: "indeterminate"; reason: string };
+
+type PackageManifest = {
+  scripts?: Record<string, unknown>;
+  packageManager?: unknown;
+};
+
+const CHECK_RUNNERS: Record<CheckPackageManager, CheckRunner> = {
+  bun: { manager: "bun", command: "bun", argsBeforeKey: ["run"] },
+  pnpm: { manager: "pnpm", command: "pnpm", argsBeforeKey: ["run"] },
+  yarn: { manager: "yarn", command: "yarn", argsBeforeKey: ["run"] },
+  npm: { manager: "npm", command: "npm", argsBeforeKey: ["run"] },
+};
+
+function readPackageManifest(cwd: string): PackageManifest | null {
+  try {
+    return JSON.parse(readFileSync(path.join(cwd, "package.json"), "utf8")) as PackageManifest;
+  } catch {
+    return null;
+  }
+}
+
+function managerFromPackageManagerField(value: unknown): CheckPackageManager | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const manager = /^(bun|pnpm|yarn|npm)(?:@|$)/.exec(value.trim())?.[1];
+  return manager === "bun" || manager === "pnpm" || manager === "yarn" || manager === "npm"
+    ? manager
+    : null;
+}
+
+/**
+ * Select the target project's package manager without guessing between
+ * conflicting lockfiles. A valid root packageManager declaration is explicit
+ * intent and wins; otherwise exactly one lockfile family is required. A bare
+ * package.json retains npm as the backwards-compatible final fallback.
+ */
+export function detectCheckRunner(cwd: string): CheckRunnerDetection {
+  const manifest = readPackageManifest(cwd);
+  if (!manifest) {
+    return { status: "indeterminate", reason: `No readable ${path.join(cwd, "package.json")}.` };
+  }
+
+  const declared = managerFromPackageManagerField(manifest.packageManager);
+  if (declared) {
+    return { status: "resolved", runner: CHECK_RUNNERS[declared] };
+  }
+  if (Object.prototype.hasOwnProperty.call(manifest, "packageManager")) {
+    return {
+      status: "indeterminate",
+      reason: `package.json declares an unsupported or malformed packageManager (${JSON.stringify(manifest.packageManager)}); expected bun, pnpm, yarn, or npm with an optional version.`,
+    };
+  }
+
+  const lockfileManagers = new Set<CheckPackageManager>();
+  if (existsSync(path.join(cwd, "bun.lock")) || existsSync(path.join(cwd, "bun.lockb"))) {
+    lockfileManagers.add("bun");
+  }
+  if (existsSync(path.join(cwd, "pnpm-lock.yaml"))) {
+    lockfileManagers.add("pnpm");
+  }
+  if (existsSync(path.join(cwd, "yarn.lock"))) {
+    lockfileManagers.add("yarn");
+  }
+  if (existsSync(path.join(cwd, "package-lock.json"))) {
+    lockfileManagers.add("npm");
+  }
+
+  if (lockfileManagers.size === 1) {
+    const manager = Array.from(lockfileManagers)[0];
+    if (!manager) {
+      return { status: "indeterminate", reason: "Could not read the selected package-manager lockfile." };
+    }
+    return { status: "resolved", runner: CHECK_RUNNERS[manager] };
+  }
+  if (lockfileManagers.size > 1) {
+    return {
+      status: "indeterminate",
+      reason: `Conflicting package-manager lockfiles (${Array.from(lockfileManagers).join(", ")}) with no valid packageManager declaration.`,
+    };
+  }
+  return { status: "resolved", runner: CHECK_RUNNERS.npm };
+}
+
 /** Which of the four check keys the repo's package.json actually offers. */
 export function configuredCheckKeys(cwd: string): CheckKey[] {
-  let raw: string;
-  try {
-    raw = readFileSync(path.join(cwd, "package.json"), "utf8");
-  } catch {
-    return [];
-  }
-  try {
-    const parsed = JSON.parse(raw) as { scripts?: Record<string, unknown> };
-    const scripts = parsed.scripts ?? {};
-    return CHECK_KEYS.filter((key) => typeof scripts[key] === "string");
-  } catch {
-    return [];
-  }
+  const scripts = readPackageManifest(cwd)?.scripts ?? {};
+  return CHECK_KEYS.filter((key) => typeof scripts[key] === "string");
 }
 
 function execCheck(
@@ -112,6 +196,19 @@ export async function runChecks(input: {
 
   const outcomes: CheckOutcome[] = [];
   let lastEvidenceKey: string | null = null;
+  const runner = detectCheckRunner(input.cwd);
+
+  if (runner.status === "indeterminate") {
+    return {
+      cwd: input.cwd,
+      evidenceKey: null,
+      outcomes: requested.map((key) => ({
+        key,
+        status: "error" as const,
+        summary: `Could not select a package manager for "${key}": ${runner.reason}`,
+      })),
+    };
+  }
 
   const logDir = path.join(input.config.stateDir, "check-logs", input.projectSlug);
 
@@ -140,12 +237,9 @@ export async function runChecks(input: {
     }
 
     const startedAt = Date.now();
-    const result = await execCheck(
-      "npm",
-      ["run", "--silent", key],
-      input.cwd,
-      input.config.checkTimeoutMs,
-    );
+    const args = [...runner.runner.argsBeforeKey, key];
+    const commandDisplay = [runner.runner.command, ...args].join(" ");
+    const result = await execCheck(runner.runner.command, args, input.cwd, input.config.checkTimeoutMs);
     const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
 
     if (result.spawnError) {
@@ -174,7 +268,7 @@ export async function runChecks(input: {
       writeFileSync(
         logPath,
         [
-          `command: npm run --silent ${key}`,
+          `command: ${commandDisplay}`,
           `cwd: ${input.cwd}`,
           `evidence key: ${evidenceKey}`,
           `exit: ${result.timedOut ? "timeout" : (result.code ?? "?")}`,

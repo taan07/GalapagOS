@@ -514,7 +514,7 @@ test("a Bash-written out-of-lane file freezes the worker, raises the violation, 
   );
 });
 
-test("Bash-written build artifacts never trip the lane guard", async () => {
+test("Bash-written package-manager artifacts never trip the lane guard", async () => {
   const notices: LaneViolationNotice[] = [];
   const { db, project, runtime, sessions } = await fixture({
     onLaneViolation: (notice) => notices.push(notice),
@@ -526,7 +526,7 @@ test("Bash-written build artifacts never trip the lane guard", async () => {
   }
   sessions[0]?.emit({ kind: "session_started", sdkSessionId: "sdk-w1" });
 
-  // `npm install` / a build leaves untracked node_modules + dist. In this
+  // `npm install`, `bun install`, or a build leaves untracked node_modules + dist. In this
   // fixture repo they are NOT gitignored — the exact flood scenario.
   mkdirSync(path.join(outcome.worktreePath, "node_modules", "dep"), { recursive: true });
   writeFileSync(path.join(outcome.worktreePath, "node_modules", "dep", "index.js"), "x\n");
@@ -537,6 +537,11 @@ test("Bash-written build artifacts never trip the lane guard", async () => {
     payload: { tool: "Bash", input: { command: "npm install" } },
   });
   sessions[0]?.emit({ kind: "tool_result", payload: { content: "added 1 package", isError: false } });
+  sessions[0]?.emit({
+    kind: "tool_use",
+    payload: { tool: "Bash", input: { command: "bun install" } },
+  });
+  sessions[0]?.emit({ kind: "tool_result", payload: { content: "installed 1 package", isError: false } });
 
   await new Promise((resolve) => setTimeout(resolve, 60));
   assert.equal(notices.length, 0, "generated output is not a lane violation");
@@ -1634,7 +1639,7 @@ test("collectAuditFiles excludes build/dependency output even when the repo did 
     );
   const baseSha = git(["rev-parse", "HEAD"]).trim();
 
-  // A worker that ran `npm install` / a build leaves these UNtracked and, in a
+  // A worker that ran a package-manager install / a build leaves these untracked and, in a
   // repo that forgot to .gitignore them, they would otherwise flood the audit.
   mkdirSync(path.join(repo, "node_modules", "@babel", "core", "lib"), { recursive: true });
   writeFileSync(path.join(repo, "node_modules", "@babel", "core", "lib", "index.js"), "x\n");

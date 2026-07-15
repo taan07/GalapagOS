@@ -3,14 +3,14 @@
   "configurations": [
     {
       "name": "daemon",
-      "runtimeExecutable": "npm",
+      "runtimeExecutable": "bun",
       "runtimeArgs": ["run", "daemon"],
       "port": 4517,
       "autoPort": false
     },
     {
       "name": "web",
-      "runtimeExecutable": "npm",
+      "runtimeExecutable": "bun",
       "runtimeArgs": ["run", "web"],
       "port": 3005,
       "autoPort": false

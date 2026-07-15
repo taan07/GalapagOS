@@ -26,14 +26,17 @@ APIs.
 
 ## Development
 
-- `npm run dev` — daemon (:4517) + Next.js UI (http://localhost:3005)
-- `npm test` — typecheck + node --test suites (no network)
-- `npm run spike:resume` — proves session resume across process boundaries
+- `bun run dev` — daemon (:4517) + Next.js UI (http://localhost:3005)
+- `bun run test` — typecheck + node --test suites (no network)
+- `bun run spike:resume` — proves session resume across process boundaries
   (makes two small real manager turns on your subscription)
 
-**Run `npm run dev` from your own terminal.** Darwin's sessions spawn your
+The permanent runtime bench at `~/Dev/galapagos-runtime` owns `bun run dev`.
+It stays on `next` and is user-operated: never start, stop, restart, edit, or
+check out that runtime from a track. Deploy to it only by merging a tested
+track; see [the workflow](docs/workflow.md). Darwin's sessions spawn the
 installed Claude Code binary (`~/.claude/local/claude`, override with
-`GALAPAGOS_CLAUDE_BIN`) so they authenticate with your subscription login via
+`GALAPAGOS_CLAUDE_BIN`) so they authenticate with the subscription login via
 the macOS keychain — sandboxed or headless shells cannot reach it, and turns
 fail with "Not logged in".
 
