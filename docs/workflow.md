@@ -1,66 +1,115 @@
 # Working agreement: tracks, worktrees, and the runtime bench
 
+Adopted 2026-07-09 after parallel sessions sharing one checkout produced
+tangled commits, swept-up work, and lost changes.
+
 ## The rule
 
-**One track = one branch = one git worktree = one session.** A track is a
-coherent feature, fix, or documentation change. It owns its worktree and no
-other session edits or commits there.
-
-## Directory map
+**One track = one branch = one git worktree = one session.** A track is one
+coherent feature, fix, or documentation change. It owns its worktree; no other
+session edits or commits there.
 
 | Directory | Branch | Role |
 |---|---|---|
-| `~/Dev/galapagos` | primary development checkout | source for new tracks |
+| `~/Dev/galapagos` | `main` | primary checkout; never a shared scratchpad |
 | `~/Dev/galapagos-runtime` | `next`, permanently | user-owned deployment bench |
 | `~/Dev/galapagos-<track>` | `feat/<track>` etc. | isolated development track |
 
-Create a track with `git worktree add ~/Dev/galapagos-<name> -b feat/<name> main`.
-After its merge, retire it with `git worktree remove ~/Dev/galapagos-<name>`
-and `git branch -d feat/<name>`.
+Create a track with:
 
-## The permanent runtime bench
+```sh
+git worktree add ~/Dev/galapagos-<track> -b feat/<track> main
+```
 
-`~/Dev/galapagos-runtime` is permanently checked out on `next`. It is a
-deployment-only, user-owned checkout. A track session must never manually
-edit it, check out another branch there, or start, stop, or restart its
-processes.
+After its PR merges, retire it with `git worktree remove` followed by
+`git branch -d`. Never commit from a checkout the track does not own. Stage
+explicit paths rather than `git add .` or `git add -A`; keep commits scoped to
+one intent and leave the worktree clean.
 
-Deploy only by merging a tested track into `next`; the runtime's existing
-watch process reloads the merge. Do not use branch switches, copied files, or
-manual restarts as deployment mechanisms. Only the user may hard-reset
-`next`.
+## Test in the track
 
-Before accepting a bench result, verify both the listener and its working
-directory: identify the process listening on port 4517, then inspect that
-process's `cwd`; it must be `~/Dev/galapagos-runtime`. Confirm
-`curl localhost:4517/health` reports the expected `next` branch and revision.
-If either the port, cwd, branch, or revision differs, stop and ask the runtime
-owner to correct it rather than changing the bench.
+Use Bun for GalapagOS dependencies and top-level scripts:
 
-## Dependencies and verification
+```sh
+cd ~/Dev/galapagos-<track>
+bun install --frozen-lockfile
+rm -rf dist-node
+bun run test
+bun run build
+git diff --check
+```
 
-Use Bun for Galapagos's own dependencies and top-level scripts. After a
-`package.json` change, run `bun install` in the track that made the change and
-commit the resulting `bun.lock`. Do not run it as a routine preflight. Use
-`bun install --frozen-lockfile` only to verify a committed lockfile from a
-clean install.
+`bun install --frozen-lockfile` is a clean-track verification command. A
+dependency change must update both `package.json` and `bun.lock`. GalapagOS
+still supervises npm, pnpm, Yarn, and Bun repositories, so do not rewrite
+npm-specific fixtures or historical handoffs that truthfully describe their
+original commands.
 
-A dependency-changing worker lane must explicitly cover both `package.json`
-and its selected lockfile (`bun.lock`, `bun.lockb`, `pnpm-lock.yaml`,
-`yarn.lock`, or `package-lock.json`). Do not weaken lane globs globally to
-make dependency changes fit.
+## Deploy to localhost
 
-Track-local verification is safe without touching the runtime:
+The user's permanent processes run from `~/Dev/galapagos-runtime` on `next`:
+the daemon on port 4517 under `tsx watch`, and the Next UI on port 3005. They
+reload when files in that checkout change.
 
-- `bun run test`
-- `bun run build`
-- `git diff --check`
+**Deploying means a Git merge into the runtime checkout. Nothing else.** Never
+edit, commit, copy files into, check out another branch in, start, stop,
+restart, or kill processes from `~/Dev/galapagos-runtime`.
 
-Do not rewrite npm-specific worker-project behavior or historical handoffs:
-Galapagos still supervises repositories that use npm.
+Deploy a tested track with exactly:
 
-## Main and commits
+```sh
+git -C ~/Dev/galapagos-runtime merge feat/<track>
+```
+
+If and only if the merge changed `package.json` or `bun.lock`, update the
+running bench's installed dependencies with:
+
+```sh
+cd ~/Dev/galapagos-runtime
+bun install
+```
+
+Do not use `bun install --frozen-lockfile` as the running-bench install step.
+Batch compatible commits into one tested merge when possible so daemon-side
+watch reloads do not repeatedly interrupt active work.
+
+## Verify what is live
+
+Before claiming a deployment, verify both services:
+
+```sh
+curl -s localhost:4517/health
+curl -s -o /dev/null -w "%{http_code}\n" localhost:3005
+```
+
+Health must report `"branch":"next"` and the expected revision, and the UI
+must return 200. A UI-only merge does not reload the daemon, so its health
+revision may legitimately remain on the preceding daemon-side commit even
+though the web watcher has reloaded.
+
+If a change does not appear, first confirm each listener's working directory:
+
+```sh
+lsof -nP -iTCP:4517 -sTCP:LISTEN
+lsof -a -p <daemon-pid> -d cwd
+lsof -nP -iTCP:3005 -sTCP:LISTEN
+lsof -a -p <web-pid> -d cwd
+git -C ~/Dev/galapagos-runtime log --oneline -3
+```
+
+Both working directories must be `~/Dev/galapagos-runtime`. If either process
+belongs to another checkout, stop and tell the user; do not work around it or
+kill it. For a UI-only change, ask the user to hard-reload the browser and
+inspect the existing web-process output for compile errors.
+
+## Main and bench reset
 
 `main` receives tested work through one PR per track. Never commit directly to
-`main`, and never use the runtime bench as an editing checkout. Stage explicit
-paths, keep each commit to one intent, and leave no accidental untracked work.
+`main`, and never use `next` as the only home of a change.
+
+Only the user may hard-reset the runtime bench. The normal non-destructive way
+to re-align `next` after PRs merge is:
+
+```sh
+git -C ~/Dev/galapagos-runtime merge main
+```

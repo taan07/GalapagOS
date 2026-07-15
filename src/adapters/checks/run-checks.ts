@@ -85,6 +85,12 @@ export function detectCheckRunner(cwd: string): CheckRunnerDetection {
   if (declared) {
     return { status: "resolved", runner: CHECK_RUNNERS[declared] };
   }
+  if (Object.prototype.hasOwnProperty.call(manifest, "packageManager")) {
+    return {
+      status: "indeterminate",
+      reason: `package.json declares an unsupported or malformed packageManager (${JSON.stringify(manifest.packageManager)}); expected bun, pnpm, yarn, or npm with an optional version.`,
+    };
+  }
 
   const lockfileManagers = new Set<CheckPackageManager>();
   if (existsSync(path.join(cwd, "bun.lock")) || existsSync(path.join(cwd, "bun.lockb"))) {

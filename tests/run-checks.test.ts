@@ -102,6 +102,35 @@ test("detectCheckRunner recognizes each supported lockfile and rejects conflicti
   }
 });
 
+test("detectCheckRunner rejects an invalid explicit packageManager instead of falling back", async () => {
+  const repo = fixtureRepo(SCRIPTS, {
+    packageManager: "bnu@1.2.5",
+    lockfiles: ["bun.lock"],
+  });
+  const detected = detectCheckRunner(repo);
+  assert.equal(detected.status, "indeterminate");
+  if (detected.status === "indeterminate") {
+    assert.match(detected.reason, /bnu@1\.2\.5/);
+    assert.match(detected.reason, /expected bun, pnpm, yarn, or npm/);
+  }
+
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "glp-checks-state-"));
+  const config = loadConfig({ ...process.env, GALAPAGOS_STATE_DIR: stateDir });
+  const db = openDb(stateDir);
+  const project = await registerProject(db, { rootPath: repo });
+  const result = await runChecks({
+    db,
+    config,
+    projectId: project.id,
+    projectSlug: project.slug,
+    cwd: repo,
+    keys: ["test"],
+  });
+  assert.equal(result.outcomes[0]?.status, "error");
+  assert.match(result.outcomes[0]?.summary ?? "", /bnu@1\.2\.5/);
+  assert.equal(listEvidenceRuns(db, { projectId: project.id, workerId: null }).length, 0);
+});
+
 test("runChecks executes configured checks, writes keyed evidence rows, reports the rest honestly", async () => {
   const { db, config, project } = await fixture();
   const result = await runChecks({
