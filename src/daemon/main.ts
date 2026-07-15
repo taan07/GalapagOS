@@ -73,6 +73,7 @@ import {
   type DebriefRunResult,
 } from "./completion-debrief-scheduler";
 import type { CompletionDebriefRow } from "../adapters/db/repos/debriefs";
+import { createSseClientRegistry } from "../core/sse-clients";
 
 const db = openDb(config.stateDir);
 // The only module-level state: live SSE clients, per-project busy flags, the
@@ -88,7 +89,7 @@ const distillsInFlight = new Map<string, Promise<void>>();
 // abort the fork directly (activeTurnControllers may already belong to the
 // next phase by the time the preempt runs).
 const distillControllers = new Map<string, AbortController>();
-const eventClients = new Set<http.ServerResponse>();
+const eventClients = createSseClientRegistry();
 const activeTurnControllers = new Map<string, AbortController>();
 // Per-project manager-model override, set when the user hits "change to Opus"
 // after Fable's usage limit. In-memory on purpose: a daemon restart drops it,
@@ -302,19 +303,20 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 function startSse(res: http.ServerResponse): void {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-store",
+    "Cache-Control": "no-cache, no-store, no-transform",
     Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
   });
+  res.flushHeaders();
 }
 
+/** Direct response stream for the initiating POST; /events uses the registry. */
 function sseWrite(res: http.ServerResponse, event: unknown): void {
   res.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
 function broadcast(event: unknown): void {
-  for (const client of eventClients) {
-    sseWrite(client, event);
-  }
+  eventClients.broadcast(event);
 }
 
 /** Everything a turn writes to the wire: turn events plus the distill note. */
@@ -1582,10 +1584,11 @@ const server = http.createServer((req, res) => {
   }
   if (route === "GET /events") {
     startSse(res);
-    eventClients.add(res);
-    req.on("close", () => {
-      eventClients.delete(res);
-    });
+    const removeClient = eventClients.add(res);
+    req.on("close", removeClient);
+    req.on("error", removeClient);
+    res.on("close", removeClient);
+    res.on("error", removeClient);
     return;
   }
 

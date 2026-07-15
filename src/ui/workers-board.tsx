@@ -5,6 +5,11 @@
 // flow through Darwin; this page observes. Initial data comes from SQLite via
 // the route handlers; liveness arrives over the daemon's SSE stream.
 import { memo, useCallback, useEffect, useRef, useState } from "react";
+import {
+  createProjectRecoveryModel,
+  createSingleFlightReconciler,
+  type StreamConnectionState,
+} from "../core/live-recovery";
 import type {
   DaemonStreamEvent,
   ProjectConfidenceView,
@@ -19,6 +24,33 @@ import type {
 import { ConfidenceGauge } from "./confidence";
 import { useProjectSelection } from "./use-project-selection";
 import { localClockTime } from "./time";
+
+type WorkersProjectSnapshot = {
+  workers: WorkerView[] | null;
+  confidence: ProjectConfidenceView | null;
+  selectedWorkerId: string | null;
+  detail: WorkerDetailView | null;
+};
+
+/** Preserve events appended from SSE when an older HTTP snapshot lands. */
+function mergeWorkerDetail(
+  snapshot: WorkerDetailView,
+  current: WorkerDetailView | null,
+): WorkerDetailView {
+  if (!current || current.worker.id !== snapshot.worker.id) {
+    return snapshot;
+  }
+  const events = new Map(snapshot.events.map((event) => [event.id, event]));
+  for (const event of current.events) {
+    if (!events.has(event.id)) events.set(event.id, event);
+  }
+  return {
+    ...snapshot,
+    events: [...events.values()].sort((a, b) =>
+      a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt.localeCompare(b.createdAt),
+    ),
+  };
+}
 
 function agoLabel(iso: string | null, now: number): string {
   if (!iso) {
@@ -596,77 +628,191 @@ export function WorkersBoard() {
   const [stopping, setStopping] = useState(false);
   const [holding, setHolding] = useState(false);
   const [stopNote, setStopNote] = useState<{ workerId: string; text: string } | null>(null);
+  const [streamConnection, setStreamConnection] =
+    useState<StreamConnectionState>("connecting");
   const selectedWorkerRef = useRef<string | null>(null);
   selectedWorkerRef.current = selectedWorkerId;
   const projectRef = useRef<string | null>(null);
   projectRef.current = selectedProjectId;
+  const workersRef = useRef<WorkerView[] | null>(null);
+  workersRef.current = workers;
+  const recoveryRef = useRef(createProjectRecoveryModel<WorkersProjectSnapshot>());
+  const reconciliationRef = useRef(createSingleFlightReconciler());
+  const detailRequestRef = useRef(0);
+  const daemonDownRef = useRef(false);
 
   useEffect(() => {
     const interval = setInterval(() => setNow(Date.now()), 10_000);
     return () => clearInterval(interval);
   }, []);
 
-  const refreshWorkers = useCallback(async (projectId: string) => {
-    setError(null);
-    const response = await fetch(`/api/workers?projectId=${encodeURIComponent(projectId)}`, {
-      cache: "no-store",
+  /**
+   * Re-read the selected project's durable truth. Reconnect/focus/visibility/
+   * online/health bursts coalesce here; a late project response is cached but
+   * cannot update a different project.
+   */
+  const reconcileProject = useCallback(async (projectId: string) => {
+    return reconciliationRef.current.run(projectId, async () => {
+      const ticket = recoveryRef.current.begin(projectId);
+      const json = async <T,>(url: string): Promise<T | null> => {
+        try {
+          const response = await fetch(url, { cache: "no-store" });
+          return response.ok ? ((await response.json()) as T) : null;
+        } catch {
+          return null;
+        }
+      };
+
+      const [workersPayload, confidencePayload] = await Promise.all([
+        json<{ workers: WorkerView[] }>(
+          `/api/workers?projectId=${encodeURIComponent(projectId)}`,
+        ),
+        json<ProjectConfidenceView>(
+          `/api/confidence?projectId=${encodeURIComponent(projectId)}`,
+        ),
+      ]);
+      const loadedWorkers = workersPayload?.workers ?? null;
+      const requestedWorkerId = selectedWorkerRef.current;
+      const workerId = loadedWorkers
+        ? requestedWorkerId && loadedWorkers.some((worker) => worker.id === requestedWorkerId)
+          ? requestedWorkerId
+          : (loadedWorkers.at(-1)?.id ?? null)
+        : null;
+      const loadedDetail = workerId
+        ? await json<WorkerDetailView>(
+            `/api/workers/detail?workerId=${encodeURIComponent(workerId)}`,
+          )
+        : null;
+      // Detail has no project parameter, so establish project ownership via
+      // the authoritative project worker list before accepting it.
+      const validDetail =
+        loadedDetail &&
+        loadedDetail.worker.id === workerId &&
+        loadedWorkers?.some((worker) => worker.id === loadedDetail.worker.id)
+          ? loadedDetail
+          : null;
+      const snapshot: WorkersProjectSnapshot = {
+        workers: loadedWorkers,
+        confidence: confidencePayload,
+        selectedWorkerId: workerId,
+        detail: validDetail,
+      };
+      if (!recoveryRef.current.store(ticket, snapshot)) return;
+      // projectRef changes during render, before the selection effect updates
+      // the recovery model, so guard both to close that small navigation race.
+      if (projectRef.current !== projectId || !recoveryRef.current.mayApply(ticket)) return;
+
+      if (!loadedWorkers) {
+        setError("Could not reconcile workers from the server.");
+        return;
+      }
+      setError(null);
+      workersRef.current = loadedWorkers;
+      setWorkers(loadedWorkers);
+      if (confidencePayload) setConfidence(confidencePayload);
+
+      // A user may select another worker while the HTTP reads are in flight.
+      // Never pull that selection back or install the old worker's detail.
+      const currentWorkerId = selectedWorkerRef.current;
+      const nextWorkerId =
+        currentWorkerId && loadedWorkers.some((worker) => worker.id === currentWorkerId)
+          ? currentWorkerId
+          : workerId;
+      if (nextWorkerId !== currentWorkerId) {
+        selectedWorkerRef.current = nextWorkerId;
+        setSelectedWorkerId(nextWorkerId);
+      }
+      if (validDetail && validDetail.worker.id === nextWorkerId) {
+        setDetail((current) => mergeWorkerDetail(validDetail, current));
+      } else if (!nextWorkerId) {
+        setDetail(null);
+      }
     });
-    const payload = (await response.json()) as { workers?: WorkerView[]; error?: string };
-    const loaded = payload.workers;
-    if (!response.ok || !loaded) {
-      setError(payload.error ?? `Failed to load workers (${response.status}).`);
+  }, []);
+
+  /** A user-driven drilldown read, guarded against both project and worker hops. */
+  const refreshSelectedDetail = useCallback(async (projectId: string, workerId: string) => {
+    const request = ++detailRequestRef.current;
+    try {
+      const response = await fetch(
+        `/api/workers/detail?workerId=${encodeURIComponent(workerId)}`,
+        { cache: "no-store" },
+      );
+      if (!response.ok) return;
+      const loaded = (await response.json()) as WorkerDetailView;
+      if (
+        request !== detailRequestRef.current ||
+        projectRef.current !== projectId ||
+        selectedWorkerRef.current !== workerId ||
+        loaded.worker.id !== workerId ||
+        !workersRef.current?.some((worker) => worker.id === workerId)
+      ) {
+        return;
+      }
+      setDetail((current) => mergeWorkerDetail(loaded, current));
+    } catch {
+      // The next SSE invalidation or recovery trigger retries from HTTP truth.
+    }
+  }, []);
+
+  useEffect(() => {
+    recoveryRef.current.select(selectedProjectId);
+    detailRequestRef.current += 1;
+    selectedWorkerRef.current = null;
+    setSelectedWorkerId(null);
+    setWorkers(null);
+    workersRef.current = null;
+    setDetail(null);
+    setConfidence(null);
+    setError(null);
+    if (selectedProjectId) void reconcileProject(selectedProjectId);
+  }, [selectedProjectId, reconcileProject]);
+
+  useEffect(() => {
+    const projectId = selectedProjectId;
+    if (!projectId || !selectedWorkerId) {
+      setDetail(null);
       return;
     }
-    setWorkers(loaded);
-    setSelectedWorkerId((current) =>
-      current && loaded.some((worker) => worker.id === current)
-        ? current
-        : (loaded.at(-1)?.id ?? null),
+    setDetail((current) =>
+      current?.worker.id === selectedWorkerId ? current : null,
     );
+    void refreshSelectedDetail(projectId, selectedWorkerId);
+  }, [selectedProjectId, selectedWorkerId, refreshSelectedDetail]);
+
+  const selectWorker = useCallback((workerId: string) => {
+    selectedWorkerRef.current = workerId;
+    detailRequestRef.current += 1;
+    setSelectedWorkerId(workerId);
   }, []);
 
-  const refreshDetail = useCallback(async (workerId: string) => {
-    const response = await fetch(`/api/workers/detail?workerId=${encodeURIComponent(workerId)}`, {
-      cache: "no-store",
-    });
-    if (response.ok) {
-      setDetail((await response.json()) as WorkerDetailView);
+  const checkDaemon = useCallback(async () => {
+    let down = true;
+    try {
+      const response = await fetch("/api/daemon-health", { cache: "no-store" });
+      down = !response.ok;
+    } catch {
+      down = true;
     }
-  }, []);
-
-  const refreshConfidence = useCallback(async (projectId: string) => {
-    const response = await fetch(`/api/confidence?projectId=${encodeURIComponent(projectId)}`, {
-      cache: "no-store",
-    });
-    if (response.ok) {
-      setConfidence((await response.json()) as ProjectConfidenceView);
+    const wasDown = daemonDownRef.current;
+    daemonDownRef.current = down;
+    if (wasDown && !down && projectRef.current) {
+      void reconcileProject(projectRef.current);
     }
-  }, []);
+  }, [reconcileProject]);
 
   useEffect(() => {
-    if (selectedProjectId) {
-      setWorkers(null);
-      setDetail(null);
-      setConfidence(null);
-      void refreshWorkers(selectedProjectId);
-      void refreshConfidence(selectedProjectId);
-    }
-  }, [selectedProjectId, refreshWorkers, refreshConfidence]);
-
-  useEffect(() => {
-    if (selectedWorkerId) {
-      setDetail(null);
-      void refreshDetail(selectedWorkerId);
-    } else {
-      setDetail(null);
-    }
-  }, [selectedWorkerId, refreshDetail]);
+    void checkDaemon();
+    const interval = setInterval(() => void checkDaemon(), 10_000);
+    return () => clearInterval(interval);
+  }, [checkDaemon]);
 
   // The escape hatch (user-confirmed): stop without a chat turn. The daemon
   // runs the same finalize pass Darwin's stop_worker uses; the note reports
   // its outcome honestly.
   const stopWorker = useCallback(
     async (workerId: string) => {
+      const projectId = projectRef.current;
       setStopping(true);
       setStopNote(null);
       try {
@@ -682,44 +828,57 @@ export function WorkersBoard() {
           auditError?: string | null;
         };
         if (!response.ok) {
-          setStopNote({ workerId, text: payload.error ?? `Stop failed (${response.status}).` });
+          if (projectRef.current === projectId) {
+            setStopNote({ workerId, text: payload.error ?? `Stop failed (${response.status}).` });
+          }
         } else {
           const violations = Array.isArray(payload.violations) ? payload.violations.length : 0;
-          setStopNote({
-            workerId,
-            text: [
-              "Worker stopped; its lane is retired and the worktree survives for review.",
-              payload.auditError
-                ? `Lane audit could not run: ${payload.auditError}`
-                : violations > 0
-                  ? `${violations} out-of-lane change${violations === 1 ? "" : "s"} — raised as a high-priority attention item.`
-                  : "Lane audit clean.",
-              payload.hasDigest
-                ? "A completion report was parsed."
-                : "No completion report — not rendered done.",
-            ].join(" "),
-          });
+          if (projectRef.current === projectId) {
+            setStopNote({
+              workerId,
+              text: [
+                "Worker stopped; its lane is retired and the worktree survives for review.",
+                payload.auditError
+                  ? `Lane audit could not run: ${payload.auditError}`
+                  : violations > 0
+                    ? `${violations} out-of-lane change${violations === 1 ? "" : "s"} — raised as a high-priority attention item.`
+                    : "Lane audit clean.",
+                payload.hasDigest
+                  ? "A completion report was parsed."
+                  : "No completion report — not rendered done.",
+              ].join(" "),
+            });
+          }
         }
       } catch (fetchError) {
-        setStopNote({
-          workerId,
-          text: `Stop failed: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
-        });
+        if (projectRef.current === projectId) {
+          setStopNote({
+            workerId,
+            text: `Stop failed: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
+          });
+        }
       } finally {
         setStopping(false);
       }
-      if (projectRef.current) {
-        void refreshWorkers(projectRef.current);
-      }
-      void refreshDetail(workerId);
+      if (projectId) void reconcileProject(projectId);
     },
-    [refreshWorkers, refreshDetail],
+    [reconcileProject],
   );
 
   // Live updates: append streamed events to the open drilldown, refresh the
   // list on status changes, refetch after results (digest/attention shift).
   useEffect(() => {
     const source = new EventSource("/api/events");
+    source.onopen = () => {
+      recoveryRef.current.setConnection("live");
+      setStreamConnection("live");
+      const projectId = projectRef.current;
+      if (projectId) void reconcileProject(projectId);
+    };
+    source.onerror = () => {
+      recoveryRef.current.setConnection("reconnecting");
+      setStreamConnection("reconnecting");
+    };
     source.onmessage = (message) => {
       let event: DaemonStreamEvent;
       try {
@@ -730,27 +889,28 @@ export function WorkersBoard() {
       const projectId = projectRef.current;
       if (event.type === "worker_event" && event.projectId === projectId) {
         setNow(Date.now());
-        setWorkers((current) => {
-          if (current && !current.some((worker) => worker.id === event.workerId)) {
-            // A worker this page has never seen — Darwin just spawned it.
-            // The live board must show it without a reload.
-            void refreshWorkers(projectId ?? "");
-            return current;
-          }
-          return current
-            ? current.map((worker) =>
-                worker.id === event.workerId
-                  ? { ...worker, lastMessageAt: event.event.createdAt }
-                  : worker,
-              )
-            : current;
-        });
+        const currentWorkers = workersRef.current;
+        if (currentWorkers && !currentWorkers.some((worker) => worker.id === event.workerId)) {
+          // A worker this page has never seen — Darwin just spawned it.
+          // The live board must show it without a reload.
+          if (projectId) void reconcileProject(projectId);
+        } else if (currentWorkers) {
+          const nextWorkers = currentWorkers.map((worker) =>
+            worker.id === event.workerId
+              ? { ...worker, lastMessageAt: event.event.createdAt }
+              : worker,
+          );
+          workersRef.current = nextWorkers;
+          setWorkers(nextWorkers);
+        }
         if (event.workerId === selectedWorkerRef.current) {
           if (event.event.kind === "result" || event.event.kind === "error") {
-            void refreshDetail(event.workerId);
+            if (projectId) void reconcileProject(projectId);
           } else {
             setDetail((current) =>
-              current && !current.events.some((existing) => existing.id === event.event.id)
+              current &&
+              current.worker.id === event.workerId &&
+              !current.events.some((existing) => existing.id === event.event.id)
                 ? { ...current, events: [...current.events, event.event] }
                 : current,
             );
@@ -762,20 +922,13 @@ export function WorkersBoard() {
         // stop writes attention rows, a result writes a digest), so refetch
         // the list — it is cheap and statuses change per turn, not per event.
         if (projectId) {
-          void refreshWorkers(projectId);
-          void refreshConfidence(projectId);
-        }
-        if (event.workerId === selectedWorkerRef.current) {
-          void refreshDetail(event.workerId);
+          void reconcileProject(projectId);
         }
       }
       if (event.type === "worker_plan" && event.projectId === projectId && projectId) {
         // The checklist moved: the card's count/bar and the open goal card
         // both re-fetch (the broadcast carries ids only, by design).
-        void refreshWorkers(projectId);
-        if (event.workerId === selectedWorkerRef.current) {
-          void refreshDetail(event.workerId);
-        }
+        void reconcileProject(projectId);
       }
       if (
         projectId &&
@@ -786,21 +939,36 @@ export function WorkersBoard() {
       ) {
         // The monitor's tick moves gauges without any user action (evidence
         // freshness, staleness), and attention changes move both surfaces.
-        void refreshConfidence(projectId);
-        if (event.type !== "monitor_tick") {
-          void refreshWorkers(projectId);
-          if (selectedWorkerRef.current) {
-            void refreshDetail(selectedWorkerRef.current);
-          }
-        }
+        void reconcileProject(projectId);
       }
     };
     return () => source.close();
-  }, [refreshDetail, refreshWorkers, refreshConfidence]);
+  }, [reconcileProject]);
+
+  // Laptop sleep can leave EventSource apparently open after it has stopped
+  // delivering. Reconcile from durable HTTP truth on every browser wake cue.
+  useEffect(() => {
+    const recover = () => {
+      const projectId = projectRef.current;
+      if (projectId) void reconcileProject(projectId);
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") recover();
+    };
+    window.addEventListener("focus", recover);
+    window.addEventListener("online", recover);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.removeEventListener("focus", recover);
+      window.removeEventListener("online", recover);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [reconcileProject]);
 
   // Hold: pause without ending — the honest middle ground before Stop.
   const holdWorker = useCallback(
     async (workerId: string) => {
+      const projectId = projectRef.current;
       setHolding(true);
       try {
         const response = await fetch("/api/workers/hold", {
@@ -812,25 +980,29 @@ export function WorkersBoard() {
           error?: string;
           response?: string | null;
         };
-        setStopNote({
-          workerId,
-          text: !response.ok
-            ? (payload.error ?? `Hold failed (${response.status}).`)
-            : payload.response
-              ? `Held. The worker's position: ${payload.response}`
-              : "Hold delivered — the worker has not acknowledged yet; its next reply will state where it is.",
-        });
+        if (projectRef.current === projectId) {
+          setStopNote({
+            workerId,
+            text: !response.ok
+              ? (payload.error ?? `Hold failed (${response.status}).`)
+              : payload.response
+                ? `Held. The worker's position: ${payload.response}`
+                : "Hold delivered — the worker has not acknowledged yet; its next reply will state where it is.",
+          });
+        }
       } catch (fetchError) {
-        setStopNote({
-          workerId,
-          text: `Hold failed: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
-        });
+        if (projectRef.current === projectId) {
+          setStopNote({
+            workerId,
+            text: `Hold failed: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
+          });
+        }
       } finally {
         setHolding(false);
       }
-      void refreshDetail(workerId);
+      if (projectId) void reconcileProject(projectId);
     },
-    [refreshDetail],
+    [reconcileProject],
   );
 
   const detailForSelection = detail && detail.worker.id === selectedWorkerId ? detail : null;
@@ -844,6 +1016,9 @@ export function WorkersBoard() {
         <div className="app-title">
           GALAPAGOS <span>/ Workers</span>
         </div>
+        <span className={`stream-state ${streamConnection}`} aria-label={`Live updates: ${streamConnection}`}>
+          {streamConnection === "live" ? "live" : streamConnection}
+        </span>
         {confidence ? (
           <ConfidenceGauge report={confidence.project} label="project" compact />
         ) : null}
@@ -890,7 +1065,7 @@ export function WorkersBoard() {
                   <button
                     key={worker.id}
                     className={`worker-card${worker.id === selectedWorkerId ? " selected" : ""}`}
-                    onClick={() => setSelectedWorkerId(worker.id)}
+                    onClick={() => selectWorker(worker.id)}
                   >
                     <div className="worker-card-head">
                       <span className="lane-name">{worker.laneName ?? "(lane missing)"}</span>
