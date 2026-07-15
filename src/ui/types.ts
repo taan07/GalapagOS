@@ -1,11 +1,18 @@
 // View types for the UI layer. The UI never imports adapters — these mirror
-// the shapes served by the route handlers.
+// the shapes served by the route handlers. (core/attachments is the one
+// shared import by design: it IS the wire contract both ends must agree on.)
+import type { OutgoingAttachment } from "../core/attachments";
+/** The Shift+Tab autonomy stops — mirror of core/autonomy (UI stays
+ * adapter-free; the daemon validates, this only renders). */
+export type AutonomyModeView = "interview" | "default" | "auto";
+
 export type ProjectView = {
   id: string;
   name: string;
   slug: string;
   root_path: string;
   created_at: string;
+  autonomy_mode: AutonomyModeView;
 };
 
 export type TurnView = {
@@ -70,11 +77,26 @@ export type DecisionView = {
   custom: string;
 };
 
-/** A message waiting its turn while Darwin works — visible and steerable. */
-export type QueuedMessage = { id: string; text: string };
+/**
+ * An attachment as the chat renders it: `url` is a server path
+ * (/api/attachments/…) for history, or a data:/blob: URL on the optimistic
+ * echo before the turn persists. Images render as click-to-expand
+ * thumbnails; text files as open-in-new-tab chips.
+ */
+export type AttachmentView = {
+  kind: "image" | "text";
+  name: string;
+  size: number;
+  url: string;
+};
+
+/** A message waiting its turn while Darwin works — visible and steerable.
+ * Attachments ride in memory only; the persisted queue keeps just the text
+ * (base64 image bytes would blow the localStorage quota). */
+export type QueuedMessage = { id: string; text: string; attachments?: OutgoingAttachment[] };
 
 export type ChatItem = (
-  | { kind: "user"; text: string }
+  | { kind: "user"; text: string; attachments?: AttachmentView[] }
   /** folded: loaded from history — the reply collapses to its summary
    * paragraph so scrolled-back history scans, not walls of text. Replies
    * streamed live in this session render in full. */
@@ -177,6 +199,31 @@ export type WorkerGithubView = {
   baseCommitUrl: string | null;
   /** Blob URL at the worker's branch, keyed by claim file path. */
   fileUrls: Record<string, string>;
+};
+
+/** One commit a worker made since its lane base. */
+export type WorkerChangeCommit = { sha: string; subject: string };
+
+/** The latest run of one check, with HONEST freshness: `fresh` is true only
+ * when the run's evidence key matches the worktree's state right now — a
+ * passing run against code that has since changed is not a green check. */
+export type WorkerCheckView = {
+  key: "typecheck" | "lint" | "test" | "build";
+  status: "passed" | "failed";
+  summary: string;
+  fresh: boolean;
+  createdAt: string;
+};
+
+/** Per-worker commits + diff + check evidence, served on demand (track F). */
+export type WorkerChangesView = {
+  /** The worktree no longer exists — nothing to show, honestly. */
+  gone: boolean;
+  commits: WorkerChangeCommit[];
+  diff: string;
+  diffTruncated: boolean;
+  dirtyFiles: string[];
+  checks: WorkerCheckView[];
 };
 
 export type WorkerEventView = {
@@ -286,12 +333,16 @@ export type DaemonStreamEvent =
   | { type: "manager_note"; projectId: string; text: string }
   /** A worker's plan/steps changed — re-fetch its checklist (ids only). */
   | { type: "worker_plan"; projectId: string; workerId: string }
-  /** A decision card fired somewhere (any turn, any tab): drives the
-   * needs-you cue and lets non-initiating tabs render the card. */
-  | ({ projectId: string } & Extract<
-      ManagerStreamEvent,
-      { type: "decision_request" } | { type: "decision_settled" }
-    >);
+  /** The autonomy stop changed (Shift+Tab, or a plan sign-off ended
+   * Interview) — every tab's pill flips together. */
+  | { type: "autonomy_mode"; projectId: string; mode: AutonomyModeView }
+  /** Every turn event now rides the broadcast wrapped with its project
+   * (turn-attach): decision cards drive the needs-you cue in every tab, and
+   * the full lifecycle (turn_started … turn_complete) lets a tab that loaded
+   * mid-turn re-attach to the living turn instead of orphaning. The tab that
+   * owns the initiating POST stream ignores this traffic — its own stream is
+   * authoritative. */
+  | ({ projectId: string } & ManagerStreamEvent);
 
 /** One durable record as served by /api/records — every field attributed. */
 export type RecordView = {

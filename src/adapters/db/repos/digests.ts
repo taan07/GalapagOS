@@ -55,6 +55,15 @@ export function latestDigestForWorker(
     .get(workerId) as CompletionDigestRow | undefined;
 }
 
+export function getCompletionDigest(
+  db: GalapagosDb,
+  digestId: string,
+): CompletionDigestRow | undefined {
+  return db.prepare("SELECT * FROM completion_digests WHERE id = ?").get(digestId) as
+    | CompletionDigestRow
+    | undefined;
+}
+
 export function setDigestStatus(
   db: GalapagosDb,
   id: string,

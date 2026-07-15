@@ -17,6 +17,9 @@ export function openDb(stateDir: string, options: { readonly?: boolean } = {}): 
     // Additive migrations: CREATE IF NOT EXISTS cannot grow an existing
     // table, so columns added after a table shipped are patched in here.
     ensureColumn(db, "workers", "resumed_from", "TEXT");
+    // The Shift+Tab autonomy axis — per-project and PERSISTENT (a restart
+    // must not silently move Darwin's leash).
+    ensureColumn(db, "projects", "autonomy_mode", "TEXT NOT NULL DEFAULT 'default'");
   }
   return db;
 }

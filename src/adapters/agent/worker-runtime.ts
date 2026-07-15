@@ -29,6 +29,7 @@ import {
   getWorker,
   listLiveStatusWorkers,
   listRecentWorkerEvents,
+  listWorkerEventsOfKind,
   listWorkers,
   setWorkerBriefRecord,
   setWorkerSdkSessionId,
@@ -51,7 +52,7 @@ import {
   type AttentionItemRow,
 } from "../db/repos/attention";
 import type { ProjectRow } from "../db/repos/projects";
-import { slugify } from "../db/repos/projects";
+import { getProject, slugify } from "../db/repos/projects";
 import { addWorktree, removeWorktree, workerWorktreePath } from "../git/mutating-runner";
 import { commitRecords } from "../git/mutating-runner";
 import { LocalGitCommandRunner } from "../git/runner";
@@ -507,11 +508,15 @@ export function createWorkerRuntime(deps: {
     return parsed.status;
   };
 
-  const consumeSession = async (workerId: string, session: WorkerSession): Promise<void> => {
+  const consumeSession = async (
+    workerId: string,
+    session: WorkerSession,
+    expectedResume: string | null = null,
+  ): Promise<void> => {
     // Runs unawaited in the background: it must never reject, or the daemon
     // dies on an unhandled rejection. Failures are persisted, not thrown.
     try {
-      await consumeSessionInner(workerId, session);
+      await consumeSessionInner(workerId, session, expectedResume);
     } catch (error) {
       try {
         const worker = getWorker(db, workerId);
@@ -529,8 +534,13 @@ export function createWorkerRuntime(deps: {
     }
   };
 
-  const consumeSessionInner = async (workerId: string, session: WorkerSession): Promise<void> => {
+  const consumeSessionInner = async (
+    workerId: string,
+    session: WorkerSession,
+    expectedResume: string | null = null,
+  ): Promise<void> => {
     let failed = false;
+    let resumeMismatch = false;
     for await (const event of session.events) {
       const worker = getWorker(db, workerId);
       if (!worker) {
@@ -538,8 +548,31 @@ export function createWorkerRuntime(deps: {
       }
       switch (event.kind) {
         case "session_started":
+          if (expectedResume && event.sdkSessionId !== expectedResume) {
+            // A resume that comes back under a DIFFERENT id is the SDK
+            // silently starting a blank session (spike-proven, same guard as
+            // the manager's ResumeMismatchError). Touch NOTHING: writing the
+            // blank id would destroy the only record of the real transcript
+            // and make the next restart's "resume" fake success. Kill the
+            // session; the post-loop fallback finalizes honestly.
+            resumeMismatch = true;
+            const mismatchEntry = live.get(workerId);
+            if (mismatchEntry) {
+              // The kill's debris (error result / stream error) must read as
+              // a requested stop, never as a worker failure.
+              mismatchEntry.stopRequested = true;
+            }
+            void session.stop().catch(() => {});
+            break;
+          }
           setWorkerSdkSessionId(db, workerId, event.sdkSessionId);
-          setStatus(worker, "running");
+          if (worker.status === "spawning") {
+            // Fresh spawns are always `spawning` at init. A re-attached
+            // orphan never is — its persisted status (running /
+            // awaiting_input / idle) is the truth and must survive the
+            // restart untouched.
+            setStatus(worker, "running");
+          }
           break;
         case "assistant":
           persistEvent(worker, "assistant", event.payload, oneLine(event.payload.text));
@@ -644,9 +677,46 @@ export function createWorkerRuntime(deps: {
           break;
         }
       }
+      if (resumeMismatch) {
+        // Stop CONSUMING, not just the switch: anything a blank session
+        // emits before its stream closes would be processed as real worker
+        // events — an assistant message rewrites the plan, a success result
+        // could mint a fabricated completion digest. Nothing after the
+        // mismatch is the worker's.
+        break;
+      }
     }
 
     const worker = getWorker(db, workerId);
+    if (worker && resumeMismatch) {
+      // The re-attach failed — fall back to exactly what boot reconciliation
+      // did before auto-resume existed: honest error event, at-stop safety
+      // pass, `stopped` (never `failed` — the platform lost the session, the
+      // worker did nothing wrong).
+      persistEvent(worker, "error", {
+        message:
+          "Daemon restarted — resuming the worker session came back blank (session id mismatch). The live session was lost; work up to this point remains in the worktree.",
+      });
+      if (stopping.has(workerId)) {
+        // A stop() is already in flight: it holds the finalize baton and will
+        // run the at-stop pass the moment this loop resolves. Finalizing here
+        // too would double the stopped marker and the no-digest attention
+        // item — and deleting from `stopping` would strip stop()'s own
+        // membership mid-flight. Record the mismatch and get out of its way.
+        return;
+      }
+      // No await between the has-check and the add, so a stop() passing its
+      // own gates either landed in `stopping` before this check (handled
+      // above) or will be refused by it until the finalize completes.
+      stopping.add(workerId);
+      try {
+        await finalizeStop(worker, "the daemon (restart re-attach failed)");
+        console.log(`[workers] re-attach of ${workerId} came back blank — finalized as stopped`);
+      } finally {
+        stopping.delete(workerId);
+      }
+      return;
+    }
     const entry = live.get(workerId);
     if (worker && !failed && !entry?.stopRequested && worker.status !== "failed") {
       // The stream ended without a stop request: the session process died.
@@ -737,6 +807,137 @@ export function createWorkerRuntime(deps: {
     const status: WorkerStatus = current?.status === "failed" ? "failed" : "stopped";
     setStatus(worker, status);
     return { ok: true, status, violations, hasDigest: digest !== undefined, auditError };
+  };
+
+  /**
+   * The restart notice a re-attached worker wakes up to. The wrong variant
+   * silently rewrites fleet state: a held worker told to "continue" is a hold
+   * nobody released (worst case: the lane guard froze it mid-violation and
+   * the nudge un-freezes it straight back into the violation).
+   *
+   * Hold detection: a release IS an ordinary manager steer, so the newest
+   * INSTRUCTION-steer decides — but notice-steers are not instructions and
+   * must not read as releases: the re-attach marker itself (or a second
+   * consecutive restart would silently un-hold) and lane-amendment notices
+   * (amending a frozen worker's lane does not release the freeze).
+   */
+  const buildReattachNudge = (worker: WorkerRow): string => {
+    for (const steer of listWorkerEventsOfKind(db, worker.id, "steer")) {
+      let payload: { hold?: unknown; reattached?: unknown; laneAmendment?: unknown };
+      try {
+        payload = JSON.parse(steer.payload) as typeof payload;
+      } catch {
+        // Unreadable steer payload — not an instruction we can read; skip it
+        // rather than guess.
+        continue;
+      }
+      if (payload.reattached === true || payload.laneAmendment !== undefined) {
+        continue;
+      }
+      if (payload.hold === true) {
+        return "The daemon restarted and your session was resumed — you are still ON HOLD. Do not start anything new and do not write further changes. Reply with ONE short message restating where you are and what remains, then keep waiting for further instructions. Do not emit a completion block.";
+      }
+      break; // newest instruction-steer is not a hold — the hold (if any) was released
+    }
+    if (worker.status === "awaiting_input") {
+      return "The daemon restarted and your session was resumed — your plan and progress stand. If you were waiting on an answer from your manager, restate your question in ONE short message and keep waiting. Do not emit a new galapagos-plan unless the work itself changed.";
+    }
+    if (worker.status === "idle") {
+      // idle without a digest (digest-carriers never re-attach) means the
+      // worker claimed completion but its block did not parse.
+      return "The daemon restarted and your session was resumed — your plan and progress stand. Your last completion block did not parse; if the task is truly finished, re-emit a valid galapagos-completion block, otherwise continue from your current step. Do not emit a new galapagos-plan unless the work itself changed.";
+    }
+    return "The daemon restarted mid-run and your session was resumed — your plan and progress stand. Inspect your worktree state and continue from your current step. Do not emit a new galapagos-plan unless the work itself changed.";
+  };
+
+  /**
+   * Boot re-attach: resume an orphan's SDK session in place — SAME worker
+   * row, lane, and worktree, so its plan, steps, and history all survive and
+   * a daemon restart feeds ZERO failure evidence into confidence. Eligibility
+   * is strict; anything short of certainty falls back to the legacy finalize
+   * path (returns false):
+   * - no persisted sdk_session_id (still `spawning`, or a pre-capture crash):
+   *   there is nothing to resume;
+   * - worktree gone: resume is cwd-keyed, the session cannot come back;
+   * - lane missing or not active: a crash inside finalizeStop's retire→status
+   *   window leaves a live-status row with a retired lane, and re-attaching
+   *   it would run with the lane guard silently disabled;
+   * - a completion digest exists: the work is already claimed complete
+   *   (finalize raises no unstructured_completion then), and the re-attach
+   *   event would bump the event count under a fresh watchdog verdict,
+   *   capping confidence for no benefit.
+   * Session id verification happens asynchronously in consumeSessionInner —
+   * boot must not await N session inits before the daemon can listen.
+   */
+  const reattachOrphan = (worker: WorkerRow): boolean => {
+    if (worker.status === "spawning" || !worker.sdk_session_id) {
+      return false;
+    }
+    if (!existsSync(worker.worktree_path)) {
+      return false;
+    }
+    const lane = getLane(db, worker.lane_id);
+    if (!lane || lane.status !== "active") {
+      return false;
+    }
+    if (latestDigestForWorker(db, worker.id)) {
+      return false;
+    }
+    const project = getProject(db, worker.project_id);
+    if (!project) {
+      return false;
+    }
+
+    // One shared contract object, exactly as spawn/resume wire it: the
+    // session's canUseTool closes over it, so amend_lane keeps working on a
+    // re-attached worker.
+    const contract = laneGlobs(lane);
+    const nudge = buildReattachNudge(worker);
+    let session: WorkerSession;
+    try {
+      session = sessionFactory({
+        config,
+        worktreePath: worker.worktree_path,
+        systemPrompt: buildWorkerDoctrine({
+          projectName: project.name,
+          laneName: lane.name,
+          allowedGlobs: contract.allowedGlobs,
+          forbiddenGlobs: contract.forbiddenGlobs,
+          baseSha: lane.base_sha,
+          branch: worker.branch,
+          worktreePath: worker.worktree_path,
+        }),
+        // The nudge IS the first message — the streaming-input queue requires
+        // one, and it buffers until the resumed session reads it. Never
+        // awaited: a reply wait here would serialize boots behind the fleet.
+        briefText: nudge,
+        model: config.workerModel,
+        lane: contract,
+        onToolDenied: (tool) => recordDenial(worker.id, worker.project_id, tool),
+        resume: worker.sdk_session_id,
+      });
+    } catch (error) {
+      console.error(
+        `[workers] re-attach spawn failed for ${worker.id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return false;
+    }
+    const loopDone = consumeSession(worker.id, session, worker.sdk_session_id);
+    live.set(worker.id, {
+      session,
+      loopDone,
+      stopRequested: false,
+      preemptRequested: false,
+      contract,
+      replyWaiters: [],
+      lastViolationKey: "",
+    });
+    // steer-kind, not error-kind: the notice is the manager's voice, carries
+    // no failure evidence, and its touchWorker side effect resets the
+    // staleness clock so an overnight orphan isn't flagged stale on the
+    // first monitor tick.
+    persistEvent(worker, "steer", { text: nudge, reattached: true });
+    return true;
   };
 
   return {
@@ -1432,20 +1633,42 @@ plan does not carry over). End with your completion report as required.`;
 
     /**
      * Boot reconciliation: rows whose status implies a live session after a
-     * daemon restart are orphans — their sessions died with the old process.
-     * Mark them honestly and run the same at-stop safety pass (their
-     * worktrees still hold the work).
+     * daemon restart are orphans of the dead process. Orphans with a
+     * persisted sdk_session_id and a surviving worktree are RE-ATTACHED in
+     * place (a restart is a platform hiccup, not a worker failure); the rest
+     * get the honest legacy treatment — error event, the same at-stop safety
+     * pass, `stopped` (their worktrees still hold the work). `reattached`
+     * counts ATTEMPTS: session id verification lands asynchronously after
+     * boot, and a mismatch falls back to the finalize path on its own.
      */
-    async reconcileOrphans(): Promise<number> {
+    async reconcileOrphans(): Promise<{ reattached: number; finalized: number }> {
       const orphans = listLiveStatusWorkers(db);
+      let reattached = 0;
+      let finalized = 0;
       for (const worker of orphans) {
+        // A re-attach attempt that THROWS (db read, records store) must cost
+        // only its own worker the fallback — never abort the loop and leave
+        // the remaining orphans wedged in a live status until the next boot.
+        let attached = false;
+        try {
+          attached = reattachOrphan(worker);
+        } catch (error) {
+          console.error(
+            `[workers] re-attach attempt failed for ${worker.id}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        if (attached) {
+          reattached += 1;
+          continue;
+        }
         persistEvent(worker, "error", {
           message:
             "Daemon restarted — the live worker session was lost. Work up to this point remains in the worktree.",
         });
         await finalizeStop(worker, "the daemon (restart reconciliation)");
+        finalized += 1;
       }
-      return orphans.length;
+      return { reattached, finalized };
     },
   };
 }

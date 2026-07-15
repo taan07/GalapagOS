@@ -4,14 +4,66 @@ import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
+  AttachmentView,
+  AutonomyModeView,
   ChatItem,
   DecisionView,
   LiveTurnStatusView,
   QueuedMessage,
   RebriefView,
 } from "./types";
+import { shouldAttachPastedText, type OutgoingAttachment } from "../core/attachments";
+import { imageFileToAttachment } from "./attachments-paste";
 import { localClockTime, localDate, localDateTime } from "./time";
 import { groupTurns, planSettledTurn, splitAnswerFold, type IndexedItem, type TurnGroup } from "./turns";
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${Math.round(bytes / 1024)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** A user message's attachments: image thumbnails open full-size in a new
+ * tab; pasted-text files open as raw text. History stays scannable — the
+ * thumbnail is bounded, the file is a one-line chip. */
+function AttachmentStrip({ attachments }: { attachments: AttachmentView[] }) {
+  return (
+    <div className="msg-attachments">
+      {attachments.map((attachment, index) =>
+        attachment.kind === "image" ? (
+          <a
+            key={index}
+            className="msg-attachment-image"
+            href={attachment.url}
+            target="_blank"
+            rel="noreferrer"
+            title={`${attachment.name} — open full size`}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={attachment.url} alt={attachment.name} loading="lazy" />
+          </a>
+        ) : (
+          <a
+            key={index}
+            className="msg-attachment-file"
+            href={attachment.url}
+            target="_blank"
+            rel="noreferrer"
+            title="Open the pasted text"
+          >
+            <span className="attach-icon">📄</span>
+            <span className="attach-name">{attachment.name}</span>
+            <span className="attach-size">{formatSize(attachment.size)}</span>
+          </a>
+        ),
+      )}
+    </div>
+  );
+}
 
 /** Render a settled card's outcome as one scannable line. */
 function settledSummary(decision: DecisionView): string {
@@ -316,6 +368,9 @@ const ChatMessage = memo(function ChatMessage({
     return (
       <div className="msg user">
         <CopyButton text={item.text} />
+        {item.attachments && item.attachments.length > 0 ? (
+          <AttachmentStrip attachments={item.attachments} />
+        ) : null}
         {item.text}
       </div>
     );
@@ -569,12 +624,28 @@ const TurnBlock = memo(function TurnBlock({
  * The free-text answer to a pending card arrives here too (2026-07-08 ruling):
  * `onSend` routes it to the waiting decision instead of starting a new turn.
  */
+const MODE_LABELS: Record<AutonomyModeView, string> = {
+  interview: "Interview/Plan",
+  default: "Default",
+  auto: "Auto",
+};
+
+const MODE_HINTS: Record<AutonomyModeView, string> = {
+  interview:
+    "Clarity phase: Darwin interrogates and plans; starting new workers is off. He proposes the formal sign-off when the plan is ready — signing it returns to Default. Shift+Tab cycles.",
+  default:
+    "Balanced: Darwin acts on what is clearly agreed and asks about the rest. Shift+Tab cycles.",
+  auto: "Long leash over workers: Darwin spawns, steers, and retires freely. Ambiguity still interrupts; main and direction calls still need your yes. Shift+Tab cycles.",
+};
+
 function Composer({
   projectId,
   disabled,
   answering,
   working,
   queued,
+  mode,
+  onCycleMode,
   onSend,
 }: {
   projectId: string | null;
@@ -582,10 +653,32 @@ function Composer({
   answering: boolean;
   working: boolean;
   queued: QueuedMessage[];
-  onSend: (text: string) => void;
+  mode: AutonomyModeView;
+  onCycleMode: () => void;
+  onSend: (text: string, attachments: OutgoingAttachment[]) => void;
 }) {
   const storageKey = projectId ? `galapagos.draft.${projectId}` : null;
   const [draft, setDraft] = useState("");
+  // The attachment tray: pasted images (downscaled, base64) and intercepted
+  // large-text pastes waiting to ride the next send. Ephemeral by design —
+  // unlike the text draft, chips don't survive a reload (image bytes have no
+  // sane localStorage story); they're re-pasteable.
+  const [tray, setTray] = useState<OutgoingAttachment[]>([]);
+  const [pasteNote, setPasteNote] = useState<string | null>(null);
+  // Paste events don't carry modifier state — track Shift at the window so
+  // Shift+paste can bypass the large-text interception (openwebui §6).
+  const shiftHeldRef = useRef(false);
+  useEffect(() => {
+    const track = (event: KeyboardEvent) => {
+      shiftHeldRef.current = event.shiftKey;
+    };
+    window.addEventListener("keydown", track);
+    window.addEventListener("keyup", track);
+    return () => {
+      window.removeEventListener("keydown", track);
+      window.removeEventListener("keyup", track);
+    };
+  }, []);
 
   // Load the persisted draft whenever the focused project changes. Reads run
   // client-side only (this is a "use client" tree), so useState starts empty
@@ -593,9 +686,11 @@ function Composer({
   useEffect(() => {
     if (!storageKey) {
       setDraft("");
-      return;
+    } else {
+      setDraft(window.localStorage.getItem(storageKey) ?? "");
     }
-    setDraft(window.localStorage.getItem(storageKey) ?? "");
+    setTray([]);
+    setPasteNote(null);
   }, [storageKey]);
 
   // Persist on edit (not via an effect, to avoid a project switch briefly
@@ -614,18 +709,112 @@ function Composer({
 
   const submit = () => {
     const text = draft.trim();
-    if (!text || disabled) {
+    // A bare screenshot is a valid message; attachments never answer a
+    // pending card (the free-text answer contract is text-only).
+    const attachments = answering ? [] : tray;
+    if ((!text && attachments.length === 0) || disabled) {
       return;
     }
     setDraft("");
+    setTray([]);
+    setPasteNote(null);
     if (storageKey) {
       window.localStorage.removeItem(storageKey);
     }
-    onSend(text);
+    onSend(text, attachments);
+  };
+
+  /**
+   * openwebui §6 parity: pasted images become tray chips (downscaled to
+   * API-safe bounds); plain text past the threshold becomes a .txt chip
+   * unless Shift is held (the escape hatch back to an inline paste). Normal
+   * pastes fall through to the browser default. Disabled while a card is
+   * answering — that path is text-only.
+   */
+  const handlePaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (answering || disabled) {
+      return;
+    }
+    const clipboard = event.clipboardData;
+    const imageFiles: File[] = [];
+    for (const item of Array.from(clipboard.items)) {
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) {
+          imageFiles.push(file);
+        }
+      }
+    }
+    if (imageFiles.length > 0) {
+      event.preventDefault();
+      setPasteNote(null);
+      void Promise.all(imageFiles.map((file) => imageFileToAttachment(file).catch(() => null))).then(
+        (results) => {
+          const attached = results.filter((entry): entry is OutgoingAttachment => entry !== null);
+          if (attached.length > 0) {
+            setTray((current) => [...current, ...attached]);
+          }
+          if (attached.length < results.length) {
+            setPasteNote("Couldn't attach that image (unreadable or too large).");
+          }
+        },
+      );
+      return;
+    }
+    const text = clipboard.getData("text/plain");
+    if (shouldAttachPastedText(text, shiftHeldRef.current)) {
+      event.preventDefault();
+      setPasteNote(null);
+      setTray((current) => [
+        ...current,
+        {
+          kind: "text",
+          text,
+          name: `Pasted_Text_${Date.now()}.txt`,
+          size: text.length,
+        },
+      ]);
+    }
+  };
+
+  const removeFromTray = (index: number) => {
+    setTray((current) => current.filter((_, i) => i !== index));
   };
 
   return (
     <div className={`chat-compose${answering ? " answering" : ""}`}>
+      {tray.length > 0 && !answering ? (
+        <div className="attach-tray">
+          {tray.map((attachment, index) => (
+            <span
+              key={index}
+              className={`attach-chip ${attachment.kind === "image" ? "image" : "file"}`}
+            >
+              {attachment.kind === "image" ? (
+                /* eslint-disable-next-line @next/next/no-img-element */
+                <img
+                  src={`data:${attachment.mediaType};base64,${attachment.data}`}
+                  alt={attachment.name}
+                />
+              ) : (
+                <>
+                  <span className="attach-icon">📄</span>
+                  <span className="attach-name">{attachment.name}</span>
+                  <span className="attach-size">{formatSize(attachment.size)}</span>
+                </>
+              )}
+              <button
+                type="button"
+                className="attach-remove"
+                title="Remove attachment"
+                onClick={() => removeFromTray(index)}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : null}
       <textarea
         value={draft}
         placeholder={
@@ -637,6 +826,7 @@ function Composer({
         }
         disabled={disabled}
         onChange={(event) => edit(event.target.value)}
+        onPaste={handlePaste}
         onKeyDown={(event) => {
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
@@ -645,8 +835,19 @@ function Composer({
         }}
       />
       <div className="compose-row">
+        <button
+          type="button"
+          className={`mode-pill mode-${mode}`}
+          onClick={onCycleMode}
+          disabled={disabled}
+          title={MODE_HINTS[mode]}
+        >
+          {MODE_LABELS[mode]} <span className="mode-key">⇧⇥</span>
+        </button>
         {answering ? (
           <span className="hint">Your message answers the question above.</span>
+        ) : pasteNote ? (
+          <span className="queue-note">{pasteNote}</span>
         ) : queued.length > 0 ? (
           <span className="queue-note">
             Queued — sending in order when Darwin finishes, or Steer to interrupt.
@@ -654,7 +855,13 @@ function Composer({
         ) : (
           <span className="hint">Enter to send · Shift+Enter for a new line</span>
         )}
-        <button onClick={submit} disabled={disabled || draft.trim().length === 0}>
+        <button
+          onClick={submit}
+          disabled={
+            disabled ||
+            (draft.trim().length === 0 && (answering || tray.length === 0))
+          }
+        >
           {answering ? "Answer" : working ? "Queue" : "Send"}
         </button>
       </div>
@@ -678,6 +885,8 @@ export function Chat({
   onClearRebrief,
   onAnswerDecision,
   onSwitchToOpus,
+  mode,
+  onCycleMode,
 }: {
   items: ChatItem[];
   working: boolean;
@@ -692,7 +901,7 @@ export function Chat({
   /** Focused project id — the key the composer persists its draft under. */
   projectId: string | null;
   projectName: string;
-  onSend: (text: string) => void;
+  onSend: (text: string, attachments: OutgoingAttachment[]) => void;
   /** Interrupt the current turn and send this queued message next. */
   onQueueSteer: (id: string) => void;
   onQueueRemove: (id: string) => void;
@@ -704,6 +913,9 @@ export function Chat({
     custom: string,
   ) => void;
   onSwitchToOpus: (failedText: string) => void;
+  /** The project's autonomy stop; the composer pill renders and cycles it. */
+  mode: AutonomyModeView;
+  onCycleMode: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -839,6 +1051,8 @@ export function Chat({
         answering={answering}
         working={working}
         queued={queued}
+        mode={mode}
+        onCycleMode={onCycleMode}
         onSend={onSend}
       />
     </section>

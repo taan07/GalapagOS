@@ -159,6 +159,35 @@ export function compactSession(
   return swap();
 }
 
+/**
+ * The session most recently compacted for a project — where a proactive
+ * re-brief finds the conversational tail the compaction left undistilled.
+ */
+export function latestCompactedSessionId(db: GalapagosDb, projectId: string): string | null {
+  const row = db
+    .prepare(
+      `SELECT id FROM manager_sessions
+       WHERE project_id = ? AND status = 'compacted'
+       ORDER BY rowid DESC LIMIT 1`,
+    )
+    .get(projectId) as { id: string } | undefined;
+  return row?.id ?? null;
+}
+
+/**
+ * A session's conversational turns no distill pass ever covered — the live
+ * delta the record store does not hold. System turns carry no context.
+ */
+export function listUndistilledTurns(db: GalapagosDb, sessionId: string): ManagerTurnRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM manager_turns
+       WHERE session_id = ? AND distilled_at IS NULL AND role != 'system'
+       ORDER BY turn_index`,
+    )
+    .all(sessionId) as ManagerTurnRow[];
+}
+
 /** Chat history for a project spans compacted sessions — memory survives. */
 export function listProjectTurns(db: GalapagosDb, projectId: string): ManagerTurnRow[] {
   // rowid = insertion order: same-millisecond turns across a compaction

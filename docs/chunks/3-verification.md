@@ -167,6 +167,16 @@ mid-task (button or chat) before it finishes.
 
 ## Drill 9 — Daemon restart reconciliation
 
+> **Superseded 2026-07-12 (feat/worker-auto-resume):** this drill's expected
+> outcome inverts. A running worker with a persisted session id now survives
+> the restart: boot logs `[workers] re-attached 1 live worker after restart
+> (sessions resumed in place)`, /workers still shows it live with its plan
+> intact, a "session was resumed" steer appears in its stream, and NO error
+> event, attention item, or lane retirement occurs. The checks below describe
+> the FALLBACK path, which still applies when the worktree is gone, the lane
+> is not active, no session id was ever captured, or the resume comes back
+> blank.
+
 Spawn a worker on a fresh lane; while it is `running`, Ctrl-C `npm run
 dev`, then start it again.
 

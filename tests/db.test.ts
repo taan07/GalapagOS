@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, existsSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { openDb } from "../src/adapters/db/db";
 import {
   getProject,
@@ -29,6 +30,58 @@ const TEST_GIT_IDENTITY = { name: "Galapagos Tests", email: "tests@galapagos.loc
 function tmpDir(prefix: string): string {
   return mkdtempSync(path.join(os.tmpdir(), prefix));
 }
+
+test("opening a pre-lifecycle database adds retirement and durable debrief tables", () => {
+  const stateDir = tmpDir("glp-pre-retirement-");
+  const legacy = new Database(path.join(stateDir, "state.db"));
+  // Exact pre-change shape: CREATE IF NOT EXISTS must preserve this table and
+  // add the new lifecycle table beside it, never reinterpret digest status.
+  legacy.exec(`
+    CREATE TABLE completion_digests (
+      id TEXT PRIMARY KEY,
+      worker_id TEXT NOT NULL,
+      narrative TEXT NOT NULL,
+      before_after TEXT NOT NULL,
+      claims TEXT NOT NULL,
+      touched_areas TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'parsed',
+      created_at TEXT NOT NULL
+    );
+  `);
+  legacy.close();
+
+  const db = openDb(stateDir);
+  const columns = db.pragma("table_info(completion_retirements)") as { name: string }[];
+  assert.deepEqual(
+    columns.map((column) => column.name),
+    [
+      "digest_id",
+      "project_id",
+      "worker_id",
+      "status",
+      "attempts",
+      "failure_kind",
+      "last_error",
+      "last_attempt_at",
+      "retired_at",
+      "created_at",
+      "updated_at",
+    ],
+  );
+  const legacyColumns = db.pragma("table_info(completion_digests)") as { name: string }[];
+  assert.equal(
+    legacyColumns.some((column) => column.name === "retirement_status"),
+    false,
+    "verification status was not overloaded by migration",
+  );
+  const debriefColumns = db.pragma("table_info(completion_debriefs)") as { name: string }[];
+  assert.ok(debriefColumns.some((column) => column.name === "due_at"));
+  assert.ok(debriefColumns.some((column) => column.name === "narrated_at"));
+  const attemptColumns = db.pragma("table_info(completion_debrief_attempts)") as { name: string }[];
+  assert.ok(attemptColumns.some((column) => column.name === "context"));
+  assert.ok(attemptColumns.some((column) => column.name === "error_code"));
+  db.close();
+});
 
 test("slugify produces stable kebab-case slugs", () => {
   assert.equal(slugify("MAKE IN THAILAND"), "make-in-thailand");

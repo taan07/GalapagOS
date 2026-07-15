@@ -14,13 +14,20 @@ import type { GalapagosDb } from "../db/db";
 import {
   createAttentionItem,
   listOpenAttentionItems,
+  updateAttentionDetail,
   type AttentionItemRow,
 } from "../db/repos/attention";
 import { listUnreviewedDigests, type CompletionDigestRow } from "../db/repos/digests";
 import { createJob, failJob, finishJob, startJob } from "../db/repos/jobs";
 import { getLane } from "../db/repos/lanes";
-import { getOrCreateActiveSession, appendTurn } from "../db/repos/manager";
+import { getOrCreateActiveSession, appendTurn, updateTurnContent } from "../db/repos/manager";
 import type { ProjectRow } from "../db/repos/projects";
+import {
+  describeOutcome,
+  type DecisionBroker,
+  type DecisionOption,
+} from "./decisions";
+import type { DecisionTurnPayload } from "./manager-session";
 import { getWorker } from "../db/repos/workers";
 import { buildWorkerEvidence } from "../evidence/adapter";
 import { createRecordsStore } from "../records/store";
@@ -63,8 +70,12 @@ Management by exception, in order of preference:
    resolve_attention with what you did.
 2. Escalate with ask_user ONLY for: failures you cannot fix, contradicted
    claims, and genuine direction calls. Always include what you checked and
-   your recommendation. Mark the related completion escalated via
-   review_completion when there is one.
+   your recommendation — and ALWAYS give 2-4 clickable options (lead with
+   your recommendation). Your question renders as a card the user clicks;
+   an options-less card can only be answered by typing, and when several
+   cards stack only the newest gets the composer — options keep every card
+   answerable. Mark the related completion escalated via review_completion
+   when there is one.
 3. Dismiss (resolve_attention, resolution=dismissed) only items that are
    plainly noise — and say why.
 
@@ -204,8 +215,30 @@ export function createAskUserBridge(input: {
   db: GalapagosDb;
   project: ProjectRow;
   broadcast?: (event: unknown) => void;
-}): (question: string, context: string) => { attentionId: string } {
-  return (question, questionContext) => {
+  /**
+   * The daemon's decision broker (track E): with it, an escalation becomes a
+   * REAL pending card in the chat — clickable options, composer free-text —
+   * instead of a dead note. Without it (older contexts, tests), the note
+   * path stands.
+   */
+  decisions?: DecisionBroker;
+  /**
+   * Fired when the user ANSWERS the card. The daemon wakes Darwin with the
+   * answer so it is acted on immediately — never parked until the user
+   * happens to send another message.
+   */
+  onAnswered?: (answer: { question: string; outcomeText: string; attentionId: string }) => void;
+  /** Card timeout override; omitted = the broker's 10-minute default. */
+  cardTimeoutMs?: number;
+}): (
+  question: string,
+  context: string,
+  options?: DecisionOption[],
+  multiSelect?: boolean,
+) => { attentionId: string } {
+  return (question, questionContext, options = [], multiSelect = false) => {
+    // The durable half, unchanged: the queue records the question whatever
+    // happens to the card (timeout, restart, ignored tab).
     const item = createAttentionItem(input.db, {
       projectId: input.project.id,
       kind: "question_for_user",
@@ -213,18 +246,111 @@ export function createAskUserBridge(input: {
       detail: questionContext ? `${question}\n\n${questionContext}` : question,
       priority: "high",
     });
-    // The chat surface: a system note in Darwin's history, so the question
-    // reaches the user where they already talk — answers flow back through
-    // Darwin, who reads the queue with list_attention.
     const session = getOrCreateActiveSession(input.db, input.project.id);
-    const noteText = `Triage escalated a question:\n${question}${questionContext ? `\n\n${questionContext}` : ""}\n\nAnswer here — Darwin will route it (attention item ${item.id}).`;
-    appendTurn(input.db, {
+    const fullQuestion = questionContext ? `${question}\n\n${questionContext}` : question;
+
+    if (!input.decisions) {
+      // Legacy surface: a system note in Darwin's history. Answers flow back
+      // through Darwin, who reads the queue with list_attention.
+      const noteText = `Triage escalated a question:\n${fullQuestion}\n\nAnswer here — Darwin will route it (attention item ${item.id}).`;
+      appendTurn(input.db, {
+        sessionId: session.id,
+        role: "system",
+        content: JSON.stringify({ kind: "note", text: noteText }),
+      });
+      input.broadcast?.({ type: "manager_note", projectId: input.project.id, text: noteText });
+      input.broadcast?.({ type: "attention_changed", projectId: input.project.id });
+      return { attentionId: item.id };
+    }
+
+    // The card surface (track E): register with the broker (10-minute
+    // timeout, same as live cards), persist the SAME pending payload a live
+    // turn would (byte-compatible with reload rendering and the boot sweep),
+    // broadcast the request — and DO NOT WAIT. Triage never blocks on the
+    // user; the settle callback below carries the answer onward.
+    const { request, outcome } = input.decisions.ask({
+      kind: "decision",
+      question: fullQuestion,
+      options,
+      multiSelect,
+      ...(input.cardTimeoutMs !== undefined ? { timeoutMs: input.cardTimeoutMs } : {}),
+    });
+    const payload: DecisionTurnPayload = {
+      kind: "decision",
+      cardKind: "decision",
+      decisionId: request.id,
+      question: fullQuestion,
+      options,
+      multiSelect,
+      fields: [],
+      status: "pending",
+      selections: [],
+      responses: {},
+      custom: "",
+    };
+    const turn = appendTurn(input.db, {
       sessionId: session.id,
       role: "system",
-      content: JSON.stringify({ kind: "note", text: noteText }),
+      content: JSON.stringify(payload),
     });
-    input.broadcast?.({ type: "manager_note", projectId: input.project.id, text: noteText });
+    input.broadcast?.({
+      type: "decision_request",
+      projectId: input.project.id,
+      turnId: turn.id,
+      decisionId: request.id,
+      cardKind: "decision",
+      question: fullQuestion,
+      options,
+      multiSelect,
+      fields: [],
+    });
     input.broadcast?.({ type: "attention_changed", projectId: input.project.id });
+
+    void outcome.then((settled) => {
+      const answered = settled.status === "answered" ? settled.answer : null;
+      const settledPayload: DecisionTurnPayload = {
+        ...payload,
+        status: settled.status,
+        selections: answered?.selections ?? [],
+        responses: answered?.responses ?? {},
+        custom: answered?.custom ?? "",
+      };
+      updateTurnContent(input.db, turn.id, JSON.stringify(settledPayload));
+      input.broadcast?.({
+        type: "decision_settled",
+        projectId: input.project.id,
+        decisionId: request.id,
+        status: settled.status,
+        selections: answered?.selections ?? [],
+        responses: answered?.responses ?? {},
+        custom: answered?.custom ?? "",
+      });
+      if (settled.status === "answered") {
+        // The durable anchor is NOT released here (review finding: the wake
+        // is in-memory, and closing the item first strands the answer if a
+        // restart or busy-queue loss eats the wake). Instead the answer is
+        // folded INTO the open item — whoever picks it up (Darwin's pickup
+        // turn, or triage re-raising it after a lost wake) acts on the
+        // answer instead of re-asking. Darwin resolves the item himself once
+        // he has actually acted, exactly like every other attention item.
+        const outcomeText = describeOutcome(settled);
+        updateAttentionDetail(
+          input.db,
+          item.id,
+          `${fullQuestion}\n\nANSWERED by the user via the chat card:\n${outcomeText}\n\nAwaiting Darwin's pickup — act on the answer, then resolve this item.`,
+        );
+        input.broadcast?.({ type: "attention_changed", projectId: input.project.id });
+        input.onAnswered?.({
+          question: fullQuestion,
+          outcomeText,
+          attentionId: item.id,
+        });
+      }
+      // Timeout/interrupt: the turn is stamped honestly and the attention
+      // item stays OPEN — the question is still owed an answer, and the
+      // queue is what re-raises it.
+    });
+
     return { attentionId: item.id };
   };
 }
@@ -235,6 +361,14 @@ export async function runTriageJob(input: {
   project: ProjectRow;
   workers: WorkerRuntime;
   broadcast?: (event: unknown) => void;
+  /** The daemon's decision broker — escalations become real cards (track E). */
+  decisions?: DecisionBroker;
+  /** Fired when the user answers a triage card; the daemon wakes Darwin. */
+  onEscalationAnswered?: (answer: {
+    question: string;
+    outcomeText: string;
+    attentionId: string;
+  }) => void;
 }): Promise<TriageOutcome> {
   const { db, config, project } = input;
   const items = listOpenAttentionItems(db, project.id);
@@ -262,8 +396,16 @@ export async function runTriageJob(input: {
     db,
     config,
     // Triage gets the fire-and-forget escalation channel, never the blocking
-    // decision channel — a triage session must not wait on the user.
-    escalateToUser: createAskUserBridge({ db, project, ...(input.broadcast ? { broadcast: input.broadcast } : {}) }),
+    // decision channel — a triage session must not wait on the user. With a
+    // broker present the escalation is a REAL card (track E); the answer
+    // wakes Darwin through onEscalationAnswered.
+    escalateToUser: createAskUserBridge({
+      db,
+      project,
+      ...(input.broadcast ? { broadcast: input.broadcast } : {}),
+      ...(input.decisions ? { decisions: input.decisions } : {}),
+      ...(input.onEscalationAnswered ? { onAnswered: input.onEscalationAnswered } : {}),
+    }),
     onToolEvent: (event) => {
       actions.push(`${event.tool}: ${event.summary}`);
     },

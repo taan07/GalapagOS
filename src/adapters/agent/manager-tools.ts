@@ -10,7 +10,11 @@ import {
   listOpenAttentionItems,
   resolveAttentionItem,
 } from "../db/repos/attention";
-import { latestDigestForWorker, setDigestStatus } from "../db/repos/digests";
+import {
+  getCompletionDigest,
+  latestDigestForWorker,
+  setDigestStatus,
+} from "../db/repos/digests";
 import { buildWorkerEvidence } from "../evidence/adapter";
 import { scoreWorker } from "../../core/confidence/engine";
 import { getLane, laneGlobs } from "../db/repos/lanes";
@@ -70,11 +74,27 @@ export type ManagerToolContext = {
    */
   askConfirm?: (playback: string) => Promise<DecisionOutcome>;
   /**
-   * Fire-and-forget escalation (chunk 4 triage): the question lands as a
-   * system note in Darwin's chat AND a high-priority queue item; answers
-   * flow back through Darwin. Wired only for triage sessions.
+   * Fire-and-forget escalation (chunk 4 triage; track E made it a real card):
+   * the question lands as a pending decision card in the user's chat AND a
+   * high-priority queue item — without waiting. Options ride along so the
+   * card is clickable, not prose; the answer wakes Darwin. Wired only for
+   * triage sessions.
    */
-  escalateToUser?: (question: string, context: string) => { attentionId: string };
+  escalateToUser?: (
+    question: string,
+    context: string,
+    options?: DecisionOption[],
+    multiSelect?: boolean,
+  ) => { attentionId: string };
+  /**
+   * The sign-off hook (track C): fired when update_record moves an
+   * implementation_plan to "approved" — the signature that ends Interview
+   * mode. Returns whether the mode actually flipped (Interview → Default);
+   * the tool words its reply on that truth. Wire it in EVERY context that
+   * can reach update_record (manager turns, distill forks, triage) — an
+   * unwired approval would strand a project in Interview.
+   */
+  onPlanApproved?: () => boolean;
   onToolEvent?: (event: { tool: string; summary: string; detail: string }) => void;
 };
 
@@ -166,7 +186,7 @@ function renderWorkerStatus(view: WorkerStatusView): string {
       : "",
     `last activity: ${worker.last_message_at ?? "(none yet)"}${worker.last_summary ? ` — ${worker.last_summary}` : ""}`,
     digest
-      ? `completion digest (${digest.status}): ${digest.narrative}`
+      ? `completion digest ${digest.id} (${digest.status}): ${digest.narrative}`
       : "no completion digest — NOT done, whatever the transcript claims",
   ].filter(Boolean);
 
@@ -361,6 +381,18 @@ export function createManagerToolServer(context: ManagerToolContext) {
               ...(chosen_path !== undefined ? { chosenPath: chosen_path } : {}),
             });
             emit("update_record", `updated ${doc.type} ${doc.id} → ${doc.status}`, renderFullRecord(doc));
+            if (doc.type === "implementation_plan" && doc.status === "approved") {
+              // The formal sign-off (track C): an approved plan is the
+              // signature that ends Interview mode — but the reply only says
+              // so when the flip actually happened (already in Default/Auto,
+              // or an unwired context, is a plain record update).
+              const flipped = context.onPlanApproved?.() ?? false;
+              return text(
+                flipped
+                  ? `Updated ${doc.type} ${doc.id}: status approved. The plan is SIGNED — Interview mode has ended and the project is back in Default mode; building may begin.`
+                  : `Updated ${doc.type} ${doc.id}: status approved.`,
+              );
+            }
             return text(`Updated ${doc.type} ${doc.id}: status ${doc.status}.`);
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -415,7 +447,7 @@ export function createManagerToolServer(context: ManagerToolContext) {
       ),
       tool(
         "resume_worker",
-        "Continue a STOPPED (or failed) worker's task: a fresh session in the SAME worktree and branch, lane re-activated, briefed from the original worker_brief record plus the worktree's current git state and your continuation note. This is the ONLY way to continue stopped work — never reuse its lane name for a new spawn.",
+        "Continue a STOPPED (or failed) worker's task: a fresh session in the SAME worktree and branch, lane re-activated, briefed from the original worker_brief record plus the worktree's current git state and your continuation note. This is the ONLY way to continue stopped work — never reuse its lane name for a new spawn. Note: daemon restarts no longer stop workers (live sessions are re-attached in place — steer those as normal); resume is for workers that genuinely ended.",
         {
           id: z.string().describe("The stopped worker's id"),
           note: z
@@ -709,12 +741,18 @@ export function createManagerToolServer(context: ManagerToolContext) {
             return text(describeOutcome(decision));
           }
           if (context.escalateToUser) {
-            // Triage never blocks on the user: fire-and-forget into chat +
-            // queue; the answer arrives through Darwin.
-            const { attentionId } = context.escalateToUser(question, questionContext ?? "");
+            // Triage never blocks on the user: fire-and-forget card into chat
+            // + queue; the answer arrives through Darwin. Options ride along
+            // so the user clicks instead of typing prose.
+            const { attentionId } = context.escalateToUser(
+              question,
+              questionContext ?? "",
+              options ?? [],
+              multi_select ?? false,
+            );
             emit("ask_user", `escalated to user: ${oneLine(question, 80)}`, questionContext ?? "");
             return text(
-              `Question delivered to the user (attention item ${attentionId}). Do not wait for the answer — it will arrive through Darwin.`,
+              `Question delivered to the user as a card (attention item ${attentionId}). Do not wait for the answer — it will arrive through Darwin.`,
             );
           }
           return text(
@@ -911,9 +949,9 @@ export function createManagerToolServer(context: ManagerToolContext) {
       ),
       tool(
         "worker_status",
-        "Full status of one worker: lane contract, liveness, completion digest (or its honest absence), open attention items, and the most recent events.",
-        { id: z.string() },
-        async ({ id }) => {
+        "Full status of one worker: lane contract, liveness, completion digest (or its honest absence), open attention items, and the most recent events. Pass digest_id when narrating a queued completion so a newer digest cannot replace the one being reported.",
+        { id: z.string(), digest_id: z.string().optional() },
+        async ({ id, digest_id }) => {
           const bridge = requireWorkers();
           if (!bridge) {
             return text("Worker control is not available in this context.");
@@ -923,7 +961,15 @@ export function createManagerToolServer(context: ManagerToolContext) {
             emit("worker_status", `no worker ${id}`, "");
             return text(`No worker with id ${id}. Use list_workers to see what exists.`);
           }
-          const rendered = renderWorkerStatus(view);
+          const requestedDigest = digest_id && context.db
+            ? getCompletionDigest(context.db, digest_id)
+            : undefined;
+          if (digest_id && (!requestedDigest || requestedDigest.worker_id !== id)) {
+            return text(`Digest ${digest_id} does not belong to worker ${id}.`);
+          }
+          const rendered = renderWorkerStatus(
+            requestedDigest ? { ...view, digest: requestedDigest } : view,
+          );
           emit(
             "worker_status",
             `checked worker ${id.slice(0, 8)} [${view.worker.status}]`,

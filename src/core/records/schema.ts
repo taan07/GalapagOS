@@ -1,4 +1,4 @@
-// The eight durable record types and their validation rules (architecture §4).
+// The nine durable record types and their validation rules (architecture §4).
 // Records are doctrine, not transcripts: short, durable, linkable. Pure module —
 // the store adapter enforces these rules at the filesystem boundary.
 import type { Frontmatter, FrontmatterValue } from "./frontmatter";
@@ -12,6 +12,10 @@ export const GLP_TYPES = [
   "routed_clarification",
   "worker_brief",
   "decision",
+  // "How to work with me" (principle 7): the user's standing working
+  // preferences — tone, formats, red lines. Seeded into EVERY re-brief so a
+  // compaction never resets how Darwin behaves toward the user.
+  "style_contract",
 ] as const;
 
 export type GlpType = (typeof GLP_TYPES)[number];
@@ -30,6 +34,7 @@ export const TYPE_DIRS: Record<GlpType, string> = {
   routed_clarification: "clarifications",
   worker_brief: "briefs",
   decision: "decisions",
+  style_contract: "style",
 };
 
 /** Closed statuses are global and reachable only via update, never on create. */
@@ -57,6 +62,7 @@ export const OPEN_STATUSES: Record<GlpType, readonly string[]> = {
   routed_clarification: ["routed"],
   worker_brief: ["issued"],
   decision: ["proposed"],
+  style_contract: ["active"],
 };
 
 export function defaultStatus(type: GlpType): string {

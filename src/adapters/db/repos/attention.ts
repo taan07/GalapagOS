@@ -30,7 +30,14 @@ export type AttentionKind =
   // Goal-progress chunk: a worker was deliberately stopped BEFORE its work
   // passed the quality gate (stop_worker intent "abandon") — visible so
   // unfinished work is never mistaken for retired-clean work.
-  | "worker_abandoned";
+  | "worker_abandoned"
+  // A verified completion whose worker/lane could not be retired. Evidence
+  // remains verified; this item makes the separate lifecycle failure loud.
+  | "worker_retirement_failed"
+  // A verified completion whose autonomous user debrief exhausted retries or
+  // hit a non-retryable failure. The digest remains verified and retryable by
+  // explicit user action.
+  | "completion_debrief_failed";
 
 export type AttentionStatus = "open" | "resolved" | "dismissed";
 
@@ -98,6 +105,20 @@ export function getAttentionItem(db: GalapagosDb, id: string): AttentionItemRow 
   return db.prepare("SELECT * FROM attention_items WHERE id = ?").get(id) as
     | AttentionItemRow
     | undefined;
+}
+
+/**
+ * Rewrite an OPEN item's detail in place — track E uses this to fold the
+ * user's card answer INTO the durable question item, so a lost wake self-heals:
+ * the open item now carries the answer, and whoever picks it up (Darwin's
+ * pickup turn, or triage re-raising it) acts on the answer instead of
+ * re-asking the user.
+ */
+export function updateAttentionDetail(db: GalapagosDb, id: string, detail: string): void {
+  db.prepare("UPDATE attention_items SET detail = ? WHERE id = ? AND status = 'open'").run(
+    detail,
+    id,
+  );
 }
 
 export function resolveAttentionItem(
