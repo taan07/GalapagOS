@@ -20,6 +20,11 @@ export function openDb(stateDir: string, options: { readonly?: boolean } = {}): 
     // The Shift+Tab autonomy axis — per-project and PERSISTENT (a restart
     // must not silently move Darwin's leash).
     ensureColumn(db, "projects", "autonomy_mode", "TEXT NOT NULL DEFAULT 'default'");
+    // Existing rows retain their historical user-origin default. New daemon
+    // prompts are structured role=system audit inputs; assistant/tool outputs
+    // remain visible and are never recast as user intent.
+    ensureColumn(db, "manager_turns", "input_origin", "TEXT NOT NULL DEFAULT 'user'");
+    ensureColumn(db, "manager_turns", "input_kind", "TEXT NOT NULL DEFAULT 'user_message'");
   }
   return db;
 }

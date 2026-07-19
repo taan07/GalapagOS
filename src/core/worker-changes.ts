@@ -28,7 +28,7 @@ export type CheckView = {
 export function checkViewsFrom(
   keys: readonly string[],
   latest: ReadonlyMap<string, CheckRunLike>,
-  workspaceKey: string,
+  workspaceKey: string | null,
 ): CheckView[] {
   return keys.flatMap((key) => {
     const run = latest.get(key);
@@ -40,7 +40,7 @@ export function checkViewsFrom(
         key,
         status: run.status,
         summary: run.summary,
-        fresh: run.head_sha === workspaceKey,
+        fresh: workspaceKey !== null && run.head_sha === workspaceKey,
         createdAt: run.created_at,
       },
     ];

@@ -464,6 +464,9 @@ const ChatMessage = memo(function ChatMessage({
       />
     );
   }
+  if (item.kind === "synthetic") {
+    return <pre className="synthetic-audit-input">autonomous input ({item.inputKind}){"\n"}{item.text}</pre>;
+  }
   if (item.kind === "limit") {
     return (
       <LimitNote
@@ -889,6 +892,8 @@ export function Chat({
   onSwitchToOpus,
   mode,
   onCycleMode,
+  showSynthetic,
+  onToggleSynthetic,
 }: {
   items: ChatItem[];
   working: boolean;
@@ -918,6 +923,8 @@ export function Chat({
   /** The project's autonomy stop; the composer pill renders and cycles it. */
   mode: AutonomyModeView;
   onCycleMode: () => void;
+  showSynthetic: boolean;
+  onToggleSynthetic: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -971,10 +978,20 @@ export function Chat({
 
   // Turn grouping recomputes only when items change — token deltas and
   // status flips leave the groups (and every settled TurnBlock) untouched.
-  const groups = useMemo(() => groupTurns(items), [items]);
+  const visibleItems = useMemo(
+    () => (showSynthetic ? items : items.filter((item) => item.kind !== "synthetic")),
+    [items, showSynthetic],
+  );
+  const hasSynthetic = items.some((item) => item.kind === "synthetic");
+  const groups = useMemo(() => groupTurns(visibleItems), [visibleItems]);
 
   return (
     <section className="chat" aria-label="Darwin chat">
+      {hasSynthetic ? <div className="chat-audit-toggle">
+        <button onClick={onToggleSynthetic} aria-pressed={showSynthetic}>
+          {showSynthetic ? "Hide autonomous audit inputs" : "Show autonomous audit inputs"}
+        </button>
+      </div> : null}
       <div
         className="chat-scroll"
         ref={scrollRef}
@@ -986,7 +1003,7 @@ export function Chat({
           }
         }}
       >
-        {items.length === 0 && !working ? (
+        {visibleItems.length === 0 && !working ? (
           <p className="empty-note">
             This is Darwin, your manager for {projectName || "this project"}. Tell him what you
             want to build — and expect questions until the specifics are pinned down.

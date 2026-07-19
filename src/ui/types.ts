@@ -19,6 +19,8 @@ export type TurnView = {
   id: string;
   turn_index: number;
   role: "user" | "assistant" | "tool" | "system";
+  input_origin?: "user" | "daemon";
+  input_kind?: string;
   content: string;
   created_at: string;
 };
@@ -105,6 +107,7 @@ export type ChatItem = (
   | { kind: "chip"; chip: ToolChip }
   | { kind: "rebrief"; rebrief: RebriefView }
   | { kind: "decision"; decision: DecisionView }
+  | { kind: "synthetic"; text: string; inputKind: string }
   | { kind: "note"; text: string }
   /** A usage-limit failure with a retry-on-Opus offer (see turn_error). */
   | { kind: "limit"; message: string; failedText: string; model: string }
@@ -216,6 +219,30 @@ export type WorkerCheckView = {
   createdAt: string;
 };
 
+/** The observer's bounded-resource report. A false availability makes every check stale. */
+export type WorkspaceEvidenceView = {
+  available: boolean;
+  reason: string | null;
+  usage: {
+    untrackedEntries: number;
+    untrackedBytes: number;
+    unstagedDiffBytes: number;
+    stagedDiffBytes: number;
+    statusBytes: number;
+    gitOutputBytes: number;
+    gitStderrBytes: number;
+  };
+  limits: {
+    maxUntrackedEntries: number;
+    maxUntrackedFileBytes: number;
+    maxAggregateUntrackedBytes: number;
+    maxGitOutputBytes: number;
+    maxAggregateGitOutputBytes: number;
+    maxGitStderrBytes: number;
+    maxConcurrentReads: number;
+  };
+};
+
 /** Per-worker commits + diff + check evidence, served on demand (track F). */
 export type WorkerChangesView = {
   /** The worktree no longer exists — nothing to show, honestly. */
@@ -225,6 +252,7 @@ export type WorkerChangesView = {
   diffTruncated: boolean;
   dirtyFiles: string[];
   checks: WorkerCheckView[];
+  workspaceEvidence: WorkspaceEvidenceView;
 };
 
 export type WorkerEventView = {

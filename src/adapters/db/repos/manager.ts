@@ -13,12 +13,15 @@ export type ManagerSessionRow = {
 };
 
 export type ManagerTurnRole = "user" | "assistant" | "tool" | "system";
+export type ManagerTurnInputOrigin = "user" | "daemon";
 
 export type ManagerTurnRow = {
   id: string;
   session_id: string;
   turn_index: number;
   role: ManagerTurnRole;
+  input_origin: ManagerTurnInputOrigin;
+  input_kind: string;
   content: string;
   sdk_session_id_after: string | null;
   distilled_at: string | null;
@@ -67,6 +70,8 @@ export function appendTurn(
     role: ManagerTurnRole;
     content: string;
     sdkSessionIdAfter?: string | null;
+    inputOrigin?: ManagerTurnInputOrigin;
+    inputKind?: string;
   },
 ): ManagerTurnRow {
   const insert = db.transaction((): ManagerTurnRow => {
@@ -78,14 +83,16 @@ export function appendTurn(
       session_id: input.sessionId,
       turn_index: (last.max_index ?? -1) + 1,
       role: input.role,
+      input_origin: input.inputOrigin ?? "user",
+      input_kind: input.inputKind ?? "user_message",
       content: input.content,
       sdk_session_id_after: input.sdkSessionIdAfter ?? null,
       distilled_at: null,
       created_at: nowIso(),
     };
     db.prepare(
-      `INSERT INTO manager_turns (id, session_id, turn_index, role, content, sdk_session_id_after, distilled_at, created_at)
-       VALUES (@id, @session_id, @turn_index, @role, @content, @sdk_session_id_after, @distilled_at, @created_at)`,
+      `INSERT INTO manager_turns (id, session_id, turn_index, role, input_origin, input_kind, content, sdk_session_id_after, distilled_at, created_at)
+       VALUES (@id, @session_id, @turn_index, @role, @input_origin, @input_kind, @content, @sdk_session_id_after, @distilled_at, @created_at)`,
     ).run(row);
     return row;
   });
@@ -183,6 +190,7 @@ export function listUndistilledTurns(db: GalapagosDb, sessionId: string): Manage
     .prepare(
       `SELECT * FROM manager_turns
        WHERE session_id = ? AND distilled_at IS NULL AND role != 'system'
+         AND NOT (role = 'user' AND input_origin = 'daemon')
        ORDER BY turn_index`,
     )
     .all(sessionId) as ManagerTurnRow[];

@@ -10,6 +10,9 @@ import type {
 
 const execFileAsync = promisify(execFile);
 
+/** Generic read-only git calls are bounded too; evidence has its own stricter streaming observer. */
+export const MAX_READ_ONLY_GIT_OUTPUT_BYTES = 1 * 1024 * 1024;
+
 const READ_ONLY_GIT_COMMANDS = new Set([
   "branch",
   "diff",
@@ -48,7 +51,7 @@ export class LocalGitCommandRunner implements GitCommandRunner {
       const { stdout } = await execFileAsync("git", [...args], {
         cwd,
         encoding: "utf8",
-        maxBuffer: 10 * 1024 * 1024,
+        maxBuffer: MAX_READ_ONLY_GIT_OUTPUT_BYTES,
       });
       return stdout;
     } catch (error) {

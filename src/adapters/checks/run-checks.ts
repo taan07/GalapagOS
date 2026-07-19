@@ -128,6 +128,14 @@ export async function runChecks(input: {
     let evidenceKey: string;
     try {
       const workspace = await observeWorkspaceEvidence(input.cwd);
+      if (!workspace.available || !workspace.key) {
+        outcomes.push({
+          key,
+          status: "error",
+          summary: `Could not observe the workspace state before "${key}": ${workspace.reason ?? "indeterminate evidence"} — check skipped; prior checks are stale/unknown.`,
+        });
+        continue;
+      }
       evidenceKey = workspace.key;
       lastEvidenceKey = workspace.key;
     } catch (error) {

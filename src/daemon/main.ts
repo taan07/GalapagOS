@@ -33,7 +33,6 @@ import {
   compactSession,
   getOrCreateActiveSession,
   getTurn,
-  listTurns,
   updateTurnContent,
 } from "../adapters/db/repos/manager";
 import { createDecisionBroker } from "../adapters/agent/decisions";
@@ -69,6 +68,7 @@ import {
   updateLiveSnapshot,
   type LiveTurnSnapshot,
 } from "./live-turn-snapshot";
+import { COMPACTED_NOTE, rebriefSessionNow } from "./manual-rebrief";
 import { buildCompletionDebrief } from "./completion-debrief";
 import {
   createCompletionDebriefScheduler,
@@ -76,6 +76,7 @@ import {
   type DebriefRunResult,
 } from "./completion-debrief-scheduler";
 import type { CompletionDebriefRow } from "../adapters/db/repos/debriefs";
+import { createSseClientRegistry } from "../core/sse-clients";
 
 const db = openDb(config.stateDir);
 // The only module-level state: live SSE clients, per-project busy flags, the
@@ -91,7 +92,7 @@ const distillsInFlight = new Map<string, Promise<void>>();
 // abort the fork directly (activeTurnControllers may already belong to the
 // next phase by the time the preempt runs).
 const distillControllers = new Map<string, AbortController>();
-const eventClients = new Set<http.ServerResponse>();
+const eventClients = createSseClientRegistry();
 const activeTurnControllers = new Map<string, AbortController>();
 // Per-project manager-model override, set when the user hits "change to Opus"
 // after Fable's usage limit. In-memory on purpose: a daemon restart drops it,
@@ -312,19 +313,20 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 function startSse(res: http.ServerResponse): void {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-store",
+    "Cache-Control": "no-cache, no-store, no-transform",
     Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
   });
+  res.flushHeaders();
 }
 
+/** Direct response stream for the initiating POST; /events uses the registry. */
 function sseWrite(res: http.ServerResponse, event: unknown): void {
   res.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
 function broadcast(event: unknown): void {
-  for (const client of eventClients) {
-    sseWrite(client, event);
-  }
+  eventClients.broadcast(event);
 }
 
 /** Everything a turn writes to the wire: turn events plus the distill note. */
@@ -461,9 +463,6 @@ function approvePlanSignOff(projectId: string): boolean {
   });
   return true;
 }
-
-const COMPACTED_NOTE =
-  "Darwin's context was compacted at a clean boundary — he re-briefs himself from the committed records (plus the live thread tail and worker fleet) on his next turn.";
 
 /**
  * The proactive re-brief trigger (principle 7): when a completed turn ran its
@@ -846,11 +845,27 @@ async function runAutonomousManagerTurn(input: {
     if (actualDebriefContext) {
       input.onTurnBeginning?.(actualDebriefContext);
     }
+    const autonomousSession = getOrCreateActiveSession(db, project.id);
+    const inputKind = logTag.startsWith("lane-guard")
+      ? "lane_guard"
+      : logTag.startsWith("narrator:")
+        ? "completion_debrief"
+        : logTag === "triage-answer"
+          ? "answer_pickup"
+          : "autonomous";
+    const syntheticTurn = appendTurn(db, {
+      sessionId: autonomousSession.id,
+      role: "system",
+      content: JSON.stringify({ kind: "synthetic_input", inputKind, text: seed }),
+      inputOrigin: "daemon",
+      inputKind,
+    });
     const outcome = await runManagerTurn({
       db,
       config: effectiveConfig,
       project: projectAtTurnStart,
       userText: seed,
+      persistedUserTurn: syntheticTurn,
       // Autonomous turns have no chat stream — the /events broadcast is the
       // ONLY path anything (decision cards, live status, prose) reaches the
       // user. Full parity with user turns via the shared emit.
@@ -1039,20 +1054,11 @@ async function handleRebriefNow(
     sendJson(res, 409, { error: "Darwin is mid-turn — wait for it to finish before re-briefing." });
     return;
   }
-  const session = getOrCreateActiveSession(db, projectId);
-  const hasConversation = listTurns(db, session.id).some((turn) => turn.role !== "system");
-  if (!hasConversation && session.seeded_from_records_at) {
-    // Already a virgin records-seeded session: compacting again would just
-    // churn rows for an identical outcome.
-    sendJson(res, 200, {
-      compacted: false,
-      note: "Darwin's context is already fresh — the next turn re-briefs from records.",
-    });
-    return;
+  const acknowledgement = rebriefSessionNow(db, projectId);
+  if (acknowledgement.compacted) {
+    broadcast({ type: "manager_note", projectId, text: acknowledgement.note });
   }
-  compactSession(db, projectId, session.id);
-  broadcast({ type: "manager_note", projectId, text: COMPACTED_NOTE });
-  sendJson(res, 200, { compacted: true });
+  sendJson(res, 200, acknowledgement);
 }
 
 async function handleClearRebrief(
@@ -1350,9 +1356,22 @@ async function handleWorkerChanges(res: http.ServerResponse, workerId: string): 
   // green check.
   const workspace = await observeWorkspaceEvidence(worker.worktree_path);
   const latest = latestRunsByKey(db, { projectId: worker.project_id, workerId: worker.id });
-  const checks = checkViewsFrom(CHECK_KEYS, latest, workspace.key);
+  const checks = checkViewsFrom(CHECK_KEYS, latest, workspace.available ? workspace.key : null);
 
-  sendJson(res, 200, { gone: false, commits, diff, diffTruncated, dirtyFiles, checks });
+  sendJson(res, 200, {
+    gone: false,
+    commits,
+    diff,
+    diffTruncated,
+    dirtyFiles,
+    checks,
+    workspaceEvidence: {
+      available: workspace.available,
+      reason: workspace.reason,
+      usage: workspace.usage,
+      limits: workspace.limits,
+    },
+  });
 }
 
 async function handleStopWorker(res: http.ServerResponse, workerId: string): Promise<void> {
@@ -1595,10 +1614,11 @@ const server = http.createServer((req, res) => {
   }
   if (route === "GET /events") {
     startSse(res);
-    eventClients.add(res);
-    req.on("close", () => {
-      eventClients.delete(res);
-    });
+    const removeClient = eventClients.add(res);
+    req.on("close", removeClient);
+    req.on("error", removeClient);
+    res.on("close", removeClient);
+    res.on("error", removeClient);
     return;
   }
 

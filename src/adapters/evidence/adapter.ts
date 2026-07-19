@@ -282,12 +282,8 @@ export async function buildWorkerEvidence(
     };
   }
 
-  let workspaceKey: string | null = null;
-  try {
-    workspaceKey = (await observeWorkspaceEvidence(worker.worktree_path)).key;
-  } catch {
-    workspaceKey = null;
-  }
+  const workspace = await observeWorkspaceEvidence(worker.worktree_path);
+  const workspaceKey = workspace.available ? workspace.key : null;
 
   let auditFiles: string[] | null = null;
   let laneAudit: WorkerConfidenceInput["laneAudit"];
@@ -296,7 +292,10 @@ export async function buildWorkerEvidence(
   } else {
     try {
       auditFiles = await collectAuditFiles(worker.worktree_path, lane.base_sha);
-      laneAudit = {
+      laneAudit = !workspace.available ? {
+        ran: false,
+        reason: `Workspace evidence is indeterminate: ${workspace.reason ?? "unknown reason"}`,
+      } : {
         ran: true,
         violations: checkLane(auditFiles, laneGlobs(lane)).map((violation) => violation.path),
       };

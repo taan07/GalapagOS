@@ -94,6 +94,26 @@ select:focus {
   font-weight: 400;
 }
 
+.stream-state {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.stream-state.live {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--line));
+}
+
+.stream-state.reconnecting {
+  color: var(--attention);
+  border-color: color-mix(in srgb, var(--attention) 45%, var(--line));
+}
+
 .app-main {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;
@@ -1500,6 +1520,21 @@ select:focus {
 .changes-refresh:hover {
   color: var(--fg);
 }
+
+.workspace-evidence-unavailable {
+  margin: 8px 0;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger, #c6544e) 60%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--danger, #c6544e) 10%, transparent);
+  color: var(--text, #302a27);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.workspace-evidence-unavailable div { margin-top: 4px; }
+
+.synthetic-audit-input { white-space: pre-wrap; font-size: 12px; opacity: .75; }
 
 .checks-row {
   display: flex;
