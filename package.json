@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "packageManager": "bun@1.2.5",
+  "trustedDependencies": [
+    "better-sqlite3"
+  ],
   "scripts": {
     "dev": "concurrently -n daemon,web -c blue,green \"bun run daemon\" \"bun run web\"",
     "daemon": "tsx watch src/daemon/main.ts",
@@ -11,7 +14,8 @@
     "typecheck": "tsc --noEmit",
     "test": "bun run typecheck && bun run test:unit",
     "test:unit": "tsc --project tsconfig.node.json && node --test \"dist-node/tests/*.test.js\"",
-    "spike:resume": "tsx scripts/spike-resume.ts"
+    "spike:resume": "tsx scripts/spike-resume.ts",
+    "smoke:sqlite": "tsx scripts/smoke-sqlite.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "latest",
