@@ -1,75 +1,125 @@
-# Working agreement: tracks, worktrees, and the runtime
+# Working agreement: tracks, worktrees, and the runtime bench
 
-Adopted 2026-07-09, after a week of parallel sessions sharing one checkout
-produced tangled commits, swept-up WIP, and lost work. Galapagos builds
-lane-scoped isolation for its users; its own development now follows the
-same doctrine.
+Adopted 2026-07-09 after parallel sessions sharing one checkout produced
+tangled commits, swept-up work, and lost changes.
 
-## The one rule
+## The rule
 
-**One track = one branch = one git worktree = one session.**
-
-A "track" is a coherent line of work (a feature, a fix round, a doc). It
-lives on its own branch, checked out in its own directory, worked by one
-session at a time. No two sessions ever share a working tree. Nothing is
-ever committed from a directory the track doesn't own.
-
-## Directory map
+**One track = one branch = one git worktree = one session.** A track is one
+coherent feature, fix, or documentation change. It owns its worktree; no other
+session edits or commits there.
 
 | Directory | Branch | Role |
 |---|---|---|
-| `~/Dev/galapagos` | (the track you're actively developing) | primary dev checkout |
-| `~/Dev/galapagos-runtime` | `next` — always | serves the daemon (`npm run dev`), never edited by hand |
-| `~/Dev/galapagos-<track>` | `feat/<track>` etc. | one per active track |
+| `~/Dev/galapagos` | `main` | primary checkout; never a shared scratchpad |
+| `~/Dev/galapagos-runtime` | `next`, permanently | user-owned deployment bench |
+| `~/Dev/galapagos-<track>` | `feat/<track>` etc. | isolated development track |
 
-Create a track: `git worktree add ~/Dev/galapagos-<name> -b feat/<name> main`
-Retire a track (after merge): `git worktree remove ~/Dev/galapagos-<name> && git branch -d feat/<name>`
+Create a track with:
 
-## The runtime and `next`
+```sh
+git worktree add ~/Dev/galapagos-<track> -b feat/<track> main
+```
 
-The daemon runs from `galapagos-runtime`, pinned to the **`next`**
-integration branch, via `tsx watch` — it hot-reloads on any file change,
-so deploying is a git operation, never a manual restart:
+After its PR merges, retire it with `git worktree remove` followed by
+`git branch -d`. Never commit from a checkout the track does not own. Stage
+explicit paths rather than `git add .` or `git add -A`; keep commits scoped to
+one intent and leave the worktree clean.
 
-- **Test a track (or several together):** `git -C ~/Dev/galapagos-runtime merge feat/<track>` — the daemon reloads with it.
-- **Reset the bench:** `git -C ~/Dev/galapagos-runtime reset --hard main` — `next` is throwaway by design; nothing lives only on `next`.
-- `curl localhost:4517/health` tells you exactly what revision/branch is serving (identity is resolved at boot — a branch switch with identical trees keeps the old label until the first real reload).
+## Test in the track
 
-## `main`
+Use Bun for GalapagOS dependencies and top-level scripts:
 
-`main` receives **tested work only**, through PRs (one per track). Never
-commit directly to main; never merge an untested track to main "to see
-it". Testing happens on `next`.
+```sh
+cd ~/Dev/galapagos-<track>
+bun install --frozen-lockfile
+rm -rf dist-node
+bun run smoke:sqlite
+bun run test
+bun run build
+git diff --check
+```
 
-## Commit hygiene
+`bun install --frozen-lockfile` is the clean-track verification command. It
+and every top-level script require the exact Bun version declared in
+`package.json`; a dependency change must update both `package.json` and
+`bun.lock`. GalapagOS still supervises npm, pnpm, Yarn, and Bun repositories,
+so do not rewrite npm-specific fixtures or historical handoffs that truthfully
+describe their original commands.
 
-- Never `git add -A` / `git add .` — stage explicit paths. (This is how a
-  model-switch feature once got swept into an unrelated WIP checkpoint.)
-- Commit messages carry the track's *intent*, not just its mechanics —
-  each distinct effort gets its own section in the body.
-- Zero untracked files at the end of a work session: commit, or delete.
-- Auto-stash tools ("epitaxy: pre-switch") are not a safety net; treat an
-  unexpected stash as a smell and resolve it same-day.
+## Deploy to localhost
 
-## Current tracks and their goals (2026-07-09)
+The user's permanent processes run from `~/Dev/galapagos-runtime` on `next`:
+the daemon on port 4517 under `tsx watch`, and the Next UI on port 3005. They
+reload when files in that checkout change.
 
-| Track | Goal | State |
-|---|---|---|
-| `feat/workers-goal-progress` | Worker plan contract: a worker turns its brief into a visible checklist (`worker_steps`), so /workers shows real goal progress. Also carries GitHub-link derivation (remote → web/branch/blob URLs). | in progress |
-| `feat/quality-gated-retirement` | Stopping a worker carries intent (`retire`/`abandon`/`force`); retire is refused unless the completion is manager-reviewed; monitor auto-retires clean completions; abandoned work raises attention. | committed, awaiting PR merge |
-| `feat/chat-ux` | Port of open-webui chat affordances: markdown rendering of Darwin's replies, visible/steerable message queue, copy buttons. Reference digest in `docs/reference/`. | committed, awaiting PR merge |
-| `chore/workflow-doc` | This document. | this commit |
+**Deploying means a Git merge into the runtime checkout. Nothing else.** Never
+edit, commit, copy files into, check out another branch in, start, stop,
+restart, or kill processes from `~/Dev/galapagos-runtime`.
 
-Recently merged to main (2026-07-09): turn-lock/hold-preempt fix,
-interactive prompting (ask_user/ask_batch/confirm_understanding cards,
-chat-composer-as-free-text), Fable-limit → Opus model switch, lane guard.
+Deploy a tested track with exactly:
 
-## Known debt
+```sh
+git -C ~/Dev/galapagos-runtime merge feat/<track>
+```
+
+If and only if the merge changed `package.json` or `bun.lock`, update the
+running bench's installed dependencies with:
+
+```sh
+cd ~/Dev/galapagos-runtime
+bun install
+```
+
+Do not use `bun install --frozen-lockfile` as the running-bench install step.
+Batch compatible commits into one tested merge when possible so daemon-side
+watch reloads do not repeatedly interrupt active work.
+
+## Verify what is live
+
+Before claiming a deployment, verify both services:
+
+```sh
+curl -s localhost:4517/health
+curl -s -o /dev/null -w "%{http_code}\n" localhost:3005
+```
+
+Health must report `"branch":"next"` and the expected revision, and the UI
+must return 200. A UI-only merge does not reload the daemon, so its health
+revision may legitimately remain on the preceding daemon-side commit even
+though the web watcher has reloaded.
+
+If a change does not appear, first confirm each listener's working directory:
+
+```sh
+lsof -nP -iTCP:4517 -sTCP:LISTEN
+lsof -a -p <daemon-pid> -d cwd
+lsof -nP -iTCP:3005 -sTCP:LISTEN
+lsof -a -p <web-pid> -d cwd
+git -C ~/Dev/galapagos-runtime log --oneline -3
+```
+
+Both working directories must be `~/Dev/galapagos-runtime`. If either process
+belongs to another checkout, stop and tell the user; do not work around it or
+kill it. For a UI-only change, ask the user to hard-reload the browser and
+inspect the existing web-process output for compile errors.
+
+## Main and bench reset
+
+`main` receives tested work through one PR per track. Never commit directly to
+`main`, and never use `next` as the only home of a change.
+
+Only the user may hard-reset the runtime bench. The normal non-destructive way
+to re-align `next` after PRs merge is:
+
+```sh
+git -C ~/Dev/galapagos-runtime merge main
+```
+
+## Project notes
 
 - `main` may sit ahead of `origin/main` between pushes — check
   `git branch -vv` before assuming GitHub is current.
-- The next big fronts (per the user): the user↔Darwin chat behaviour and
-  the /workers page — both have dedicated-track work ahead.
-- The sidebar trio (confidence gauge · attention queue · specifics panel)
-  is consciously PARKED untouched (2026-07-10 ruling) — it needs its own
-  rework track later; nothing ships against it until then.
+- The sidebar trio (confidence gauge, attention queue, specifics panel)
+  remains parked for a dedicated rework track; unrelated work must not change
+  it opportunistically.

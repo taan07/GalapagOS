@@ -980,7 +980,7 @@ export function createManagerToolServer(context: ManagerToolContext) {
       ),
       tool(
         "run_checks",
-        "Run the project's configured checks (typecheck, lint, test, build — auto-detected from package.json scripts) and record the results as evidence keyed to the exact workspace state. Pass worker_id to run them in that worker's worktree — the ONLY way to verify a worker's claims; project-level runs say nothing about a diverged worktree. Omit keys to run everything configured.",
+        "Run the project's configured checks (typecheck, lint, test, build — auto-detected from package.json scripts with the repository's selected package manager) and record the results as evidence keyed to the exact workspace state. Pass worker_id to run them in that worker's worktree — the ONLY way to verify a worker's claims; project-level runs say nothing about a diverged worktree. Omit keys to run everything configured.",
         {
           worker_id: z.string().optional(),
           keys: z

@@ -3,7 +3,7 @@
 // per turn, resume restores context, and a cwd mismatch is detectable rather
 // than silently blank.
 //
-// Run: npm run spike:resume
+// Run: bun run spike:resume
 import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";

@@ -1325,8 +1325,8 @@ export function App() {
       </header>
       {daemonDown ? (
         <div className="banner danger">
-          The Galapagos daemon is not running — start it with `npm run dev`. Chat is disabled
-          until it is back.
+          The Galapagos daemon is not running — ask the runtime owner to restore the permanent
+          bench. Chat is disabled until it is back.
         </div>
       ) : null}
       {needsProject ? (
