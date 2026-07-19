@@ -628,7 +628,7 @@ export function App() {
       }
       // While this fetch streams, /events turn traffic is a duplicate feed —
       // armed before the request so the first broadcast can never race it.
-      projectActivityRef.current.beginStream(projectId);
+      const streamTicket = projectActivityRef.current.beginStream(projectId);
       // A 409 hands the turn lock to someone else (another tab, an autonomous
       // turn): the message queues instead of dying, and `working` must stay
       // armed past the finally — /events drives it from here.
@@ -771,6 +771,17 @@ export function App() {
             }
             const event = JSON.parse(dataLine.slice(6)) as ManagerStreamEvent;
             if (selectedIdRef.current !== projectId) {
+              continue;
+            }
+            // A completed turn's POST remains open through distillation, so
+            // turn N can still deliver frames after N+1 owns this project's
+            // shared live surface. Its durable distill note remains useful,
+            // but no older event may overwrite N+1's status, tail, or error
+            // presentation.
+            if (
+              !projectActivityRef.current.isCurrentStream(streamTicket) &&
+              event.type !== "distilled"
+            ) {
               continue;
             }
             if (event.type === "turn_complete") {
@@ -920,7 +931,10 @@ export function App() {
           }
         }
       } catch (error) {
-        if (selectedIdRef.current === projectId) {
+        if (
+          selectedIdRef.current === projectId &&
+          projectActivityRef.current.isCurrentStream(streamTicket)
+        ) {
           setItems((current) => [
             ...current,
             {
@@ -931,13 +945,14 @@ export function App() {
           ]);
         }
       } finally {
-        const remaining = projectActivityRef.current.endStream(projectId);
+        const ownsLiveSurface = projectActivityRef.current.isCurrentStream(streamTicket);
+        const remaining = projectActivityRef.current.endStream(streamTicket);
         if (remaining === 0) {
           if (deferredHistoryRef.current.delete(projectId)) {
             void reconcileProject(projectId);
           }
         }
-        if (!busyElsewhere && selectedIdRef.current === projectId) {
+        if (!busyElsewhere && ownsLiveSurface && selectedIdRef.current === projectId) {
           setWorking(false);
           setLiveStatus(null);
           setLiveText("");

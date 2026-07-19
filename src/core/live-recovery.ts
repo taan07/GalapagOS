@@ -9,6 +9,16 @@ export type ReconciliationTicket = {
   generation: number;
 };
 
+/**
+ * The tab-local owner of a manager POST stream. A project can briefly have two
+ * streams: turn N stays open for distillation while turn N+1 has already
+ * started. Only the newest one may control the shared live-turn surface.
+ */
+export type ProjectStreamTicket = {
+  projectId: string;
+  generation: number;
+};
+
 export type ProjectRecoveryModel<T> = {
   select(projectId: string | null): void;
   selected(): string | null;
@@ -23,16 +33,23 @@ export type ProjectRecoveryModel<T> = {
 /** Project-keyed mutable state that must survive navigation without leaking. */
 export function createProjectActivityModel<T>() {
   const streams = new Map<string, number>();
+  const latestStreamGeneration = new Map<string, number>();
   const queues = new Map<string, T[]>();
   return {
-    beginStream(projectId: string): void {
+    beginStream(projectId: string): ProjectStreamTicket {
       streams.set(projectId, (streams.get(projectId) ?? 0) + 1);
+      const generation = (latestStreamGeneration.get(projectId) ?? 0) + 1;
+      latestStreamGeneration.set(projectId, generation);
+      return { projectId, generation };
     },
-    endStream(projectId: string): number {
-      const remaining = Math.max(0, (streams.get(projectId) ?? 1) - 1);
-      if (remaining === 0) streams.delete(projectId);
-      else streams.set(projectId, remaining);
+    endStream(ticket: ProjectStreamTicket): number {
+      const remaining = Math.max(0, (streams.get(ticket.projectId) ?? 1) - 1);
+      if (remaining === 0) streams.delete(ticket.projectId);
+      else streams.set(ticket.projectId, remaining);
       return remaining;
+    },
+    isCurrentStream(ticket: ProjectStreamTicket): boolean {
+      return latestStreamGeneration.get(ticket.projectId) === ticket.generation;
     },
     ownsStream(projectId: string): boolean {
       return (streams.get(projectId) ?? 0) > 0;

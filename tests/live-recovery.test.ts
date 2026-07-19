@@ -79,18 +79,56 @@ test("connection state reports reconnecting rather than assuming health from a p
 
 test("POST ownership and queued messages remain isolated by project", () => {
   const activity = createProjectActivityModel<string>();
-  activity.beginStream("A");
-  activity.beginStream("A");
+  const first = activity.beginStream("A");
+  const second = activity.beginStream("A");
   assert.equal(activity.ownsStream("A"), true);
   assert.equal(activity.ownsStream("B"), false);
+  assert.equal(activity.isCurrentStream(first), false);
+  assert.equal(activity.isCurrentStream(second), true);
   activity.queue("A", () => []).push("A message");
   activity.queue("B", () => []).push("B message");
   assert.deepEqual(activity.queue("A", () => []), ["A message"]);
   assert.deepEqual(activity.queue("B", () => []), ["B message"]);
-  assert.equal(activity.endStream("A"), 1);
+  assert.equal(activity.endStream(first), 1);
   assert.equal(activity.ownsStream("A"), true);
-  assert.equal(activity.endStream("A"), 0);
+  assert.equal(activity.endStream(second), 0);
   assert.equal(activity.ownsStream("A"), false);
+});
+
+test("an older POST cannot tear down or report over a successor's live turn", () => {
+  const activity = createProjectActivityModel<never>();
+  const first = activity.beginStream("A");
+
+  // N completes but its POST stays open for distillation. The composer sends
+  // N+1, which becomes the only owner allowed to touch the shared live view.
+  const successor = activity.beginStream("A");
+  const view = {
+    working: true,
+    status: "Writing N+1",
+    text: "new live tail",
+    notes: [] as string[],
+  };
+  const applyIfOwner = (ticket: typeof first, change: () => void) => {
+    if (activity.isCurrentStream(ticket)) change();
+  };
+
+  // N's close, rejected read, and post-completion error are all stale now.
+  assert.equal(activity.endStream(first), 1);
+  applyIfOwner(first, () => {
+    view.working = false;
+    view.status = "";
+    view.text = "";
+  });
+  applyIfOwner(first, () => view.notes.push("Connection lost mid-turn"));
+  applyIfOwner(first, () => view.notes.push("Turn failed: late distill error"));
+
+  assert.deepEqual(view, {
+    working: true,
+    status: "Writing N+1",
+    text: "new live tail",
+    notes: [],
+  });
+  assert.equal(activity.isCurrentStream(successor), true);
 });
 
 test("heartbeat transport removes closed clients and never emits a domain event", () => {
