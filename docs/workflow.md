@@ -121,5 +121,5 @@ git -C ~/Dev/galapagos-runtime merge main
 - `main` may sit ahead of `origin/main` between pushes — check
   `git branch -vv` before assuming GitHub is current.
 - The sidebar trio (confidence gauge, attention queue, specifics panel)
-  remains parked for a dedicated rework track; unrelated work must not change
-  it opportunistically.
+  remains consciously parked under the 2026-07-10 ruling. It needs a
+  dedicated rework track; unrelated work must not silently redesign it.
