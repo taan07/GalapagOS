@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS manager_turns (
   session_id TEXT NOT NULL REFERENCES manager_sessions(id),
   turn_index INTEGER NOT NULL,
   role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool', 'system')),
+  input_origin TEXT NOT NULL DEFAULT 'user' CHECK (input_origin IN ('user', 'daemon')),
+  input_kind TEXT NOT NULL DEFAULT 'user_message',
   content TEXT NOT NULL,
   sdk_session_id_after TEXT,
   distilled_at TEXT,

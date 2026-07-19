@@ -1534,6 +1534,8 @@ select:focus {
 
 .workspace-evidence-unavailable div { margin-top: 4px; }
 
+.synthetic-audit-input { white-space: pre-wrap; font-size: 12px; opacity: .75; }
+
 .checks-row {
   display: flex;
   gap: 6px;

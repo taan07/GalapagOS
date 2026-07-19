@@ -13,7 +13,7 @@ import {
   listUndistilledTurns,
   markTurnsDistilled,
 } from "../src/adapters/db/repos/manager";
-import { findUnclearedRebriefMarker } from "../src/adapters/agent/manager-session";
+import { findUnclearedRebriefMarker, rebriefPrompt } from "../src/adapters/agent/manager-session";
 
 const TEST_GIT_IDENTITY = { name: "Galapagos Tests", email: "tests@galapagos.local" };
 
@@ -65,6 +65,35 @@ test("listUndistilledTurns: system turns and distilled turns carry no thread sta
 
   const tail = listUndistilledTurns(db, session.id).map((turn) => turn.content);
   assert.deepEqual(tail, ["fresh question", "fresh reply"]);
+});
+
+test("daemon-authored inputs stay auditable but never read as user thread state", async () => {
+  const { db, project } = await fixture();
+  const session = getOrCreateActiveSession(db, project.id);
+  const synthetic = appendTurn(db, {
+    sessionId: session.id,
+    role: "system",
+    content: JSON.stringify({ kind: "synthetic_input", inputKind: "lane_guard", text: "SYSTEM — automatic lane guard" }),
+    inputOrigin: "daemon",
+    inputKind: "lane_guard",
+  });
+  appendTurn(db, { sessionId: session.id, role: "assistant", content: "I held the worker." });
+  appendTurn(db, { sessionId: session.id, role: "user", content: "Please keep me posted." });
+  assert.equal(synthetic.input_origin, "daemon");
+  assert.equal(synthetic.input_kind, "lane_guard");
+  assert.equal(synthetic.role, "system", "daemon input never masquerades as a user turn");
+  assert.deepEqual(
+    listUndistilledTurns(db, session.id).map((turn) => turn.content),
+    ["I held the worker.", "Please keep me posted."],
+    "synthetic prompt text is not re-brief/user-intent material; resulting assistant output remains",
+  );
+});
+
+test("re-brief labels daemon audit input truthfully while preserving its raw SDK prompt", () => {
+  const prompt = rebriefPrompt("# records", "SYSTEM — hold the lane", "daemon");
+  assert.match(prompt, /autonomous system input/);
+  assert.match(prompt, /SYSTEM — hold the lane$/);
+  assert.doesNotMatch(prompt, /user's message/);
 });
 
 test("findUnclearedRebriefMarker: the failed-first-attempt sequence reuses, never re-compacts", async () => {

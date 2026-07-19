@@ -117,6 +117,16 @@ export type RebriefTurnPayload = {
   clearedAt: string | null;
 };
 
+/** Truthful wrapper shared by every compaction/re-brief path. */
+export function rebriefPrompt(
+  preamble: string,
+  prompt: string,
+  origin: "user" | "daemon" = "user",
+): string {
+  const label = origin === "daemon" ? "the autonomous system input" : "the user's message";
+  return `${preamble}\n\n---\n\nWith that context restored, ${label}:\n\n${prompt}`;
+}
+
 export type EmitManagerTurnEvent = (event: ManagerTurnEvent) => void;
 
 export type ManagerTurnOutcome = {
@@ -363,7 +373,7 @@ export async function runManagerTurn(input: {
   /** The daemon's decision broker — chat accept/deny and questionnaires. */
   decisions?: DecisionBroker;
   /**
-   * A user turn the caller already persisted (before any distill-preempt
+   * A user turn or daemon audit input the caller already persisted (before any distill-preempt
    * wait, so a page reload or handler death cannot lose the message).
    * Adopted instead of appending a duplicate.
    */
@@ -423,6 +433,7 @@ export async function runManagerTurn(input: {
       role: "user",
       content: userText,
     });
+  const persistedOrigin = input.persistedUserTurn?.input_origin ?? "user";
 
   let sdkSessionId: string | null = null;
   let lastPersistedTurnId: string | null = null;
@@ -600,13 +611,15 @@ export async function runManagerTurn(input: {
     // turn's payload (paths and all) must survive the compaction move.
     userTurn = appendTurn(db, {
       sessionId: session.id,
-      role: "user",
+      role: input.persistedUserTurn?.role ?? "user",
       content: input.persistedUserTurn?.content ?? userText,
+      inputOrigin: input.persistedUserTurn?.input_origin,
+      inputKind: input.persistedUserTurn?.input_kind,
     });
 
     emit({ type: "rebrief", reason, preamble, turnId: rebriefTurn.id });
     return preamble
-      ? `${preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${promptUserText}`
+      ? rebriefPrompt(preamble, promptUserText, persistedOrigin)
       : promptUserText;
   };
 
@@ -732,7 +745,7 @@ export async function runManagerTurn(input: {
       : null;
     if (marker) {
       if (marker.preamble) {
-        prompt = `${marker.preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${promptUserText}`;
+        prompt = rebriefPrompt(marker.preamble, promptUserText, persistedOrigin);
       }
     } else if (hasHistory) {
       prompt = compactAndRebrief("The previous session's resume pointer was lost.");
@@ -755,7 +768,7 @@ export async function runManagerTurn(input: {
       });
       emit({ type: "rebrief", reason, preamble, turnId: rebriefTurn.id });
       if (preamble) {
-        prompt = `${preamble}\n\n---\n\nWith that context restored, the user's message:\n\n${promptUserText}`;
+        prompt = rebriefPrompt(preamble, promptUserText, persistedOrigin);
       }
     }
   }

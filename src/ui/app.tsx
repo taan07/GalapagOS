@@ -94,7 +94,8 @@ function turnsToChatItems(turns: TurnView[]): ChatItem[] {
       const payload = JSON.parse(turn.content) as
         | { kind: "rebrief"; reason: string; preamble: string | null; clearedAt: string | null }
         | ({ kind: "decision" } & DecisionView)
-        | { kind: "note"; text: string };
+        | { kind: "note"; text: string }
+        | { kind: "synthetic_input"; text: string; inputKind: string };
       if (payload.kind === "decision") {
         return [
           {
@@ -132,6 +133,9 @@ function turnsToChatItems(turns: TurnView[]): ChatItem[] {
       if (payload.kind === "note") {
         return [{ kind: "note", text: payload.text, at }];
       }
+      if (payload.kind === "synthetic_input") {
+        return [{ kind: "synthetic", text: payload.text, inputKind: payload.inputKind, at }];
+      }
     } catch {
       // fall through to plain text
     }
@@ -155,6 +159,7 @@ export function App() {
   const [daemonDown, setDaemonDown] = useState(false);
   const [streamConnection, setStreamConnection] = useState<StreamConnectionState>("connecting");
   const [showAddProject, setShowAddProject] = useState(false);
+  const [showSynthetic, setShowSynthetic] = useState(false);
   const projectActivityRef = useRef(createProjectActivityModel<QueuedMessage>());
   const selectedIdRef = useRef<string | null>(null);
   selectedIdRef.current = selectedId;
@@ -1330,6 +1335,8 @@ export function App() {
             onSwitchToOpus={handleSwitchToOpus}
             mode={autonomyMode}
             onCycleMode={handleCycleMode}
+            showSynthetic={showSynthetic}
+            onToggleSynthetic={() => setShowSynthetic((visible) => !visible)}
           />
           <div className="side-stack">
             {confidence ? (

@@ -837,11 +837,27 @@ async function runAutonomousManagerTurn(input: {
     if (actualDebriefContext) {
       input.onTurnBeginning?.(actualDebriefContext);
     }
+    const autonomousSession = getOrCreateActiveSession(db, project.id);
+    const inputKind = logTag.startsWith("lane-guard")
+      ? "lane_guard"
+      : logTag.startsWith("narrator:")
+        ? "completion_debrief"
+        : logTag === "triage-answer"
+          ? "answer_pickup"
+          : "autonomous";
+    const syntheticTurn = appendTurn(db, {
+      sessionId: autonomousSession.id,
+      role: "system",
+      content: JSON.stringify({ kind: "synthetic_input", inputKind, text: seed }),
+      inputOrigin: "daemon",
+      inputKind,
+    });
     const outcome = await runManagerTurn({
       db,
       config: effectiveConfig,
       project: projectAtTurnStart,
       userText: seed,
+      persistedUserTurn: syntheticTurn,
       // Autonomous turns have no chat stream — the /events broadcast is the
       // ONLY path anything (decision cards, live status, prose) reaches the
       // user. Full parity with user turns via the shared emit.

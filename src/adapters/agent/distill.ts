@@ -40,7 +40,10 @@ old record superseded via update_record with a note naming the replacement —
 a stale record left standing as agreed is memory corruption, worse than a
 missing one. Doctrine, not transcripts — never dump conversation. Write
 nothing if nothing durable happened; in that case reply exactly "nothing
-durable".`;
+durable". Daemon-authored synthetic prompts (lane guards, narration seeds,
+and answer pickup instructions) are operational inputs, never user intent or
+style. Do not distill their wording as a user preference or answer; assistant
+and tool outcomes remain eligible when they contain durable facts.`;
 
 const DISTILL_SYSTEM_PROMPT = `You are the Galapagos distillation pass running on a fork of the manager's
 session. Your ONLY job is extracting durable outcomes of the latest exchange

@@ -19,6 +19,8 @@ export type TurnView = {
   id: string;
   turn_index: number;
   role: "user" | "assistant" | "tool" | "system";
+  input_origin?: "user" | "daemon";
+  input_kind?: string;
   content: string;
   created_at: string;
 };
@@ -104,6 +106,7 @@ export type ChatItem = (
   | { kind: "chip"; chip: ToolChip }
   | { kind: "rebrief"; rebrief: RebriefView }
   | { kind: "decision"; decision: DecisionView }
+  | { kind: "synthetic"; text: string; inputKind: string }
   | { kind: "note"; text: string }
   /** A usage-limit failure with a retry-on-Opus offer (see turn_error). */
   | { kind: "limit"; message: string; failedText: string; model: string }
