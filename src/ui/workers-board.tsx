@@ -312,6 +312,19 @@ function ChangesCard({
       ) : null}
       {changes && !changes.gone ? (
         <>
+          {changes.workspaceEvidence.available ? (
+            <p className="empty-note" title="The workspace state was fully observed within Galapagos's evidence limits.">
+              workspace evidence observed ({changes.workspaceEvidence.usage.untrackedEntries} untracked entries, {changes.workspaceEvidence.usage.untrackedBytes.toLocaleString()} bytes)
+            </p>
+          ) : (
+            <div className="workspace-evidence-unavailable" role="status">
+              <strong>Workspace evidence is indeterminate.</strong> {changes.workspaceEvidence.reason ?? "No reason was recorded."}
+              <div>
+                Observed: {changes.workspaceEvidence.usage.untrackedEntries} entries / {changes.workspaceEvidence.usage.untrackedBytes.toLocaleString()} bytes; git {changes.workspaceEvidence.usage.gitOutputBytes.toLocaleString()} bytes. Limits: {changes.workspaceEvidence.limits.maxUntrackedEntries} entries, {changes.workspaceEvidence.limits.maxUntrackedFileBytes.toLocaleString()} bytes per entry, {changes.workspaceEvidence.limits.maxAggregateUntrackedBytes.toLocaleString()} bytes aggregate, {changes.workspaceEvidence.limits.maxGitOutputBytes.toLocaleString()} bytes per git stream / {changes.workspaceEvidence.limits.maxAggregateGitOutputBytes.toLocaleString()} bytes aggregate.
+              </div>
+              <div>All prior checks are shown stale until a complete workspace observation succeeds.</div>
+            </div>
+          )}
           {changes.checks.length > 0 ? (
             <div className="checks-row">
               {changes.checks.map((check) => (

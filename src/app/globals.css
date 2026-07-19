@@ -1521,6 +1521,19 @@ select:focus {
   color: var(--fg);
 }
 
+.workspace-evidence-unavailable {
+  margin: 8px 0;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger, #c6544e) 60%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--danger, #c6544e) 10%, transparent);
+  color: var(--text, #302a27);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.workspace-evidence-unavailable div { margin-top: 4px; }
+
 .checks-row {
   display: flex;
   gap: 6px;

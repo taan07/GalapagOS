@@ -95,10 +95,9 @@ export async function computeProjectConfidence(
   }
 
   let projectWorkspaceKey: string | null = null;
-  try {
-    projectWorkspaceKey = (await observeWorkspaceEvidence(project.root_path)).key;
-  } catch {
-    projectWorkspaceKey = null;
+  {
+    const workspace = await observeWorkspaceEvidence(project.root_path);
+    projectWorkspaceKey = workspace.available ? workspace.key : null;
   }
   const projectRuns = latestRunsByKey(db, { projectId: project.id, workerId: null });
   const projectCheckRuns = Array.from(projectRuns.values()).map((run) => ({

@@ -62,11 +62,8 @@ export async function runWatchdogReview(input: {
   // re-arm the leg when that state moves (coverage audit 2026-07-05: a
   // transient failure must not pin the leg at "unavailable" forever).
   let payloadKey = "unobservable";
-  try {
-    payloadKey = (await observeWorkspaceEvidence(worker.worktree_path)).key;
-  } catch {
-    // Key stays "unobservable"; the run below will fail loudly on its own.
-  }
+  const payloadEvidence = await observeWorkspaceEvidence(worker.worktree_path);
+  payloadKey = payloadEvidence.available ? payloadEvidence.key : "unobservable";
   const job = createJob(db, "watchdog", {
     workerId: worker.id,
     digestId: input.digestId,
@@ -92,6 +89,11 @@ export async function runWatchdogReview(input: {
     });
 
     const workspace = await observeWorkspaceEvidence(worker.worktree_path);
+    if (!workspace.available || !workspace.key) {
+      const reason = `Workspace evidence is indeterminate: ${workspace.reason ?? "unknown reason"}`;
+      failJob(db, job.id, reason);
+      return { ran: false, error: reason };
+    }
     const globs = input.lane ? laneGlobs(input.lane) : { allowedGlobs: [], forbiddenGlobs: [] };
     const prompt = buildWatchdogPrompt({
       laneName: input.lane?.name ?? worker.id.slice(0, 8),

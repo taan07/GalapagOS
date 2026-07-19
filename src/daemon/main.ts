@@ -1340,9 +1340,22 @@ async function handleWorkerChanges(res: http.ServerResponse, workerId: string): 
   // green check.
   const workspace = await observeWorkspaceEvidence(worker.worktree_path);
   const latest = latestRunsByKey(db, { projectId: worker.project_id, workerId: worker.id });
-  const checks = checkViewsFrom(CHECK_KEYS, latest, workspace.key);
+  const checks = checkViewsFrom(CHECK_KEYS, latest, workspace.available ? workspace.key : null);
 
-  sendJson(res, 200, { gone: false, commits, diff, diffTruncated, dirtyFiles, checks });
+  sendJson(res, 200, {
+    gone: false,
+    commits,
+    diff,
+    diffTruncated,
+    dirtyFiles,
+    checks,
+    workspaceEvidence: {
+      available: workspace.available,
+      reason: workspace.reason,
+      usage: workspace.usage,
+      limits: workspace.limits,
+    },
+  });
 }
 
 async function handleStopWorker(res: http.ServerResponse, workerId: string): Promise<void> {

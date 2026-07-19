@@ -215,6 +215,30 @@ export type WorkerCheckView = {
   createdAt: string;
 };
 
+/** The observer's bounded-resource report. A false availability makes every check stale. */
+export type WorkspaceEvidenceView = {
+  available: boolean;
+  reason: string | null;
+  usage: {
+    untrackedEntries: number;
+    untrackedBytes: number;
+    unstagedDiffBytes: number;
+    stagedDiffBytes: number;
+    statusBytes: number;
+    gitOutputBytes: number;
+    gitStderrBytes: number;
+  };
+  limits: {
+    maxUntrackedEntries: number;
+    maxUntrackedFileBytes: number;
+    maxAggregateUntrackedBytes: number;
+    maxGitOutputBytes: number;
+    maxAggregateGitOutputBytes: number;
+    maxGitStderrBytes: number;
+    maxConcurrentReads: number;
+  };
+};
+
 /** Per-worker commits + diff + check evidence, served on demand (track F). */
 export type WorkerChangesView = {
   /** The worktree no longer exists — nothing to show, honestly. */
@@ -224,6 +248,7 @@ export type WorkerChangesView = {
   diffTruncated: boolean;
   dirtyFiles: string[];
   checks: WorkerCheckView[];
+  workspaceEvidence: WorkspaceEvidenceView;
 };
 
 export type WorkerEventView = {

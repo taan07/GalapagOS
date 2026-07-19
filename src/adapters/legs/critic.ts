@@ -154,10 +154,9 @@ export async function runCriticReview(input: {
   // records what it failed against, so the leg re-arms when the workspace
   // or the evidence pool moves (coverage audit 2026-07-05).
   let payloadKey = "unobservable";
-  try {
-    payloadKey = (await observeWorkspaceEvidence(worker.worktree_path)).key;
-  } catch {
-    // Key stays "unobservable"; the run below fails loudly on its own.
+  {
+    const evidence = await observeWorkspaceEvidence(worker.worktree_path);
+    payloadKey = evidence.available ? evidence.key : "unobservable";
   }
   const job = createJob(db, "critic", {
     workerId: worker.id,
@@ -199,6 +198,11 @@ export async function runCriticReview(input: {
       }));
 
     const workspace = await observeWorkspaceEvidence(worker.worktree_path);
+    if (!workspace.available || !workspace.key) {
+      const reason = `Workspace evidence is indeterminate: ${workspace.reason ?? "unknown reason"}`;
+      failJob(db, job.id, reason);
+      return { ran: false, error: reason };
+    }
     const runs = latestRunsByKey(db, { projectId: project.id, workerId: worker.id });
     const evidenceSummary = Array.from(runs.values())
       .map(
