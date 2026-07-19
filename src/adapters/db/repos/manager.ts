@@ -213,6 +213,40 @@ export function updateTurnContent(db: GalapagosDb, turnId: string, content: stri
   db.prepare("UPDATE manager_turns SET content = ? WHERE id = ?").run(content, turnId);
 }
 
+/** Pending triage cards are linked to their durable attention item in the
+ * persisted payload. Resolution scans this small system-turn set so a stale
+ * card cannot outlive the question it represented. */
+export function pendingDecisionIdsForAttention(db: GalapagosDb, attentionId: string): string[] {
+  const rows = db
+    .prepare(
+      `SELECT content FROM manager_turns
+       WHERE role = 'system' AND content LIKE '%"kind":"decision"%' AND content LIKE '%"status":"pending"%'`,
+    )
+    .all() as { content: string }[];
+  const ids: string[] = [];
+  for (const row of rows) {
+    try {
+      const payload = JSON.parse(row.content) as {
+        kind?: string;
+        status?: string;
+        decisionId?: string;
+        attentionId?: string;
+      };
+      if (
+        payload.kind === "decision" &&
+        payload.status === "pending" &&
+        payload.attentionId === attentionId &&
+        payload.decisionId
+      ) {
+        ids.push(payload.decisionId);
+      }
+    } catch {
+      // Not a decision payload.
+    }
+  }
+  return ids;
+}
+
 /**
  * Boot hygiene for the chat decision channel: a decision pending when the
  * daemon died has lost its in-memory owner (and its promise died with the

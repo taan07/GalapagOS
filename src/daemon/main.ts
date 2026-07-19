@@ -42,7 +42,10 @@ import {
   createWorkerRuntime,
   type LaneViolationNotice,
 } from "../adapters/agent/worker-runtime";
-import { runTriageJob } from "../adapters/agent/triage";
+import {
+  cancelTriageDecisionCards as cancelLinkedTriageDecisionCards,
+  runTriageJob,
+} from "../adapters/agent/triage";
 import { runWatchdogReview } from "../adapters/legs/watchdog";
 import { runCriticReview } from "../adapters/legs/critic";
 import { getAttentionItem, resolveAttentionItem } from "../adapters/db/repos/attention";
@@ -204,6 +207,12 @@ const completionDebriefs = createCompletionDebriefScheduler({
   },
 });
 const decisions = createDecisionBroker();
+
+/** A triage card has no owning manager turn to abort. Its attention item is
+ * the lifetime owner, so closing that item must retire the in-memory card. */
+function cancelTriageDecisionCards(attentionId: string): void {
+  cancelLinkedTriageDecisionCards(db, decisions, attentionId);
+}
 // The monitor tick makes zero LLM calls; triage is the event-driven session
 // it triggers only when new open attention items exist (architecture §7).
 const monitor = createMonitor({
@@ -266,6 +275,7 @@ const monitor = createMonitor({
       onEscalationAnswered: (answer) => {
         void wakeManagerForDecisionAnswer(project.id, answer);
       },
+      onAttentionResolved: cancelTriageDecisionCards,
     });
     if (outcome.error) {
       console.error(`[triage] ${project.slug}: ${outcome.error}`);
@@ -636,6 +646,7 @@ async function handleManagerMessage(
         : {}),
       mode: projectAutonomyMode(projectAtTurnStart),
       onPlanApproved: () => approvePlanSignOff(project.id),
+      onAttentionResolved: cancelTriageDecisionCards,
     });
 
     // Post-turn distillation no longer holds the input lock: the turn is
@@ -854,6 +865,7 @@ async function runAutonomousManagerTurn(input: {
       decisions,
       mode: projectAutonomyMode(projectAtTurnStart),
       onPlanApproved: () => approvePlanSignOff(project.id),
+      onAttentionResolved: cancelTriageDecisionCards,
     });
     turnCompleted = outcome.completed;
     if (outcome.completed) {
@@ -1387,6 +1399,7 @@ async function handleResolveAttention(
   }
   const note = asString(body.note);
   resolveAttentionItem(db, itemId, resolution, note ?? `${resolution} by the user from the queue`);
+  cancelTriageDecisionCards(itemId);
   broadcast({ type: "attention_changed", projectId: item.project_id });
   sendJson(res, 200, { ok: true });
 }

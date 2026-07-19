@@ -117,6 +117,8 @@ function DecisionPrompt({
           ? "No answer recorded (legacy card)"
           : decision.status === "expired"
             ? "Expired (the daemon restarted before an answer)"
+            : decision.status === "cancelled"
+              ? "No answer needed — the related item was closed"
             : "Interrupted before an answer";
     return (
       <div className={`decision settled${isConfirm ? " confirm" : ""}${isBatch ? " batch" : ""}`}>

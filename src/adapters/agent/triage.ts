@@ -28,6 +28,7 @@ import {
   type DecisionOption,
 } from "./decisions";
 import type { DecisionTurnPayload } from "./manager-session";
+import { pendingDecisionIdsForAttention } from "../db/repos/manager";
 import { getWorker } from "../db/repos/workers";
 import { buildWorkerEvidence } from "../evidence/adapter";
 import { createRecordsStore } from "../records/store";
@@ -276,6 +277,7 @@ export function createAskUserBridge(input: {
       kind: "decision",
       cardKind: "decision",
       decisionId: request.id,
+      attentionId: item.id,
       question: fullQuestion,
       options,
       multiSelect,
@@ -352,6 +354,17 @@ export function createAskUserBridge(input: {
   };
 }
 
+/** Triage cards are fire-and-forget, so the durable attention item owns their
+ * lifetime. Once it closes, remove every linked broker entry before a stale
+ * click can create a false answer wake. */
+export function cancelTriageDecisionCards(
+  db: GalapagosDb,
+  decisions: DecisionBroker,
+  attentionId: string,
+): number {
+  return pendingDecisionIdsForAttention(db, attentionId).filter((decisionId) => decisions.cancel(decisionId)).length;
+}
+
 export async function runTriageJob(input: {
   db: GalapagosDb;
   config: GalapagosConfig;
@@ -366,6 +379,8 @@ export async function runTriageJob(input: {
     outcomeText: string;
     attentionId: string;
   }) => void;
+  /** Cancels linked fire-and-forget cards when triage resolves their queue item. */
+  onAttentionResolved?: (attentionId: string) => void;
 }): Promise<TriageOutcome> {
   const { db, config, project } = input;
   const items = listOpenAttentionItems(db, project.id);
@@ -403,6 +418,7 @@ export async function runTriageJob(input: {
       ...(input.decisions ? { decisions: input.decisions } : {}),
       ...(input.onEscalationAnswered ? { onAnswered: input.onEscalationAnswered } : {}),
     }),
+    ...(input.onAttentionResolved ? { onAttentionResolved: input.onAttentionResolved } : {}),
     onToolEvent: (event) => {
       actions.push(`${event.tool}: ${event.summary}`);
     },

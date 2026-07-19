@@ -95,6 +95,8 @@ export type ManagerToolContext = {
    * unwired approval would strand a project in Interview.
    */
   onPlanApproved?: () => boolean;
+  /** Cancels any triage card linked to an attention item once it closes. */
+  onAttentionResolved?: (attentionId: string) => void;
   onToolEvent?: (event: { tool: string; summary: string; detail: string }) => void;
 };
 
@@ -1076,6 +1078,7 @@ export function createManagerToolServer(context: ManagerToolContext) {
             return text(`Attention item ${id} is already ${item.status}.`);
           }
           resolveAttentionItem(bridge.db, id, resolution, note);
+          context.onAttentionResolved?.(id);
           emit("resolve_attention", `${resolution}: ${item.title}`, note);
           return text(`Attention item "${item.title}" is now ${resolution}.`);
         },

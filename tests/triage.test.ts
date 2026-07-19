@@ -14,6 +14,7 @@ import { registerProject } from "../src/adapters/db/repos/projects";
 import {
   createAttentionItem,
   listOpenAttentionItems,
+  resolveAttentionItem,
 } from "../src/adapters/db/repos/attention";
 import { createCompletionDigest, listUnreviewedDigests } from "../src/adapters/db/repos/digests";
 import { getOrCreateActiveSession, listTurns } from "../src/adapters/db/repos/manager";
@@ -21,6 +22,7 @@ import { createWorkerRuntime } from "../src/adapters/agent/worker-runtime";
 import type { WorkerSession } from "../src/adapters/agent/worker-session";
 import {
   buildTriageSeed,
+  cancelTriageDecisionCards,
   createAskUserBridge,
   TRIAGE_ALLOWED_TOOLS,
 } from "../src/adapters/agent/triage";
@@ -267,6 +269,53 @@ test("a triage card stays pending without auto-settlement and leaves its attenti
     "the anchor stays open after an answer until Darwin acts",
   );
   assert.equal(answers.length, 1, "an answer wakes Darwin");
+});
+
+test("resolving or dismissing a triage attention item cancels its linked card and rejects stale answers", async () => {
+  const { db, project } = await fixture();
+  const answers: unknown[] = [];
+  const events: { type: string; status?: string }[] = [];
+  const decisions = createDecisionBroker();
+  const bridge = createAskUserBridge({
+    db,
+    project,
+    decisions,
+    broadcast: (event) => events.push(event as { type: string; status?: string }),
+    onAnswered: (answer) => answers.push(answer),
+  });
+  const session = getOrCreateActiveSession(db, project.id);
+  const options = [
+    { label: "Proceed", implication: "Take the recommended path — e.g. ship the verified change now." },
+    { label: "Wait", implication: "Keep the current state — e.g. revisit after review tomorrow." },
+  ];
+
+  for (const resolution of ["resolved", "dismissed"] as const) {
+    const { attentionId } = bridge(`Ship tonight (${resolution})?`, "", options, false);
+    const cardTurn = listTurns(db, session.id).filter((turn) => turn.role === "system").slice(-1)[0];
+    assert.ok(cardTurn);
+    const payload = JSON.parse(cardTurn.content) as { decisionId: string; attentionId?: string; status: string };
+    assert.equal(payload.attentionId, attentionId, "the card persists its durable owner link");
+
+    resolveAttentionItem(db, attentionId, resolution, "not needed after review");
+    assert.equal(cancelTriageDecisionCards(db, decisions, attentionId), 1);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const settled = JSON.parse(
+      listTurns(db, session.id).find((turn) => turn.id === cardTurn.id)?.content ?? "{}",
+    ) as { status?: string };
+    assert.equal(settled.status, "cancelled");
+    assert.equal(
+      decisions.answer(payload.decisionId, { selections: ["Proceed"], responses: {}, custom: "" }),
+      false,
+      "a stale click cannot settle a cancelled card",
+    );
+  }
+  assert.equal(answers.length, 0, "a stale click does not wake Darwin");
+  assert.equal(
+    events.filter((event) => event.type === "decision_settled" && event.status === "cancelled").length,
+    2,
+    "every closed attention item broadcasts its terminal card state",
+  );
 });
 
 test("triage's tool surface is non-destructive: pause and escalate, never stop (2026-07-10 ruling)", () => {

@@ -54,7 +54,9 @@ export type DecisionAnswer = {
 
 export type DecisionOutcome =
   | { status: "answered"; answer: DecisionAnswer }
-  | { status: "interrupted" };
+  | { status: "interrupted" }
+  /** A triage card's backing attention item was resolved or dismissed. */
+  | { status: "cancelled" };
 
 type PendingDecision = {
   request: DecisionRequest;
@@ -124,6 +126,17 @@ export function createDecisionBroker() {
       return true;
     },
 
+    /** Retire a fire-and-forget card whose durable attention item no longer
+     * needs an answer. Ordinary manager cards are never cancelled this way. */
+    cancel(decisionId: string): boolean {
+      const entry = pending.get(decisionId);
+      if (!entry) {
+        return false;
+      }
+      entry.resolve({ status: "cancelled" });
+      return true;
+    },
+
     /** Is this decision still waiting? (UI guard against stale buttons.) */
     isPending(decisionId: string): boolean {
       return pending.has(decisionId);
@@ -136,6 +149,9 @@ export function createDecisionBroker() {
 export function describeOutcome(outcome: DecisionOutcome, fields: DecisionField[] = []): string {
   if (outcome.status === "interrupted") {
     return "The turn was interrupted before the user answered. Do not assume an answer.";
+  }
+  if (outcome.status === "cancelled") {
+    return "This question no longer needs an answer.";
   }
 
   const { selections, custom } = outcome.answer;

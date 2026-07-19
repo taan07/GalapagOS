@@ -97,6 +97,17 @@ test("answering an unknown decision id is refused", () => {
   assert.equal(broker.answer("nope", { selections: [], custom: "" }), false);
 });
 
+test("a cancelled fire-and-forget decision releases its pending entry", async () => {
+  const broker = createDecisionBroker();
+  const { request, outcome } = broker.ask({ question: "q", options: OPTIONS, multiSelect: false });
+
+  assert.equal(broker.cancel(request.id), true);
+  assert.deepEqual(await outcome, { status: "cancelled" });
+  assert.equal(broker.isPending(request.id), false);
+  assert.equal(broker.answer(request.id, { selections: ["Allow"], custom: "" }), false);
+  assert.match(describeOutcome({ status: "cancelled" }), /no longer needs an answer/i);
+});
+
 test("describeOutcome renders answers Darwin can act on", () => {
   assert.equal(
     describeOutcome({ status: "answered", answer: { selections: ["A", "B"], custom: "note" } }),
