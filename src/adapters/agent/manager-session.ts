@@ -76,7 +76,7 @@ export type ManagerTurnEvent =
   | {
       type: "decision_settled";
       decisionId: string;
-      status: "answered" | "timeout" | "interrupted";
+      status: "answered" | "interrupted" | "cancelled";
       selections: string[];
       responses: Record<string, string[]>;
       custom: string;
@@ -102,7 +102,12 @@ export type DecisionTurnPayload = {
   multiSelect: boolean;
   /** Batch questions (absent/empty on single decisions and confirms). */
   fields?: DecisionField[];
-  status: "pending" | "answered" | "timeout" | "interrupted" | "expired";
+  /** Present only for triage cards; links the fire-and-forget card to its
+   * durable attention item so closing the item can cancel the card. */
+  attentionId?: string;
+  /** `timeout` is retained only to render historical persisted cards. New
+   * live outcomes never emit it. */
+  status: "pending" | "answered" | "timeout" | "interrupted" | "cancelled" | "expired";
   selections: string[];
   /** Per-field selected labels for a batch. */
   responses?: Record<string, string[]>;
@@ -383,6 +388,9 @@ export async function runManagerTurn(input: {
   /** Fired when update_record signs an implementation_plan (Interview exit).
    * Returns whether the mode actually flipped — the tool words its reply on it. */
   onPlanApproved?: () => boolean;
+  /** Retire any triage decision cards backed by an attention item this turn
+   * resolved or dismissed. */
+  onAttentionResolved?: (attentionId: string) => void;
   /**
    * This turn's attachments (track I). Images ride the SDK message as base64
    * content blocks; pasted-text files are already on disk — `promptNote`
@@ -446,7 +454,8 @@ export async function runManagerTurn(input: {
    * The chat decision channel: persist the question as a system turn (so it
    * survives reloads), stream it as clickable options, wait for the user via
    * the broker, stamp the settled state back into the turn. Darwin's turn
-   * holds while the user decides; timeout and interrupt resolve honestly.
+   * holds while the user decides; only explicit interruption settles without
+   * an answer.
    */
   // Shared machinery for every chat card — single decision, batch of
   // questions, or understanding playback: persist a system turn (survives
@@ -566,6 +575,7 @@ export async function runManagerTurn(input: {
     ...(askBatch ? { askBatch } : {}),
     ...(askConfirm ? { askConfirm } : {}),
     ...(input.onPlanApproved ? { onPlanApproved: input.onPlanApproved } : {}),
+    ...(input.onAttentionResolved ? { onAttentionResolved: input.onAttentionResolved } : {}),
     onToolEvent: (event) => {
       const turn = appendTurn(db, {
         sessionId: session.id,

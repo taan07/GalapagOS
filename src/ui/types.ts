@@ -72,7 +72,8 @@ export type DecisionView = {
   multiSelect: boolean;
   /** Batch questions (empty for single decisions and confirms). */
   fields?: DecisionFieldView[];
-  status: "pending" | "answered" | "timeout" | "interrupted" | "expired";
+  /** `timeout` is retained solely for historical persisted cards. */
+  status: "pending" | "answered" | "timeout" | "interrupted" | "cancelled" | "expired";
   selections: string[];
   /** Per-field selected labels for a batch, keyed by field id. */
   responses?: Record<string, string[]>;
@@ -146,7 +147,7 @@ export type ManagerStreamEvent =
   | {
       type: "decision_settled";
       decisionId: string;
-      status: "answered" | "timeout" | "interrupted";
+      status: "answered" | "interrupted" | "cancelled";
       selections: string[];
       responses: Record<string, string[]>;
       custom: string;

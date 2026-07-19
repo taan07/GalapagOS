@@ -28,6 +28,7 @@ import {
   type DecisionOption,
 } from "./decisions";
 import type { DecisionTurnPayload } from "./manager-session";
+import { pendingDecisionIdsForAttention } from "../db/repos/manager";
 import { getWorker } from "../db/repos/workers";
 import { buildWorkerEvidence } from "../evidence/adapter";
 import { createRecordsStore } from "../records/store";
@@ -228,8 +229,6 @@ export function createAskUserBridge(input: {
    * happens to send another message.
    */
   onAnswered?: (answer: { question: string; outcomeText: string; attentionId: string }) => void;
-  /** Card timeout override; omitted = the broker's 10-minute default. */
-  cardTimeoutMs?: number;
 }): (
   question: string,
   context: string,
@@ -237,8 +236,17 @@ export function createAskUserBridge(input: {
   multiSelect?: boolean,
 ) => { attentionId: string } {
   return (question, questionContext, options = [], multiSelect = false) => {
+    if (
+      options.length < 2 ||
+      options.length > 4 ||
+      options.some((option) => !option.label.trim() || !option.implication.trim())
+    ) {
+      throw new Error(
+        "Triage escalations require 2-4 concrete clickable options; free-text-only cards can strand behind newer cards.",
+      );
+    }
     // The durable half, unchanged: the queue records the question whatever
-    // happens to the card (timeout, restart, ignored tab).
+    // happens to the owning process (restart or ignored tab).
     const item = createAttentionItem(input.db, {
       projectId: input.project.id,
       kind: "question_for_user",
@@ -263,8 +271,8 @@ export function createAskUserBridge(input: {
       return { attentionId: item.id };
     }
 
-    // The card surface (track E): register with the broker (10-minute
-    // timeout, same as live cards), persist the SAME pending payload a live
+    // The card surface (track E): register with the broker, persist the SAME
+    // pending payload a live
     // turn would (byte-compatible with reload rendering and the boot sweep),
     // broadcast the request — and DO NOT WAIT. Triage never blocks on the
     // user; the settle callback below carries the answer onward.
@@ -273,12 +281,12 @@ export function createAskUserBridge(input: {
       question: fullQuestion,
       options,
       multiSelect,
-      ...(input.cardTimeoutMs !== undefined ? { timeoutMs: input.cardTimeoutMs } : {}),
     });
     const payload: DecisionTurnPayload = {
       kind: "decision",
       cardKind: "decision",
       decisionId: request.id,
+      attentionId: item.id,
       question: fullQuestion,
       options,
       multiSelect,
@@ -346,13 +354,24 @@ export function createAskUserBridge(input: {
           attentionId: item.id,
         });
       }
-      // Timeout/interrupt: the turn is stamped honestly and the attention
-      // item stays OPEN — the question is still owed an answer, and the
-      // queue is what re-raises it.
+      // An interrupted triage card is stamped honestly and the attention item
+      // stays OPEN — the question is still owed an answer, and the queue is
+      // what re-raises it.
     });
 
     return { attentionId: item.id };
   };
+}
+
+/** Triage cards are fire-and-forget, so the durable attention item owns their
+ * lifetime. Once it closes, remove every linked broker entry before a stale
+ * click can create a false answer wake. */
+export function cancelTriageDecisionCards(
+  db: GalapagosDb,
+  decisions: DecisionBroker,
+  attentionId: string,
+): number {
+  return pendingDecisionIdsForAttention(db, attentionId).filter((decisionId) => decisions.cancel(decisionId)).length;
 }
 
 export async function runTriageJob(input: {
@@ -369,6 +388,8 @@ export async function runTriageJob(input: {
     outcomeText: string;
     attentionId: string;
   }) => void;
+  /** Cancels linked fire-and-forget cards when triage resolves their queue item. */
+  onAttentionResolved?: (attentionId: string) => void;
 }): Promise<TriageOutcome> {
   const { db, config, project } = input;
   const items = listOpenAttentionItems(db, project.id);
@@ -406,6 +427,7 @@ export async function runTriageJob(input: {
       ...(input.decisions ? { decisions: input.decisions } : {}),
       ...(input.onEscalationAnswered ? { onAnswered: input.onEscalationAnswered } : {}),
     }),
+    ...(input.onAttentionResolved ? { onAttentionResolved: input.onAttentionResolved } : {}),
     onToolEvent: (event) => {
       actions.push(`${event.tool}: ${event.summary}`);
     },

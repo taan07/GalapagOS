@@ -41,7 +41,10 @@ import {
   createWorkerRuntime,
   type LaneViolationNotice,
 } from "../adapters/agent/worker-runtime";
-import { runTriageJob } from "../adapters/agent/triage";
+import {
+  cancelTriageDecisionCards as cancelLinkedTriageDecisionCards,
+  runTriageJob,
+} from "../adapters/agent/triage";
 import { runWatchdogReview } from "../adapters/legs/watchdog";
 import { runCriticReview } from "../adapters/legs/critic";
 import { getAttentionItem, resolveAttentionItem } from "../adapters/db/repos/attention";
@@ -205,6 +208,12 @@ const completionDebriefs = createCompletionDebriefScheduler({
   },
 });
 const decisions = createDecisionBroker();
+
+/** A triage card has no owning manager turn to abort. Its attention item is
+ * the lifetime owner, so closing that item must retire the in-memory card. */
+function cancelTriageDecisionCards(attentionId: string): void {
+  cancelLinkedTriageDecisionCards(db, decisions, attentionId);
+}
 // The monitor tick makes zero LLM calls; triage is the event-driven session
 // it triggers only when new open attention items exist (architecture §7).
 const monitor = createMonitor({
@@ -267,6 +276,7 @@ const monitor = createMonitor({
       onEscalationAnswered: (answer) => {
         void wakeManagerForDecisionAnswer(project.id, answer);
       },
+      onAttentionResolved: cancelTriageDecisionCards,
     });
     if (outcome.error) {
       console.error(`[triage] ${project.slug}: ${outcome.error}`);
@@ -635,6 +645,7 @@ async function handleManagerMessage(
         : {}),
       mode: projectAutonomyMode(projectAtTurnStart),
       onPlanApproved: () => approvePlanSignOff(project.id),
+      onAttentionResolved: cancelTriageDecisionCards,
     });
 
     // Post-turn distillation no longer holds the input lock: the turn is
@@ -869,6 +880,7 @@ async function runAutonomousManagerTurn(input: {
       decisions,
       mode: projectAutonomyMode(projectAtTurnStart),
       onPlanApproved: () => approvePlanSignOff(project.id),
+      onAttentionResolved: cancelTriageDecisionCards,
     });
     turnCompleted = outcome.completed;
     if (outcome.completed) {
@@ -1266,7 +1278,7 @@ async function handleDecisionAnswer(
   }
   if (!decisions.answer(decisionId, { selections, responses, custom })) {
     sendJson(res, 409, {
-      error: "That decision is no longer pending — it was answered, timed out, or belongs to an ended turn.",
+      error: "That decision is no longer pending — it was answered or belongs to an ended turn.",
     });
     return;
   }
@@ -1406,6 +1418,7 @@ async function handleResolveAttention(
   }
   const note = asString(body.note);
   resolveAttentionItem(db, itemId, resolution, note ?? `${resolution} by the user from the queue`);
+  cancelTriageDecisionCards(itemId);
   broadcast({ type: "attention_changed", projectId: item.project_id });
   sendJson(res, 200, { ok: true });
 }
@@ -1620,7 +1633,7 @@ void (async () => {
   // survive a reconcile failure (and still run vault ingestion after it).
   const staleDecisions = sweepPendingDecisionTurns(db);
   if (staleDecisions > 0) {
-    console.log(`[decisions] expired ${staleDecisions} pending decision${staleDecisions === 1 ? "" : "s"} from before the restart`);
+    console.log(`[decisions] expired ${staleDecisions} pending decision${staleDecisions === 1 ? "" : "s"} whose owning process was lost on restart`);
   }
   try {
     const { reattached, finalized } = await workers.reconcileOrphans();

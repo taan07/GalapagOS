@@ -95,6 +95,8 @@ export type ManagerToolContext = {
    * unwired approval would strand a project in Interview.
    */
   onPlanApproved?: () => boolean;
+  /** Cancels any triage card linked to an attention item once it closes. */
+  onAttentionResolved?: (attentionId: string) => void;
   onToolEvent?: (event: { tool: string; summary: string; detail: string }) => void;
 };
 
@@ -580,11 +582,7 @@ export function createManagerToolServer(context: ManagerToolContext) {
           );
           if (decision.status !== "answered") {
             emit("amend_lane", `amendment ${decision.status} for ${laneName}`, reason);
-            return text(
-              decision.status === "timeout"
-                ? "The user did not answer — the lane is UNCHANGED. Treat the amendment as deferred; do not retry without new cause."
-                : "The turn was interrupted before the user answered — the lane is UNCHANGED.",
-            );
+            return text("The turn was interrupted before the user answered — the lane is UNCHANGED.");
           }
           const approved = decision.answer.selections.includes("Allow the amendment");
           if (!approved) {
@@ -663,11 +661,7 @@ export function createManagerToolServer(context: ManagerToolContext) {
             );
             if (decision.status !== "answered") {
               emit("merge_worker", `merge ${decision.status} for ${branch}`, laneName);
-              return text(
-                decision.status === "timeout"
-                  ? "The user did not answer — NOTHING was merged. Treat it as deferred; do not retry without new cause."
-                  : "The turn was interrupted before the user answered — NOTHING was merged.",
-              );
+              return text("The turn was interrupted before the user answered — NOTHING was merged.");
             }
             if (!decision.answer.selections.includes("Merge into main")) {
               emit("merge_worker", `user declined merging ${branch}`, decision.answer.custom || laneName);
@@ -704,7 +698,7 @@ export function createManagerToolServer(context: ManagerToolContext) {
       ),
       tool(
         "ask_user",
-        "Put a REAL decision to the user. In a live chat turn this renders clickable options and WAITS for the answer (10-minute timeout; the user always gets a free-text field). In a triage session it instead lands the question in the user's chat AND on the attention queue without waiting — include your recommendation in `context`. Use only for decisions that change what gets built or how; never re-ask what records already answer.",
+        "Put a REAL decision to the user. In a live chat turn this renders clickable options and WAITS until the user answers or the turn is interrupted (the user always gets a free-text field). In a triage session it instead lands the question in the user's chat AND on the attention queue without waiting — include your recommendation in `context`. Use only for decisions that change what gets built or how; never re-ask what records already answer.",
         {
           question: z.string().describe("The decision, phrased concretely"),
           options: z
@@ -741,13 +735,23 @@ export function createManagerToolServer(context: ManagerToolContext) {
             return text(describeOutcome(decision));
           }
           if (context.escalateToUser) {
+            const triageOptions = options ?? [];
+            if (
+              triageOptions.length < 2 ||
+              triageOptions.length > 4 ||
+              triageOptions.some((option) => !option.label.trim() || !option.implication.trim())
+            ) {
+              return text(
+                "Triage escalations require 2-4 concrete clickable options (each with a label and practical implication). Do not create a free-text-only triage card.",
+              );
+            }
             // Triage never blocks on the user: fire-and-forget card into chat
             // + queue; the answer arrives through Darwin. Options ride along
             // so the user clicks instead of typing prose.
             const { attentionId } = context.escalateToUser(
               question,
               questionContext ?? "",
-              options ?? [],
+              triageOptions,
               multi_select ?? false,
             );
             emit("ask_user", `escalated to user: ${oneLine(question, 80)}`, questionContext ?? "");
@@ -832,11 +836,7 @@ export function createManagerToolServer(context: ManagerToolContext) {
           const decision = await context.askConfirm(playback);
           if (decision.status !== "answered") {
             emit("confirm_understanding", `playback ${decision.status}`, playback);
-            return text(
-              decision.status === "timeout"
-                ? "The user did not confirm within the time limit. Do not assume your understanding is right; re-confirm before consequential action."
-                : "The turn was interrupted before the user confirmed. Do not assume your understanding is right.",
-            );
+            return text("The turn was interrupted before the user confirmed. Do not assume your understanding is right.");
           }
           const confirmed =
             decision.answer.selections.includes("Confirmed") && !decision.answer.custom.trim();
@@ -1088,6 +1088,7 @@ export function createManagerToolServer(context: ManagerToolContext) {
             return text(`Attention item ${id} is already ${item.status}.`);
           }
           resolveAttentionItem(bridge.db, id, resolution, note);
+          context.onAttentionResolved?.(id);
           emit("resolve_attention", `${resolution}: ${item.title}`, note);
           return text(`Attention item "${item.title}" is now ${resolution}.`);
         },

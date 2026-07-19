@@ -203,8 +203,8 @@ Manager tools (in-process `createSdkMcpServer` + `tool()`):
 `resolve_attention(id, resolution)`. `ask_user` renders as clickable
 options in the chat — single or multiple choice, implications worded in
 product terms, always a free-text field — and the manager turn waits for
-the answer (10-minute timeout resolves as a deferral; user-confirmed
-2026-07-05).
+the answer until the user responds or the owning turn is explicitly
+interrupted (user-confirmed 2026-07-05).
 `write_record(type=decision)` triggers the checkpoint mechanism (section 8).
 
 **Completion lifecycle facts are independent.** `manager_reviewed` means the

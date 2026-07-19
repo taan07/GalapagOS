@@ -41,18 +41,25 @@ test("a decision resolves with the user's answer", async () => {
   assert.equal(broker.answer(request.id, { selections: ["Deny"], custom: "" }), false);
 });
 
-test("an unanswered decision times out honestly", async () => {
+test("an unanswered decision stays pending after a delay and accepts a late answer", async () => {
   const broker = createDecisionBroker();
-  const { outcome } = broker.ask({
+  const { request, outcome } = broker.ask({
     question: "q",
     options: OPTIONS,
     multiSelect: false,
-    timeoutMs: 20,
   });
-  const settled = await outcome;
-  assert.deepEqual(settled, { status: "timeout" });
-  assert.match(describeOutcome(settled), /deferred/);
-  assert.match(describeOutcome(settled), /do NOT guess/);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(broker.isPending(request.id), true, "time alone must not settle the card");
+  assert.equal(
+    await Promise.race([outcome.then(() => false), new Promise<true>((resolve) => setTimeout(() => resolve(true), 5))]),
+    true,
+    "the outcome remains unresolved until an answer or interruption",
+  );
+  assert.equal(broker.answer(request.id, { selections: ["Deny"], custom: "after thinking" }), true);
+  assert.deepEqual(await outcome, {
+    status: "answered",
+    answer: { selections: ["Deny"], custom: "after thinking" },
+  });
 });
 
 test("an interrupted turn resolves its pending decision as interrupted", async () => {
@@ -70,9 +77,35 @@ test("an interrupted turn resolves its pending decision as interrupted", async (
   assert.match(describeOutcome(settled), /interrupted/i);
 });
 
+test("an already-interrupted turn settles immediately without a pending card", async () => {
+  const broker = createDecisionBroker();
+  const controller = new AbortController();
+  controller.abort();
+  const { request, outcome } = broker.ask({
+    question: "q",
+    options: OPTIONS,
+    multiSelect: false,
+    signal: controller.signal,
+  });
+  assert.deepEqual(await outcome, { status: "interrupted" });
+  assert.equal(broker.isPending(request.id), false);
+  assert.equal(broker.answer(request.id, { selections: ["Allow"], custom: "" }), false);
+});
+
 test("answering an unknown decision id is refused", () => {
   const broker = createDecisionBroker();
   assert.equal(broker.answer("nope", { selections: [], custom: "" }), false);
+});
+
+test("a cancelled fire-and-forget decision releases its pending entry", async () => {
+  const broker = createDecisionBroker();
+  const { request, outcome } = broker.ask({ question: "q", options: OPTIONS, multiSelect: false });
+
+  assert.equal(broker.cancel(request.id), true);
+  assert.deepEqual(await outcome, { status: "cancelled" });
+  assert.equal(broker.isPending(request.id), false);
+  assert.equal(broker.answer(request.id, { selections: ["Allow"], custom: "" }), false);
+  assert.match(describeOutcome({ status: "cancelled" }), /no longer needs an answer/i);
 });
 
 test("describeOutcome renders answers Darwin can act on", () => {
@@ -86,7 +119,7 @@ test("describeOutcome renders answers Darwin can act on", () => {
   );
 });
 
-test("a batch card resolves with per-field responses, labeled by prompt", async () => {
+test("batch and confirm cards share the no-timeout broker lifetime", async () => {
   const broker = createDecisionBroker();
   const fields = [
     { id: "tone", prompt: "Voice?", options: OPTIONS, multiSelect: false },
@@ -94,6 +127,8 @@ test("a batch card resolves with per-field responses, labeled by prompt", async 
   ];
   const { request, outcome } = broker.ask({ kind: "batch", fields });
   assert.equal(request.kind, "batch");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(broker.isPending(request.id), true);
   assert.equal(
     broker.answer(request.id, {
       selections: [],
@@ -107,6 +142,19 @@ test("a batch card resolves with per-field responses, labeled by prompt", async 
   const described = describeOutcome(settled, fields);
   assert.match(described, /Voice\? → Allow/);
   assert.match(described, /Units\? → Deny/);
+
+  const confirm = broker.ask({
+    kind: "confirm",
+    question: "Proceed?",
+    options: OPTIONS,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(broker.isPending(confirm.request.id), true);
+  assert.equal(
+    broker.answer(confirm.request.id, { selections: ["Allow"], custom: "" }),
+    true,
+  );
+  assert.equal((await confirm.outcome).status, "answered");
 });
 
 test("describeOutcome carries the user's chat note as the free-text answer", () => {
