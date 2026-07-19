@@ -34,16 +34,18 @@ Use Bun for GalapagOS dependencies and top-level scripts:
 cd ~/Dev/galapagos-<track>
 bun install --frozen-lockfile
 rm -rf dist-node
+bun run smoke:sqlite
 bun run test
 bun run build
 git diff --check
 ```
 
-`bun install --frozen-lockfile` is a clean-track verification command. A
-dependency change must update both `package.json` and `bun.lock`. GalapagOS
-still supervises npm, pnpm, Yarn, and Bun repositories, so do not rewrite
-npm-specific fixtures or historical handoffs that truthfully describe their
-original commands.
+`bun install --frozen-lockfile` is the clean-track verification command. It
+and every top-level script require the exact Bun version declared in
+`package.json`; a dependency change must update both `package.json` and
+`bun.lock`. GalapagOS still supervises npm, pnpm, Yarn, and Bun repositories,
+so do not rewrite npm-specific fixtures or historical handoffs that truthfully
+describe their original commands.
 
 ## Deploy to localhost
 

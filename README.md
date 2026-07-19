@@ -26,8 +26,12 @@ APIs.
 
 ## Development
 
+- Bun **1.2.5** is required. The checked-in guard rejects other Bun versions
+  before install, test, build, or runtime scripts proceed.
+- `bun install --frozen-lockfile` — clean, reproducible dependency install
 - `bun run dev` — daemon (:4517) + Next.js UI (http://localhost:3005)
 - `bun run test` — typecheck + node --test suites (no network)
+- `bun run smoke:sqlite` — proves the Node/tsx runtime opens the native SQLite binding
 - `bun run spike:resume` — proves session resume across process boundaries
   (makes two small real manager turns on your subscription)
 
