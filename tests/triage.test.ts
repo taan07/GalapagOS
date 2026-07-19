@@ -28,6 +28,11 @@ import {
 } from "../src/adapters/agent/triage";
 import { createDecisionBroker } from "../src/adapters/agent/decisions";
 
+const OPTIONS = [
+  { label: "Proceed", implication: "Take the recommended path — e.g. ship the verified change now." },
+  { label: "Wait", implication: "Keep the current state — e.g. revisit after review tomorrow." },
+];
+
 function fixtureRepo(): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), "glp-triage-repo-"));
   const git = (args: string[]) =>
@@ -130,6 +135,7 @@ test("createAskUserBridge without a broker keeps the legacy note path", async ()
   const { attentionId } = bridge(
     "Stripe or PromptPay first?",
     "The payments worker is blocked on this. Recommendation: PromptPay — it was the launch-market answer in the records.",
+    OPTIONS,
   );
 
   const items = listOpenAttentionItems(db, project.id);
@@ -238,7 +244,7 @@ test("a triage card stays pending without auto-settlement and leaves its attenti
     decisions,
     onAnswered: (answer) => answers.push(answer),
   });
-  bridge("Ship tonight?", "", [], false);
+  bridge("Ship tonight?", "", OPTIONS, false);
 
   const session = getOrCreateActiveSession(db, project.id);
   const cardTurn = listTurns(db, session.id).find((turn) => turn.role === "system");
@@ -316,6 +322,23 @@ test("resolving or dismissing a triage attention item cancels its linked card an
     2,
     "every closed attention item broadcasts its terminal card state",
   );
+});
+
+test("triage rejects an older free-text-only card before a newer card can strand it", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "glp-triage-options-state-"));
+  const db = openDb(stateDir);
+  const projectDir = fixtureRepo();
+  return registerProject(db, { rootPath: projectDir }).then((project) => {
+    const bridge = createAskUserBridge({ db, project, decisions: createDecisionBroker() });
+    assert.throws(
+      () => bridge("Explain why?", "", [], false),
+      /2-4 concrete clickable options/,
+    );
+    bridge("Choose now?", "", OPTIONS, false);
+    const session = getOrCreateActiveSession(db, project.id);
+    const cards = listTurns(db, session.id).filter((turn) => turn.role === "system");
+    assert.equal(cards.length, 1, "the rejected older card never enters history or the broker");
+  });
 });
 
 test("triage's tool surface is non-destructive: pause and escalate, never stop (2026-07-10 ruling)", () => {

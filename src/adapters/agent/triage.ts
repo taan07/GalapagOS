@@ -236,6 +236,15 @@ export function createAskUserBridge(input: {
   multiSelect?: boolean,
 ) => { attentionId: string } {
   return (question, questionContext, options = [], multiSelect = false) => {
+    if (
+      options.length < 2 ||
+      options.length > 4 ||
+      options.some((option) => !option.label.trim() || !option.implication.trim())
+    ) {
+      throw new Error(
+        "Triage escalations require 2-4 concrete clickable options; free-text-only cards can strand behind newer cards.",
+      );
+    }
     // The durable half, unchanged: the queue records the question whatever
     // happens to the owning process (restart or ignored tab).
     const item = createAttentionItem(input.db, {

@@ -735,13 +735,23 @@ export function createManagerToolServer(context: ManagerToolContext) {
             return text(describeOutcome(decision));
           }
           if (context.escalateToUser) {
+            const triageOptions = options ?? [];
+            if (
+              triageOptions.length < 2 ||
+              triageOptions.length > 4 ||
+              triageOptions.some((option) => !option.label.trim() || !option.implication.trim())
+            ) {
+              return text(
+                "Triage escalations require 2-4 concrete clickable options (each with a label and practical implication). Do not create a free-text-only triage card.",
+              );
+            }
             // Triage never blocks on the user: fire-and-forget card into chat
             // + queue; the answer arrives through Darwin. Options ride along
             // so the user clicks instead of typing prose.
             const { attentionId } = context.escalateToUser(
               question,
               questionContext ?? "",
-              options ?? [],
+              triageOptions,
               multi_select ?? false,
             );
             emit("ask_user", `escalated to user: ${oneLine(question, 80)}`, questionContext ?? "");
