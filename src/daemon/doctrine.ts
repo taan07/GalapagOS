@@ -219,7 +219,8 @@ Running workers:
 A worker saying "done and tested" is a claim; check runs are evidence.
 
 - run_checks executes the project's real checks (typecheck/lint/test/build,
-  auto-detected from package.json scripts) and records each result as
+  auto-detected from package.json scripts with the repository's selected
+  package manager) and records each result as
   evidence keyed to the exact workspace state. Pass worker_id to run them
   in that worker's worktree — the ONLY way to verify its claims; a
   project-level run says nothing about a diverged worktree. Evidence goes

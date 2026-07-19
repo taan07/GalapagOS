@@ -2,15 +2,22 @@
   "name": "galapagos",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "bun@1.2.5",
+  "trustedDependencies": [
+    "better-sqlite3"
+  ],
   "scripts": {
-    "dev": "concurrently -n daemon,web -c blue,green \"npm:daemon\" \"npm:web\"",
-    "daemon": "tsx watch src/daemon/main.ts",
-    "web": "next dev --port 3005",
-    "build": "next build",
-    "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && npm run test:unit",
-    "test:unit": "tsc --project tsconfig.node.json && node --test \"dist-node/tests/*.test.js\"",
-    "spike:resume": "tsx scripts/spike-resume.ts"
+    "preinstall": "bun scripts/verify-bun-version.ts",
+    "verify:bun": "bun scripts/verify-bun-version.ts",
+    "dev": "bun run verify:bun && concurrently -n daemon,web -c blue,green \"bun run daemon\" \"bun run web\"",
+    "daemon": "bun run verify:bun && tsx watch src/daemon/main.ts",
+    "web": "bun run verify:bun && next dev --port 3005",
+    "build": "bun run verify:bun && next build",
+    "typecheck": "bun run verify:bun && tsc --noEmit",
+    "test": "bun run typecheck && bun run test:unit",
+    "test:unit": "bun run verify:bun && tsc --project tsconfig.node.json && node --test \"dist-node/tests/*.test.js\"",
+    "spike:resume": "bun run verify:bun && tsx scripts/spike-resume.ts",
+    "smoke:sqlite": "bun run verify:bun && tsx scripts/smoke-sqlite.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "latest",
