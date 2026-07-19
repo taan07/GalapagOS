@@ -1216,6 +1216,8 @@ export function App() {
     const payload = (await response.json().catch(() => ({}))) as {
       error?: string;
       note?: string;
+      compacted?: boolean;
+      sessionId?: string;
     };
     if (selectedIdRef.current !== projectId) return;
     if (!response.ok) {
@@ -1225,6 +1227,11 @@ export function App() {
       ]);
       return;
     }
+    // The POST acknowledgement is authoritative for this tab. A sleeping
+    // browser can retain a half-open EventSource and miss the broadcast, so
+    // never leave this view depending on SSE to reflect a successful compact.
+    await reconcileProject(projectId);
+    if (selectedIdRef.current !== projectId) return;
     if (payload.note) {
       const text = payload.note;
       setItems((current) =>
@@ -1233,7 +1240,7 @@ export function App() {
           : [...current, { kind: "note", text, at: now() }],
       );
     }
-  }, [selectedId]);
+  }, [selectedId, reconcileProject]);
 
   const handleClearRebrief = useCallback(
     async (rebrief: RebriefView) => {

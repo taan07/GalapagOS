@@ -33,7 +33,6 @@ import {
   compactSession,
   getOrCreateActiveSession,
   getTurn,
-  listTurns,
   updateTurnContent,
 } from "../adapters/db/repos/manager";
 import { createDecisionBroker } from "../adapters/agent/decisions";
@@ -66,6 +65,7 @@ import {
   updateLiveSnapshot,
   type LiveTurnSnapshot,
 } from "./live-turn-snapshot";
+import { COMPACTED_NOTE, rebriefSessionNow } from "./manual-rebrief";
 import { buildCompletionDebrief } from "./completion-debrief";
 import {
   createCompletionDebriefScheduler,
@@ -453,9 +453,6 @@ function approvePlanSignOff(projectId: string): boolean {
   });
   return true;
 }
-
-const COMPACTED_NOTE =
-  "Darwin's context was compacted at a clean boundary — he re-briefs himself from the committed records (plus the live thread tail and worker fleet) on his next turn.";
 
 /**
  * The proactive re-brief trigger (principle 7): when a completed turn ran its
@@ -1045,20 +1042,11 @@ async function handleRebriefNow(
     sendJson(res, 409, { error: "Darwin is mid-turn — wait for it to finish before re-briefing." });
     return;
   }
-  const session = getOrCreateActiveSession(db, projectId);
-  const hasConversation = listTurns(db, session.id).some((turn) => turn.role !== "system");
-  if (!hasConversation && session.seeded_from_records_at) {
-    // Already a virgin records-seeded session: compacting again would just
-    // churn rows for an identical outcome.
-    sendJson(res, 200, {
-      compacted: false,
-      note: "Darwin's context is already fresh — the next turn re-briefs from records.",
-    });
-    return;
+  const acknowledgement = rebriefSessionNow(db, projectId);
+  if (acknowledgement.compacted) {
+    broadcast({ type: "manager_note", projectId, text: acknowledgement.note });
   }
-  compactSession(db, projectId, session.id);
-  broadcast({ type: "manager_note", projectId, text: COMPACTED_NOTE });
-  sendJson(res, 200, { compacted: true });
+  sendJson(res, 200, acknowledgement);
 }
 
 async function handleClearRebrief(
