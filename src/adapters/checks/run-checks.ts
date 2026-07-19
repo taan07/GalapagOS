@@ -33,6 +33,10 @@ export type CheckRunner = {
   manager: CheckPackageManager;
   command: string;
   argsBeforeKey: string[];
+  /** Exact packageManager declaration, when the project supplied one. */
+  declaredPackageManager?: string;
+  /** Bun can be verified directly; Corepack resolves the other supported managers. */
+  launcher: "direct" | "corepack";
 };
 
 export type CheckRunnerDetection =
@@ -44,11 +48,17 @@ type PackageManifest = {
   packageManager?: unknown;
 };
 
-const CHECK_RUNNERS: Record<CheckPackageManager, CheckRunner> = {
-  bun: { manager: "bun", command: "bun", argsBeforeKey: ["run"] },
-  pnpm: { manager: "pnpm", command: "pnpm", argsBeforeKey: ["run"] },
-  yarn: { manager: "yarn", command: "yarn", argsBeforeKey: ["run"] },
-  npm: { manager: "npm", command: "npm", argsBeforeKey: ["run"] },
+const INFERRED_CHECK_RUNNERS: Record<CheckPackageManager, CheckRunner> = {
+  bun: { manager: "bun", command: "bun", argsBeforeKey: ["run"], launcher: "direct" },
+  pnpm: { manager: "pnpm", command: "pnpm", argsBeforeKey: ["run"], launcher: "direct" },
+  yarn: { manager: "yarn", command: "yarn", argsBeforeKey: ["run"], launcher: "direct" },
+  npm: { manager: "npm", command: "npm", argsBeforeKey: ["run"], launcher: "direct" },
+};
+
+type PackageManagerDeclaration = {
+  manager: CheckPackageManager;
+  version: string;
+  raw: string;
 };
 
 function readPackageManifest(cwd: string): PackageManifest | null {
@@ -59,14 +69,34 @@ function readPackageManifest(cwd: string): PackageManifest | null {
   }
 }
 
-function managerFromPackageManagerField(value: unknown): CheckPackageManager | null {
+function parsePackageManagerDeclaration(value: unknown): PackageManagerDeclaration | null {
   if (typeof value !== "string") {
     return null;
   }
-  const manager = /^(bun|pnpm|yarn|npm)(?:@|$)/.exec(value.trim())?.[1];
+  // Corepack requires name@x.y.z; it may include an optional integrity suffix.
+  // Keep the whole declaration intact so Corepack can enforce its hash too.
+  const match = /^(bun|pnpm|yarn|npm)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+sha(?:224|256|384|512)\.[A-Za-z0-9+/=_-]+)?$/.exec(value);
+  const manager = match?.[1];
+  const version = match?.[2];
   return manager === "bun" || manager === "pnpm" || manager === "yarn" || manager === "npm"
-    ? manager
+    ? { manager, version: version ?? "", raw: value }
     : null;
+}
+
+function declaredCheckRunner(declaration: PackageManagerDeclaration): CheckRunner {
+  if (declaration.manager === "bun") {
+    return {
+      ...INFERRED_CHECK_RUNNERS.bun,
+      declaredPackageManager: declaration.raw,
+    };
+  }
+  return {
+    manager: declaration.manager,
+    command: "corepack",
+    argsBeforeKey: [declaration.manager, "run"],
+    declaredPackageManager: declaration.raw,
+    launcher: "corepack",
+  };
 }
 
 /**
@@ -81,14 +111,14 @@ export function detectCheckRunner(cwd: string): CheckRunnerDetection {
     return { status: "indeterminate", reason: `No readable ${path.join(cwd, "package.json")}.` };
   }
 
-  const declared = managerFromPackageManagerField(manifest.packageManager);
+  const declared = parsePackageManagerDeclaration(manifest.packageManager);
   if (declared) {
-    return { status: "resolved", runner: CHECK_RUNNERS[declared] };
+    return { status: "resolved", runner: declaredCheckRunner(declared) };
   }
   if (Object.prototype.hasOwnProperty.call(manifest, "packageManager")) {
     return {
       status: "indeterminate",
-      reason: `package.json declares an unsupported or malformed packageManager (${JSON.stringify(manifest.packageManager)}); expected bun, pnpm, yarn, or npm with an optional version.`,
+      reason: `package.json declares an unsupported or malformed packageManager (${JSON.stringify(manifest.packageManager)}); expected bun, pnpm, yarn, or npm at an exact x.y.z version, with an optional +sha* integrity suffix.`,
     };
   }
 
@@ -111,7 +141,7 @@ export function detectCheckRunner(cwd: string): CheckRunnerDetection {
     if (!manager) {
       return { status: "indeterminate", reason: "Could not read the selected package-manager lockfile." };
     }
-    return { status: "resolved", runner: CHECK_RUNNERS[manager] };
+    return { status: "resolved", runner: INFERRED_CHECK_RUNNERS[manager] };
   }
   if (lockfileManagers.size > 1) {
     return {
@@ -119,7 +149,7 @@ export function detectCheckRunner(cwd: string): CheckRunnerDetection {
       reason: `Conflicting package-manager lockfiles (${Array.from(lockfileManagers).join(", ")}) with no valid packageManager declaration.`,
     };
   }
-  return { status: "resolved", runner: CHECK_RUNNERS.npm };
+  return { status: "resolved", runner: INFERRED_CHECK_RUNNERS.npm };
 }
 
 /** Which of the four check keys the repo's package.json actually offers. */
@@ -169,6 +199,39 @@ function lastMeaningfulLine(output: string): string {
   return lines.at(-1) ?? "(no output)";
 }
 
+async function validateDeclaredRunner(
+  runner: CheckRunner,
+  cwd: string,
+  timeoutMs: number,
+): Promise<string | null> {
+  if (!runner.declaredPackageManager) {
+    return null;
+  }
+
+  const preflight = runner.launcher === "corepack"
+    ? await execCheck("corepack", [runner.manager, "--version"], cwd, timeoutMs)
+    : await execCheck("bun", ["--version"], cwd, timeoutMs);
+  if (preflight.spawnError) {
+    return runner.launcher === "corepack"
+      ? `Corepack is unavailable, so ${runner.declaredPackageManager} cannot be selected.`
+      : `Bun is unavailable, so ${runner.declaredPackageManager} cannot be selected.`;
+  }
+  if (preflight.code !== 0 || preflight.timedOut) {
+    return `Could not prepare ${runner.declaredPackageManager}: ${oneLine(lastMeaningfulLine(preflight.output), 160)}.`;
+  }
+
+  if (runner.manager === "bun") {
+    const declaredVersion = /^bun@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/.exec(
+      runner.declaredPackageManager,
+    )?.[1];
+    const actualVersion = lastMeaningfulLine(preflight.output);
+    if (!declaredVersion || actualVersion !== declaredVersion) {
+      return `Bun version mismatch: ${runner.declaredPackageManager} requires Bun ${declaredVersion ?? "(invalid)"}, but the available Bun is ${actualVersion}.`;
+    }
+  }
+  return null;
+}
+
 /**
  * Run the requested checks sequentially (parallel checks fight over ports,
  * caches, and build dirs) and persist one evidence row per executed check.
@@ -206,6 +269,19 @@ export async function runChecks(input: {
         key,
         status: "error" as const,
         summary: `Could not select a package manager for "${key}": ${runner.reason}`,
+      })),
+    };
+  }
+
+  const runnerError = await validateDeclaredRunner(runner.runner, input.cwd, input.config.checkTimeoutMs);
+  if (runnerError) {
+    return {
+      cwd: input.cwd,
+      evidenceKey: null,
+      outcomes: requested.map((key) => ({
+        key,
+        status: "error" as const,
+        summary: `Could not run "${key}": ${runnerError}`,
       })),
     };
   }

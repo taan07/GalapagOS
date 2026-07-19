@@ -68,8 +68,35 @@ test("detectCheckRunner uses a valid packageManager declaration before lockfiles
   const result = detectCheckRunner(repo);
   assert.deepEqual(result, {
     status: "resolved",
-    runner: { manager: "bun", command: "bun", argsBeforeKey: ["run"] },
+    runner: {
+      manager: "bun",
+      command: "bun",
+      argsBeforeKey: ["run"],
+      declaredPackageManager: "bun@1.2.5",
+      launcher: "direct",
+    },
   });
+});
+
+test("detectCheckRunner keeps exact supported declarations and routes non-Bun managers through Corepack", () => {
+  for (const [declaration, manager, command, argsBeforeKey, launcher] of [
+    ["bun@1.2.5+sha256.fixture", "bun", "bun", ["run"], "direct"],
+    ["pnpm@9.15.0+sha224.fixture", "pnpm", "corepack", ["pnpm", "run"], "corepack"],
+    ["yarn@4.6.0+sha224.fixture", "yarn", "corepack", ["yarn", "run"], "corepack"],
+    ["npm@10.9.2+sha512.fixture", "npm", "corepack", ["npm", "run"], "corepack"],
+  ] as const) {
+    const result = detectCheckRunner(fixtureRepo(SCRIPTS, { packageManager: declaration }));
+    assert.equal(result.status, "resolved", declaration);
+    if (result.status === "resolved") {
+      assert.deepEqual(result.runner, {
+        manager,
+        command,
+        argsBeforeKey,
+        declaredPackageManager: declaration,
+        launcher,
+      });
+    }
+  }
 });
 
 test("detectCheckRunner recognizes each supported lockfile and rejects conflicting signals", () => {
@@ -131,6 +158,23 @@ test("detectCheckRunner rejects an invalid explicit packageManager instead of fa
   assert.equal(listEvidenceRuns(db, { projectId: project.id, workerId: null }).length, 0);
 });
 
+test("detectCheckRunner rejects incomplete, unversioned, and trailing packageManager declarations", () => {
+  for (const declaration of [
+    "bun",
+    "bun@",
+    "bun@garbage",
+    "bun@1.2.5 trailing",
+    "pnpm@9.15",
+    "yarn@4.6.0+not-an-integrity-suffix",
+  ]) {
+    const result = detectCheckRunner(fixtureRepo(SCRIPTS, { packageManager: declaration }));
+    assert.equal(result.status, "indeterminate", declaration);
+    if (result.status === "indeterminate") {
+      assert.match(result.reason, /exact x\.y\.z version/);
+    }
+  }
+});
+
 test("runChecks executes configured checks, writes keyed evidence rows, reports the rest honestly", async () => {
   const { db, config, project } = await fixture();
   const result = await runChecks({
@@ -187,6 +231,21 @@ test("runChecks uses Bun when the target declares Bun and records the exact comm
   const run = listEvidenceRuns(db, { projectId: project.id, workerId: null })[0];
   assert.ok(run?.log_path);
   assert.match(readFileSync(run.log_path, "utf8"), /^command: bun run test$/m);
+});
+
+test("runChecks refuses declared Bun versions that do not match the available binary", async () => {
+  const { db, config, project } = await fixture({ packageManager: "bun@0.0.0" });
+  const result = await runChecks({
+    db,
+    config,
+    projectId: project.id,
+    projectSlug: project.slug,
+    cwd: project.root_path,
+    keys: ["test"],
+  });
+  assert.equal(result.outcomes[0]?.status, "error");
+  assert.match(result.outcomes[0]?.summary ?? "", /Bun version mismatch/);
+  assert.equal(listEvidenceRuns(db, { projectId: project.id, workerId: null }).length, 0);
 });
 
 test("conflicting lockfiles produce check errors without executing an arbitrary manager", async () => {
