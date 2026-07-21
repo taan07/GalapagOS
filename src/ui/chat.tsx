@@ -14,6 +14,16 @@ import type {
   RebriefView,
 } from "./types";
 import { shouldAttachPastedText, type OutgoingAttachment } from "../core/attachments";
+import {
+  parseSlashCommand,
+  rankSlashCommands,
+  recordSlashCommandUse,
+  slashCommandAutofill,
+  slashMenuQuery,
+  type SlashCommandExecutionResult,
+  type SlashCommandInvocation,
+  type SlashCommandUsage,
+} from "../core/slash-commands";
 import { imageFileToAttachment } from "./attachments-paste";
 import { localClockTime, localDate, localDateTime } from "./time";
 import { groupTurns, planSettledTurn, splitAnswerFold, type IndexedItem, type TurnGroup } from "./turns";
@@ -729,6 +739,7 @@ function Composer({
   mode,
   onCycleMode,
   onSend,
+  onCommand,
 }: {
   projectId: string | null;
   disabled: boolean;
@@ -738,7 +749,12 @@ function Composer({
   mode: AutonomyModeView;
   onCycleMode: () => void;
   onSend: (text: string, attachments: OutgoingAttachment[]) => void;
+  onCommand: (
+    invocation: SlashCommandInvocation,
+    attachments: OutgoingAttachment[],
+  ) => SlashCommandExecutionResult | Promise<SlashCommandExecutionResult>;
 }) {
+  const COMMAND_USAGE_KEY = "galapagos.slash-command-usage";
   const storageKey = projectId ? `galapagos.draft.${projectId}` : null;
   const [draft, setDraft] = useState("");
   // The attachment tray: pasted images (downscaled, base64) and intercepted
@@ -747,6 +763,18 @@ function Composer({
   // sane localStorage story); they're re-pasteable.
   const [tray, setTray] = useState<OutgoingAttachment[]>([]);
   const [pasteNote, setPasteNote] = useState<string | null>(null);
+  const [commandNote, setCommandNote] = useState<string | null>(null);
+  const [commandUsage, setCommandUsage] = useState<SlashCommandUsage>({});
+  const [commandMenuDismissed, setCommandMenuDismissed] = useState(false);
+  const [highlightedCommand, setHighlightedCommand] = useState(0);
+  const [commandPending, setCommandPending] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const commandOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  // Async local commands can outlive a project switch. Keep the current
+  // project outside the render closure so a completion can never clear or
+  // annotate the newly selected project's composer.
+  const projectIdRef = useRef(projectId);
+  projectIdRef.current = projectId;
   // Paste events don't carry modifier state — track Shift at the window so
   // Shift+paste can bypass the large-text interception (openwebui §6).
   const shiftHeldRef = useRef(false);
@@ -762,6 +790,24 @@ function Composer({
     };
   }, []);
 
+  useEffect(() => {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(COMMAND_USAGE_KEY) ?? "{}") as Record<
+        string,
+        unknown
+      >;
+      setCommandUsage(
+        Object.fromEntries(
+          Object.entries(parsed).filter(
+            ([, value]) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0,
+          ),
+        ) as SlashCommandUsage,
+      );
+    } catch {
+      setCommandUsage({});
+    }
+  }, []);
+
   // Load the persisted draft whenever the focused project changes. Reads run
   // client-side only (this is a "use client" tree), so useState starts empty
   // and the stored value lands on mount / project switch.
@@ -773,12 +819,17 @@ function Composer({
     }
     setTray([]);
     setPasteNote(null);
+    setCommandNote(null);
+    setCommandMenuDismissed(false);
+    setCommandPending(false);
   }, [storageKey]);
 
   // Persist on edit (not via an effect, to avoid a project switch briefly
   // writing the old draft under the new project's key).
   const edit = (value: string) => {
     setDraft(value);
+    setCommandNote(null);
+    setCommandMenuDismissed(false);
     if (!storageKey) {
       return;
     }
@@ -789,13 +840,98 @@ function Composer({
     }
   };
 
-  const submit = () => {
+  const menuQuery =
+    answering || commandPending || commandMenuDismissed ? null : slashMenuQuery(draft);
+  const commandMatches = useMemo(
+    () => (menuQuery === null ? [] : rankSlashCommands(menuQuery, commandUsage)),
+    [menuQuery, commandUsage],
+  );
+  const commandMenuOpen = menuQuery !== null;
+
+  useEffect(() => {
+    setHighlightedCommand(0);
+  }, [menuQuery]);
+
+  useEffect(() => {
+    if (commandMenuOpen) {
+      commandOptionRefs.current[highlightedCommand]?.scrollIntoView({ block: "nearest" });
+    }
+  }, [commandMenuOpen, highlightedCommand]);
+
+  const rememberCommand = (name: SlashCommandInvocation["command"]["name"]) => {
+    setCommandUsage((current) => {
+      const next = recordSlashCommandUse(current, name);
+      window.localStorage.setItem(COMMAND_USAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const chooseCommand = (index: number) => {
+    const command = commandMatches[index];
+    if (!command) {
+      return;
+    }
+    edit(slashCommandAutofill(command));
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
+
+  const submit = async () => {
     const text = draft.trim();
     // A bare screenshot is a valid message; attachments never answer a
     // pending card (the free-text answer contract is text-only).
     const attachments = answering ? [] : tray;
-    if ((!text && attachments.length === 0) || disabled) {
+    if ((!text && attachments.length === 0) || disabled || commandPending) {
       return;
+    }
+    if (!answering && text.startsWith("/")) {
+      const parsed = parseSlashCommand(text);
+      if (parsed.kind === "incomplete") {
+        setCommandMenuDismissed(false);
+        return;
+      }
+      if (parsed.kind === "unknown") {
+        setCommandNote(`Unknown command “/${parsed.name}”. Type / to see available commands.`);
+        return;
+      }
+      if (parsed.kind === "command") {
+        if (parsed.command.name === "help") {
+          rememberCommand(parsed.command.name);
+          edit("/");
+          setCommandMenuDismissed(false);
+          return;
+        }
+        const commandProjectId = projectId;
+        setCommandPending(true);
+        try {
+          const result = await onCommand(parsed, attachments);
+          if (projectIdRef.current !== commandProjectId) {
+            return;
+          }
+          if (!result.keepDraft) {
+            rememberCommand(parsed.command.name);
+          }
+          if (!result.keepDraft) {
+            setDraft("");
+            if (storageKey) {
+              window.localStorage.removeItem(storageKey);
+            }
+          }
+          setPasteNote(null);
+          setCommandNote(result.message ?? null);
+          if (result.consumeAttachments) {
+            setTray([]);
+          }
+        } catch (error) {
+          if (projectIdRef.current === commandProjectId) {
+            setCommandNote(
+              `Command failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        } finally {
+          setCommandPending(false);
+        }
+        return;
+      }
     }
     setDraft("");
     setTray([]);
@@ -897,7 +1033,56 @@ function Composer({
           ))}
         </div>
       ) : null}
+      {commandMenuOpen ? (
+        <div className="slash-command-menu">
+          <div className="slash-command-heading">
+            <span>Commands</span>
+            <span>↑↓ choose · Tab autofill · Esc close</span>
+          </div>
+          <div
+            id="slash-command-menu"
+            className="slash-command-options"
+            role="listbox"
+            aria-label="Slash commands"
+          >
+            {commandMatches.length > 0 ? (
+              commandMatches.map((command, index) => (
+                <button
+                  key={command.name}
+                  ref={(node) => {
+                    commandOptionRefs.current[index] = node;
+                  }}
+                  id={`slash-command-${command.name}`}
+                  type="button"
+                  role="option"
+                  aria-selected={index === highlightedCommand}
+                  className={index === highlightedCommand ? "selected" : ""}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onMouseEnter={() => setHighlightedCommand(index)}
+                  onClick={() => chooseCommand(index)}
+                >
+                  <span className="slash-command-name">
+                    /{command.name}
+                    {command.argumentHint ? (
+                      <span className="slash-command-args"> {command.argumentHint}</span>
+                    ) : null}
+                  </span>
+                  <span className="slash-command-description">{command.description}</span>
+                  {command.aliases.length > 0 ? (
+                    <span className="slash-command-aliases">
+                      alias {command.aliases.map((alias) => `/${alias}`).join(", ")}
+                    </span>
+                  ) : null}
+                </button>
+              ))
+            ) : (
+              <div className="slash-command-empty">No matching command.</div>
+            )}
+          </div>
+        </div>
+      ) : null}
       <textarea
+        ref={textareaRef}
         value={draft}
         placeholder={
           disabled
@@ -906,13 +1091,60 @@ function Composer({
               ? "Pick above, or type your own answer here…"
               : "Message Darwin…"
         }
-        disabled={disabled}
+        disabled={disabled || commandPending}
+        role="combobox"
+        aria-autocomplete="list"
+        aria-controls={commandMenuOpen ? "slash-command-menu" : undefined}
+        aria-expanded={commandMenuOpen}
+        aria-activedescendant={
+          commandMenuOpen && commandMatches[highlightedCommand]
+            ? `slash-command-${commandMatches[highlightedCommand]?.name}`
+            : undefined
+        }
         onChange={(event) => edit(event.target.value)}
         onPaste={handlePaste}
         onKeyDown={(event) => {
+          if (commandMenuOpen) {
+            if (event.key === "ArrowDown") {
+              event.preventDefault();
+              setHighlightedCommand((current) =>
+                commandMatches.length > 0 ? (current + 1) % commandMatches.length : 0,
+              );
+              return;
+            }
+            if (event.key === "ArrowUp") {
+              event.preventDefault();
+              setHighlightedCommand((current) =>
+                commandMatches.length > 0
+                  ? (current - 1 + commandMatches.length) % commandMatches.length
+                  : 0,
+              );
+              return;
+            }
+            if (event.key === "Tab") {
+              event.preventDefault();
+              chooseCommand(highlightedCommand);
+              return;
+            }
+            if (event.key === "Escape") {
+              event.preventDefault();
+              setCommandMenuDismissed(true);
+              return;
+            }
+            if (
+              event.key === "Enter" &&
+              !event.shiftKey &&
+              commandMatches.length > 0 &&
+              parseSlashCommand(draft).kind !== "command"
+            ) {
+              event.preventDefault();
+              chooseCommand(highlightedCommand);
+              return;
+            }
+          }
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
-            submit();
+            void submit();
           }
         }}
       />
@@ -928,6 +1160,8 @@ function Composer({
         </button>
         {answering ? (
           <span className="hint">Your message answers the question above.</span>
+        ) : commandNote ? (
+          <span className="command-note">{commandNote}</span>
         ) : pasteNote ? (
           <span className="queue-note">{pasteNote}</span>
         ) : queued.length > 0 ? (
@@ -941,10 +1175,11 @@ function Composer({
           onClick={submit}
           disabled={
             disabled ||
+            commandPending ||
             (draft.trim().length === 0 && (answering || tray.length === 0))
           }
         >
-          {answering ? "Answer" : working ? "Queue" : "Send"}
+          {commandPending ? "Running…" : answering ? "Answer" : working ? "Queue" : "Send"}
         </button>
       </div>
     </div>
@@ -969,6 +1204,7 @@ export function Chat({
   onSwitchToOpus,
   mode,
   onCycleMode,
+  onCommand,
   showSynthetic,
   onToggleSynthetic,
 }: {
@@ -1000,6 +1236,10 @@ export function Chat({
   /** The project's autonomy stop; the composer pill renders and cycles it. */
   mode: AutonomyModeView;
   onCycleMode: () => void;
+  onCommand: (
+    invocation: SlashCommandInvocation,
+    attachments: OutgoingAttachment[],
+  ) => SlashCommandExecutionResult | Promise<SlashCommandExecutionResult>;
   showSynthetic: boolean;
   onToggleSynthetic: () => void;
 }) {
@@ -1150,6 +1390,7 @@ export function Chat({
         mode={mode}
         onCycleMode={onCycleMode}
         onSend={onSend}
+        onCommand={onCommand}
       />
     </section>
   );

@@ -2,6 +2,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { parseUserTurnContent, type OutgoingAttachment } from "../core/attachments";
+import {
+  slashCommandPrompt,
+  type SlashCommandExecutionResult,
+  type SlashCommandInvocation,
+} from "../core/slash-commands";
 import type {
   AttachmentView,
   AttentionView,
@@ -966,6 +971,37 @@ export function App() {
   // daemon owns the truth (doctrine + tool allowlist change server-side); the
   // pill updates optimistically and the broadcast reconciles every tab.
   const autonomyMode: AutonomyModeView = selected?.autonomy_mode ?? "default";
+  const handleSetMode = useCallback(async (next: AutonomyModeView): Promise<boolean> => {
+    const projectId = selectedIdRef.current;
+    if (!projectId || daemonDown) {
+      return false;
+    }
+    setProjects((existing) =>
+      existing
+        ? existing.map((project) =>
+            project.id === projectId ? { ...project, autonomy_mode: next } : project,
+          )
+        : existing,
+    );
+    try {
+      const response = await fetch("/api/manager/mode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId, mode: next }),
+      });
+      if (!response.ok) {
+        // The daemon refused (or is down): re-pull the truth, never render a
+        // mode Darwin isn't actually in.
+        void refreshProjects();
+        return false;
+      }
+      return true;
+    } catch {
+      void refreshProjects();
+      return false;
+    }
+  }, [daemonDown, refreshProjects]);
+
   const handleCycleMode = useCallback(() => {
     const projectId = selectedIdRef.current;
     if (!projectId || daemonDown) {
@@ -975,25 +1011,8 @@ export function App() {
       projects?.find((project) => project.id === projectId)?.autonomy_mode ?? "default";
     const next: AutonomyModeView =
       current === "interview" ? "default" : current === "default" ? "auto" : "interview";
-    setProjects((existing) =>
-      existing
-        ? existing.map((project) =>
-            project.id === projectId ? { ...project, autonomy_mode: next } : project,
-          )
-        : existing,
-    );
-    void fetch("/api/manager/mode", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectId, mode: next }),
-    }).then((response) => {
-      if (!response.ok) {
-        // The daemon refused (or is down): re-pull the truth, never render a
-        // mode Darwin isn't actually in.
-        void refreshProjects();
-      }
-    });
-  }, [projects, daemonDown, refreshProjects]);
+    void handleSetMode(next);
+  }, [projects, daemonDown, handleSetMode]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1203,35 +1222,46 @@ export function App() {
   // The manual mirror of the boundary compaction: compact NOW, re-brief on
   // the next turn. The daemon broadcasts the confirmation note (deduped by
   // text in the /events handler), so success needs no local echo.
-  const handleRebriefNow = useCallback(async () => {
+  const handleRebriefNow = useCallback(async (): Promise<boolean> => {
     if (!selectedId) {
-      return;
+      return false;
     }
     const projectId = selectedId;
-    const response = await fetch("/api/manager/rebrief/now", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectId }),
-    });
+    let response: Response;
+    try {
+      response = await fetch("/api/manager/rebrief/now", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId }),
+      });
+    } catch {
+      if (selectedIdRef.current === projectId) {
+        setItems((current) => [
+          ...current,
+          { kind: "note", text: "Re-brief failed: daemon unavailable.", at: now() },
+        ]);
+      }
+      return false;
+    }
     const payload = (await response.json().catch(() => ({}))) as {
       error?: string;
       note?: string;
       compacted?: boolean;
       sessionId?: string;
     };
-    if (selectedIdRef.current !== projectId) return;
+    if (selectedIdRef.current !== projectId) return false;
     if (!response.ok) {
       setItems((current) => [
         ...current,
         { kind: "note", text: payload.error ?? `Re-brief failed (${response.status}).`, at: now() },
       ]);
-      return;
+      return false;
     }
     // The POST acknowledgement is authoritative for this tab. A sleeping
     // browser can retain a half-open EventSource and miss the broadcast, so
     // never leave this view depending on SSE to reflect a successful compact.
     await reconcileProject(projectId);
-    if (selectedIdRef.current !== projectId) return;
+    if (selectedIdRef.current !== projectId) return false;
     if (payload.note) {
       const text = payload.note;
       setItems((current) =>
@@ -1240,7 +1270,122 @@ export function App() {
           : [...current, { kind: "note", text, at: now() }],
       );
     }
+    return true;
   }, [selectedId, reconcileProject]);
+
+  const handleSlashCommand = useCallback(
+    async (
+      invocation: SlashCommandInvocation,
+      attachments: OutgoingAttachment[],
+    ): Promise<SlashCommandExecutionResult> => {
+      const commandProjectId = selectedId;
+      const prompt = slashCommandPrompt(invocation);
+      if (prompt) {
+        handleSend(prompt, attachments);
+        return {
+          consumeAttachments: true,
+          message: working ? `/${invocation.command.name} queued for Darwin.` : undefined,
+        };
+      }
+
+      switch (invocation.command.name) {
+        case "plan": {
+          const applied = await handleSetMode("interview");
+          if (!applied || selectedIdRef.current !== commandProjectId) {
+            return {
+              message: "Could not switch Darwin to Interview/Plan mode.",
+              keepDraft: true,
+            };
+          }
+          if (invocation.args) {
+            handleSend(
+              `Plan this work carefully without starting implementation until the direction is clear: ${invocation.args}`,
+              attachments,
+            );
+            return { consumeAttachments: true };
+          }
+          return { message: "Interview/Plan mode enabled." };
+        }
+        case "mode": {
+          const requested = invocation.args.toLowerCase();
+          const mode: AutonomyModeView | null =
+            requested === "interview" || requested === "plan"
+              ? "interview"
+              : requested === "default"
+                ? "default"
+                : requested === "auto"
+                  ? "auto"
+                  : null;
+          if (!mode) {
+            return {
+              message: "Use /mode interview, /mode default, or /mode auto.",
+              keepDraft: true,
+            };
+          }
+          const applied = await handleSetMode(mode);
+          if (!applied || selectedIdRef.current !== commandProjectId) {
+            return { message: "Darwin refused the mode change.", keepDraft: true };
+          }
+          return {
+            message: `${mode === "interview" ? "Interview/Plan" : mode === "auto" ? "Auto" : "Default"} mode enabled.`,
+          };
+        }
+        case "compact":
+          if (working) {
+            return {
+              message: "Darwin is mid-turn. Interrupt or wait before compacting.",
+              keepDraft: true,
+            };
+          }
+          return (await handleRebriefNow())
+            ? { message: "Re-brief requested from durable records." }
+            : { message: "Re-brief failed. The command was kept so you can retry.", keepDraft: true };
+        case "workers":
+          if (selected) {
+            window.location.assign(`/workers?projectId=${encodeURIComponent(selected.id)}`);
+          }
+          return {};
+        case "records":
+          if (selected) {
+            window.location.assign(`/records?projectId=${encodeURIComponent(selected.id)}`);
+          }
+          return {};
+        case "interrupt":
+          if (!working || !selectedId) {
+            return { message: "Darwin has no active manager turn to interrupt." };
+          }
+          try {
+            const response = await fetch("/api/manager/interrupt", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ projectId: selectedId }),
+            });
+            if (!response.ok) {
+              return {
+                message: `Interrupt failed (${response.status}).`,
+                keepDraft: true,
+              };
+            }
+          } catch {
+            return { message: "Interrupt failed: daemon unavailable.", keepDraft: true };
+          }
+          return { message: "Interrupt requested." };
+        case "help":
+          // Composer owns /help so it can reopen the filtered menu in place.
+          return {};
+        default:
+          return { message: `/${invocation.command.name} is not available here.` };
+      }
+    },
+    [
+      handleRebriefNow,
+      handleSend,
+      handleSetMode,
+      selected,
+      selectedId,
+      working,
+    ],
+  );
 
   const handleClearRebrief = useCallback(
     async (rebrief: RebriefView) => {
@@ -1357,6 +1502,7 @@ export function App() {
             onSwitchToOpus={handleSwitchToOpus}
             mode={autonomyMode}
             onCycleMode={handleCycleMode}
+            onCommand={handleSlashCommand}
             showSynthetic={showSynthetic}
             onToggleSynthetic={() => setShowSynthetic((visible) => !visible)}
           />
