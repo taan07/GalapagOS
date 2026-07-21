@@ -15,6 +15,10 @@ import type {
 } from "./types";
 import { shouldAttachPastedText, type OutgoingAttachment } from "../core/attachments";
 import {
+  formatDictationDuration,
+  mergeDictationIntoDraft,
+} from "../core/voice-dictation";
+import {
   parseSlashCommand,
   rankSlashCommands,
   recordSlashCommandUse,
@@ -27,6 +31,7 @@ import {
 import { imageFileToAttachment } from "./attachments-paste";
 import { localClockTime, localDate, localDateTime } from "./time";
 import { groupTurns, planSettledTurn, splitAnswerFold, type IndexedItem, type TurnGroup } from "./turns";
+import { useVoiceDictation } from "./voice-dictation";
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) {
@@ -775,6 +780,23 @@ function Composer({
   // annotate the newly selected project's composer.
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
+  const applyVoiceTranscript = useCallback(
+    (transcript: string) => {
+      setDraft((current) => {
+        const next = mergeDictationIntoDraft(current, transcript);
+        if (storageKey) {
+          window.localStorage.setItem(storageKey, next);
+        }
+        return next;
+      });
+      setCommandNote(null);
+      setCommandMenuDismissed(false);
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    },
+    [storageKey],
+  );
+  const voice = useVoiceDictation(applyVoiceTranscript);
+  const voiceBusy = voice.status !== "idle";
   // Paste events don't carry modifier state — track Shift at the window so
   // Shift+paste can bypass the large-text interception (openwebui §6).
   const shiftHeldRef = useRef(false);
@@ -822,7 +844,9 @@ function Composer({
     setCommandNote(null);
     setCommandMenuDismissed(false);
     setCommandPending(false);
-  }, [storageKey]);
+    voice.cancel();
+    voice.clearError();
+  }, [storageKey, voice.cancel, voice.clearError]);
 
   // Persist on edit (not via an effect, to avoid a project switch briefly
   // writing the old draft under the new project's key).
@@ -830,6 +854,7 @@ function Composer({
     setDraft(value);
     setCommandNote(null);
     setCommandMenuDismissed(false);
+    voice.clearError();
     if (!storageKey) {
       return;
     }
@@ -841,7 +866,9 @@ function Composer({
   };
 
   const menuQuery =
-    answering || commandPending || commandMenuDismissed ? null : slashMenuQuery(draft);
+    answering || commandPending || voiceBusy || commandMenuDismissed
+      ? null
+      : slashMenuQuery(draft);
   const commandMatches = useMemo(
     () => (menuQuery === null ? [] : rankSlashCommands(menuQuery, commandUsage)),
     [menuQuery, commandUsage],
@@ -880,7 +907,7 @@ function Composer({
     // A bare screenshot is a valid message; attachments never answer a
     // pending card (the free-text answer contract is text-only).
     const attachments = answering ? [] : tray;
-    if ((!text && attachments.length === 0) || disabled || commandPending) {
+    if ((!text && attachments.length === 0) || disabled || commandPending || voiceBusy) {
       return;
     }
     if (!answering && text.startsWith("/")) {
@@ -1091,7 +1118,7 @@ function Composer({
               ? "Pick above, or type your own answer here…"
               : "Message Darwin…"
         }
-        disabled={disabled || commandPending}
+        disabled={disabled || commandPending || voiceBusy}
         role="combobox"
         aria-autocomplete="list"
         aria-controls={commandMenuOpen ? "slash-command-menu" : undefined}
@@ -1148,6 +1175,57 @@ function Composer({
           }
         }}
       />
+      {voiceBusy ? (
+        <div
+          className={`voice-recorder voice-${voice.status}`}
+          role="group"
+          aria-label="Voice dictation"
+        >
+          <span className="sr-only" aria-live="polite">
+            {voice.status === "requesting"
+              ? "Requesting microphone access"
+              : voice.status === "stopping"
+                ? "Stopping and transcribing"
+                : "Voice dictation is recording"}
+          </span>
+          <button
+            type="button"
+            className="voice-cancel"
+            aria-label="Cancel dictation"
+            title="Cancel dictation (Esc)"
+            onClick={voice.cancel}
+          >
+            ×
+          </button>
+          <span className="voice-live-dot" aria-hidden="true" />
+          <div className="voice-waveform-wrap">
+            <canvas
+              ref={voice.waveformRef}
+              className="voice-waveform"
+              role="img"
+              aria-label="Live microphone waveform"
+            />
+            <span className="voice-state" aria-hidden="true">
+              {voice.status === "requesting"
+                ? "Requesting microphone…"
+                : voice.status === "stopping"
+                  ? "Transcribing…"
+                  : voice.preview || "Listening · audio isn’t stored by GalapagOS"}
+            </span>
+          </div>
+          <span className="voice-duration">{formatDictationDuration(voice.elapsedMs)}</span>
+          <button
+            type="button"
+            className="voice-stop"
+            aria-label="Stop and transcribe"
+            title="Stop and put the transcript in the message"
+            disabled={voice.status !== "recording"}
+            onClick={voice.stop}
+          >
+            <span aria-hidden="true" />
+          </button>
+        </div>
+      ) : null}
       <div className="compose-row">
         <button
           type="button"
@@ -1158,7 +1236,9 @@ function Composer({
         >
           {MODE_LABELS[mode]} <span className="mode-key">⇧⇥</span>
         </button>
-        {answering ? (
+        {voice.error ? (
+          <span className="voice-error" role="status">{voice.error}</span>
+        ) : answering ? (
           <span className="hint">Your message answers the question above.</span>
         ) : commandNote ? (
           <span className="command-note">{commandNote}</span>
@@ -1171,16 +1251,36 @@ function Composer({
         ) : (
           <span className="hint">Enter to send · Shift+Enter for a new line</span>
         )}
-        <button
-          onClick={submit}
-          disabled={
-            disabled ||
-            commandPending ||
-            (draft.trim().length === 0 && (answering || tray.length === 0))
-          }
-        >
-          {commandPending ? "Running…" : answering ? "Answer" : working ? "Queue" : "Send"}
-        </button>
+        <div className="compose-actions">
+          <button
+            type="button"
+            className="voice-start"
+            aria-label="Dictate a message"
+            title={
+              voice.supported
+                ? "Dictate a message"
+                : "Dictation requires a browser with speech recognition"
+            }
+            disabled={disabled || commandPending || voiceBusy}
+            onClick={() => void voice.start()}
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 1 0 6 0V6a3 3 0 0 0-3-3Z" />
+              <path d="M5.5 11.5v.5a6.5 6.5 0 0 0 13 0v-.5M12 18.5V22M8.5 22h7" />
+            </svg>
+          </button>
+          <button
+            onClick={submit}
+            disabled={
+              disabled ||
+              commandPending ||
+              voiceBusy ||
+              (draft.trim().length === 0 && (answering || tray.length === 0))
+            }
+          >
+            {commandPending ? "Running…" : answering ? "Answer" : working ? "Queue" : "Send"}
+          </button>
+        </div>
       </div>
     </div>
   );

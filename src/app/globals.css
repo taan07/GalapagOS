@@ -20,6 +20,18 @@
   box-sizing: border-box;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 html,
 body {
   margin: 0;
@@ -602,11 +614,154 @@ select:focus {
   min-height: 64px;
 }
 
+/* Dictation expands the bottom-anchored composer upward: the ordinary input
+   stays in place conceptually, and a dedicated live-audio rail appears under
+   it until the browser returns editable text. */
+.voice-recorder {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 50px;
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--line));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--surface-raised) 88%, var(--accent));
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 2%);
+}
+
+.voice-cancel,
+.voice-stop,
+.voice-start {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+}
+
+.voice-cancel {
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 20px;
+}
+
+.voice-live-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--danger) 13%, transparent);
+  animation: voice-listening 1.5s ease-in-out infinite;
+}
+
+.voice-requesting .voice-live-dot,
+.voice-stopping .voice-live-dot {
+  background: var(--attention);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--attention) 13%, transparent);
+}
+
+@keyframes voice-listening {
+  0%, 100% { opacity: 0.5; transform: scale(0.88); }
+  50% { opacity: 1; transform: scale(1.08); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voice-live-dot {
+    animation: none;
+  }
+}
+
+.voice-waveform-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 80px;
+  height: 36px;
+  overflow: hidden;
+  border-radius: 5px;
+}
+
+.voice-waveform {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.voice-state {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: -1px;
+  overflow: hidden;
+  color: color-mix(in srgb, var(--muted) 82%, transparent);
+  font-size: 9.5px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.voice-duration {
+  flex: none;
+  width: 4ch;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.voice-stop {
+  border-radius: 50%;
+  border-color: color-mix(in srgb, var(--danger) 58%, var(--line));
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface-raised));
+}
+
+.voice-stop span {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: var(--danger);
+}
+
+.voice-start svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.voice-error {
+  flex: 1;
+  min-width: 0;
+  color: var(--attention);
+  font-size: 12px;
+}
+
 .compose-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+}
+
+.compose-row > .hint,
+.compose-row > .queue-note,
+.compose-row > .command-note {
+  flex: 1;
+  min-width: 0;
+}
+
+.compose-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 7px;
 }
 
 /* Attachment tray — chips waiting to ride the next send. */
