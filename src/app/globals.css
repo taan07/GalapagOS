@@ -685,6 +685,9 @@ select:focus {
 .msg-attachment-image {
   display: inline-block;
   line-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 
 .msg-attachment-image img {
@@ -697,6 +700,79 @@ select:focus {
 
 .msg-attachment-image:hover img {
   filter: brightness(1.12);
+}
+
+.msg-attachment-image:focus-visible {
+  outline: 2px solid var(--attention);
+  outline-offset: 3px;
+  border-radius: 8px;
+}
+
+/* Image attachments stay in context: focused, full-size, and dismissible
+   without navigating away from Darwin. */
+.image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgb(0 0 0 / 78%);
+  backdrop-filter: blur(8px);
+}
+
+.image-lightbox-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  max-width: min(96vw, 1400px);
+  max-height: 94vh;
+  border: 1px solid color-mix(in srgb, var(--line) 70%, white);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--surface-raised);
+  box-shadow: 0 24px 80px rgb(0 0 0 / 55%);
+}
+
+.image-lightbox-panel img {
+  display: block;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  max-height: calc(94vh - 42px);
+  object-fit: contain;
+  background: rgb(0 0 0 / 32%);
+}
+
+.image-lightbox-caption {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 9px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.image-lightbox-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 1;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 50%;
+  color: white;
+  border-color: rgb(255 255 255 / 35%);
+  background: rgb(0 0 0 / 62%);
+  font-size: 24px;
+  line-height: 1;
+}
+
+@media (max-width: 720px) {
+  .image-lightbox {
+    padding: 10px;
+  }
 }
 
 .msg-attachment-file {

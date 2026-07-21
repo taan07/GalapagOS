@@ -83,8 +83,8 @@ export type DecisionView = {
 /**
  * An attachment as the chat renders it: `url` is a server path
  * (/api/attachments/…) for history, or a data:/blob: URL on the optimistic
- * echo before the turn persists. Images render as click-to-expand
- * thumbnails; text files as open-in-new-tab chips.
+ * echo before the turn persists. Images render as in-app focused views;
+ * text files remain open-in-new-tab chips.
  */
 export type AttachmentView = {
   kind: "image" | "text";

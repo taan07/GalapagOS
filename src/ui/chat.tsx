@@ -1,8 +1,9 @@
 "use client";
 
-import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { createPortal } from "react-dom";
 import type {
   AttachmentView,
   AutonomyModeView,
@@ -27,41 +28,117 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** A user message's attachments: image thumbnails open full-size in a new
- * tab; pasted-text files open as raw text. History stays scannable — the
- * thumbnail is bounded, the file is a one-line chip. */
+function ImageLightbox({
+  attachment,
+  onClose,
+}: {
+  attachment: AttachmentView;
+  onClose: () => void;
+}) {
+  const closeRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    closeRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+      } else if (event.key === "Tab") {
+        // The close control is the modal's sole interactive element.
+        event.preventDefault();
+        closeRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      className="image-lightbox"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Focused image: ${attachment.name}`}
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
+      <div className="image-lightbox-panel">
+        <button
+          ref={closeRef}
+          type="button"
+          className="image-lightbox-close"
+          aria-label="Close focused image"
+          onClick={onClose}
+        >
+          ×
+        </button>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={attachment.url} alt={attachment.name} />
+        <div className="image-lightbox-caption">
+          <span>{attachment.name}</span>
+          <span>{formatSize(attachment.size)}</span>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+/** A user message's attachments: images expand inside the app; pasted-text
+ * files remain raw-text links. History stays scannable — the thumbnail is
+ * bounded, the file is a one-line chip. */
 function AttachmentStrip({ attachments }: { attachments: AttachmentView[] }) {
+  const [focused, setFocused] = useState<AttachmentView | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const closeFocused = useCallback(() => {
+    setFocused(null);
+    requestAnimationFrame(() => triggerRef.current?.focus());
+  }, []);
+
   return (
-    <div className="msg-attachments">
-      {attachments.map((attachment, index) =>
-        attachment.kind === "image" ? (
-          <a
-            key={index}
-            className="msg-attachment-image"
-            href={attachment.url}
-            target="_blank"
-            rel="noreferrer"
-            title={`${attachment.name} — open full size`}
-          >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src={attachment.url} alt={attachment.name} loading="lazy" />
-          </a>
-        ) : (
-          <a
-            key={index}
-            className="msg-attachment-file"
-            href={attachment.url}
-            target="_blank"
-            rel="noreferrer"
-            title="Open the pasted text"
-          >
-            <span className="attach-icon">📄</span>
-            <span className="attach-name">{attachment.name}</span>
-            <span className="attach-size">{formatSize(attachment.size)}</span>
-          </a>
-        ),
-      )}
-    </div>
+    <>
+      <div className="msg-attachments">
+        {attachments.map((attachment, index) =>
+          attachment.kind === "image" ? (
+            <button
+              key={index}
+              type="button"
+              className="msg-attachment-image"
+              title={`${attachment.name} — focus image`}
+              onClick={(event) => {
+                triggerRef.current = event.currentTarget;
+                setFocused(attachment);
+              }}
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={attachment.url} alt={attachment.name} loading="lazy" />
+            </button>
+          ) : (
+            <a
+              key={index}
+              className="msg-attachment-file"
+              href={attachment.url}
+              target="_blank"
+              rel="noreferrer"
+              title="Open the pasted text"
+            >
+              <span className="attach-icon">📄</span>
+              <span className="attach-name">{attachment.name}</span>
+              <span className="attach-size">{formatSize(attachment.size)}</span>
+            </a>
+          ),
+        )}
+      </div>
+      {focused ? <ImageLightbox attachment={focused} onClose={closeFocused} /> : null}
+    </>
   );
 }
 
